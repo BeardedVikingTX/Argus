@@ -314,6 +314,7 @@ STAGE_ARTIFACTS = {
 # Keyed by stage → (json filename, DB table kind).
 RECON_JSON_MAP: dict[str, tuple[str, str]] = {
     "subs": ("subdomains.json", "subdomains"),
+    "live": ("live_hosts.json", "live_hosts"),
 }
 def resolve_stages(arg: str) -> list[str]:
     if arg in STAGE_GROUPS:
@@ -1095,13 +1096,74 @@ def _collect_oob_tokens(outdir: Path) -> list[str]:
                     tokens.add(str(tok))
     return list(tokens)
 
+def _first_or_none(value: Any) -> Optional[str]:
+    """httpx returns `a` and `aaaa` as lists; take the first element."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return str(value[0]) if value else None
+    return str(value)
+
+
+def _to_live_host_payload(rec: dict) -> Optional[dict]:
+    """
+    Convert a live_hosts.json record into the shape live_hosts.upsert expects.
+    Returns None if the record is unusable (no URL).
+    """
+    url = rec.get("url")
+    if not url:
+        return None
+
+    return {
+        "subdomain":       rec.get("subdomain") or "",
+        "url":             url,
+        "root":            rec.get("root"),
+        "scheme":          rec.get("scheme"),
+        "host":            rec.get("host"),
+        "port":            str(rec["port"]) if rec.get("port") is not None else None,
+        "path":            rec.get("path"),
+        "status_code":     rec.get("status_code"),
+        "content_type":    rec.get("content_type"),
+        "content_length":  rec.get("content_length"),
+        "title":           rec.get("title"),
+        "web_server":      rec.get("web_server"),
+        "response_time":   rec.get("response_time"),
+        "final_url":       rec.get("final_url"),
+        "redirect_chain":  rec.get("redirect_chain"),
+        "ip":              _first_or_none(rec.get("ip")),
+        "ipv6":            _first_or_none(rec.get("ipv6")),
+        "cname":           rec.get("cname"),
+        "cdn":             rec.get("cdn"),
+        "cdn_type":        rec.get("cdn_type"),
+        "technologies":    rec.get("technologies") or [],
+        "favicon_hash":    str(rec["favicon_hash"]) if rec.get("favicon_hash") is not None else None,
+        "jarm_hash":       rec.get("jarm_hash"),
+        "tls":             rec.get("tls"),
+        "sources":         rec.get("sources") or [],
+        "source_count":    rec.get("source_count", 0),
+        "first_seen":      _format_dt(rec.get("first_seen")),
+        "geo":             rec.get("geo") or [],
+        "interesting":     bool(rec.get("interesting")),
+        "reasons":         rec.get("reasons") or [],
+        "score":           int(rec.get("score", 0)),
+    }
+
+
+def _format_dt(value: Any) -> Optional[str]:
+    """Convert ISO-8601 timestamps into MySQL DATETIME format."""
+    if not value:
+        return None
+    if isinstance(value, str):
+        # '2026-01-15T10:54:23.123456+00:00' → '2026-01-15 10:54:23'
+        return value.replace("T", " ").split(".")[0].split("+")[0].rstrip("Z")
+    return None
 
 def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> None:
     """
     Push artifacts for this stage to the bridge.
 
     Two code paths:
-      1. Recon data (RECON_JSON_MAP) — subdomains, hosts, etc.
+      1. Recon data (RECON_JSON_MAP) — subdomains, live hosts, etc.
       2. Findings (FINDINGS_JSON_MAP) — vuln candidates from audit stages
 
     Fail-safe: never raises, disables DB after N consecutive failures.
@@ -1130,24 +1192,41 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
             log.debug(f"DB sync: could not parse {fname}: {e}")
             return
 
-        if kind == "subdomains":
-            items = data.get("subdomains") or []
-            if not items:
-                return
-            try:
+        try:
+            if kind == "subdomains":
+                items = data.get("subdomains") or []
+                if not items:
+                    return
                 result = DB.upsert_subdomains(scan_id, items)
-                if result is None:
-                    _DB_FAIL_COUNT += 1
-                    log.debug(
-                        f"DB sync {stage} returned None "
-                        f"({_DB_FAIL_COUNT}/{_DB_MAX_FAILURES})"
-                    )
-                else:
-                    _DB_FAIL_COUNT = 0
-                    log.info(f"DB sync {stage}: {result} subdomain(s) upserted")
-            except Exception as e:
+                label = "subdomain(s)"
+
+            elif kind == "live_hosts":
+                items = data.get("hosts") or []
+                if not items:
+                    return
+                # Convert the local record shape to the wire payload shape
+                payloads = [_to_live_host_payload(h) for h in items]
+                payloads = [p for p in payloads if p and p.get("url")]
+                if not payloads:
+                    return
+                result = DB.upsert_live_hosts(scan_id, payloads)
+                label = "live host(s)"
+
+            else:
+                return
+
+            if result is None:
                 _DB_FAIL_COUNT += 1
-                log.debug(f"DB sync exception on {stage}: {e}")
+                log.debug(
+                    f"DB sync {stage} returned None "
+                    f"({_DB_FAIL_COUNT}/{_DB_MAX_FAILURES})"
+                )
+            else:
+                _DB_FAIL_COUNT = 0
+                log.info(f"DB sync {stage}: {result} {label} upserted")
+        except Exception as e:
+            _DB_FAIL_COUNT += 1
+            log.debug(f"DB sync exception on {stage}: {e}")
         return
 
     # ── Path 2: Findings ────────────────────────────────────────────────────

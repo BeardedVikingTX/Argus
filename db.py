@@ -205,6 +205,48 @@ class ArgusDB:
         r = self._call("query.subdomains", payload)
         return r.get("subdomains") if r and r.get("ok") else None
 
+    def upsert_live_hosts(
+        self, scan_id: int, live_hosts: list[dict], chunk_size: int = 200,
+    ) -> Optional[int]:
+        """
+        Upsert live hosts in chunks.
+
+        Chunk size is smaller than subdomains because each row is much larger
+        (TLS data, titles, geo). 200 rows × ~50KB payload ≈ 10MB, which is a
+        comfortable margin under PHP's default post_max_size (8MB).
+        Lower this to 100 if you see truncation on the server.
+        """
+        if not live_hosts:
+            return 0
+
+        total = 0
+        for i in range(0, len(live_hosts), chunk_size):
+            chunk = live_hosts[i:i + chunk_size]
+            r = self._call("live_hosts.upsert", {
+                "scan_id":    scan_id,
+                "live_hosts": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"live_hosts.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_live_hosts(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        interesting: Optional[bool] = None, min_score: Optional[int] = None,
+    ) -> Optional[list]:
+        payload = {"scan_uuid": scan_uuid, "limit": limit, "offset": offset}
+        if interesting is not None:
+            payload["interesting"] = interesting
+        if min_score is not None:
+            payload["min_score"] = min_score
+        r = self._call("query.live_hosts", payload)
+        return r.get("live_hosts") if r and r.get("ok") else None
+
     def upsert_findings(self, scan_id: int, findings: list[dict]) -> Optional[int]:
         r = self._call("findings.upsert", {"scan_id": scan_id, "findings": findings})
         return r.get("count") if r and r.get("ok") else None

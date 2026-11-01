@@ -3,20 +3,32 @@
 recon_tools/sub_discover.py — Live Host Discovery & Enrichment
 ═══════════════════════════════════════════════════════════════════════════════
 
-Takes the subdomain inventory produced by `subs.py`, probes every host with
-HTTPX using its full enrichment stack (status, title, tech, CDN, favicon,
-JARM, redirects), layers on IP geolocation and ASN data via cached batch
-lookups, attributes each host back to the sources that found it, and
-classifies hosts by triage "interestingness".
+Probes every subdomain with HTTPX using its full enrichment stack, layers on
+IP geolocation and ASN data, attributes each host back to its sources, and
+classifies hosts by triage interestingness.
+
+THIS IS THE FIRST STAGE THAT SENDS TRAFFIC TO THE TARGET. Platform headers
+from config.py ARE applied to every httpx request.
+
+Config integration (config.py):
+  • MODULE_RATE_LIMITS["live"]["rate_limit"]   → httpx -rate-limit
+  • MODULE_RATE_LIMITS["live"]["concurrency"]  → httpx -threads
+  • ACTIVE_HEADERS                             → httpx -H (applied to all reqs)
+  • SYNC_TO_DB, BRIDGE_*                       → remote database sync
 
 Outputs (into `outdir`):
-  • live_hosts.json   — full structured report (primary output)
-  • live_hosts.txt    — URL + status + title + tech (nmap-compatible)
-  • live_urls.txt     — plain URLs, one per line
-  • geo_cache.json    — IP → geo mapping (persistent cache)
+  • live_hosts.json    — full structured report (primary output)
+  • live_hosts.txt     — URL + status + title + tech (nmap-compatible)
+  • live_urls.txt      — plain URLs, one per line
+  • geo_cache.json     — IP → geo mapping (persistent cache)
+
+Remote DB (if scan_id is provided and bridge is reachable):
+  • live_hosts table   — one row per (scan_id, url_hash)
 
 Integration:
   main.py → run_one("live") → discover_live(subs_file, outdir)
+  main.py also syncs live_hosts.json via _sync_stage_artifacts()
+  Standalone: discover_live(..., scan_id=42) → self-syncs
 """
 
 from __future__ import annotations
@@ -35,37 +47,100 @@ from typing import Optional
 log = logging.getLogger("argus.sub_discover")
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION
+#  CONFIG — graceful fallback if config.py is missing
+# ═════════════════════════════════════════════════════════════════════════════
+
+try:
+    import config as CFG
+    CFG_LOADED = True
+except ImportError:
+    CFG = None
+    CFG_LOADED = False
+
+try:
+    from db import DB, ArgusDB  # noqa: F401
+    DB_AVAILABLE = True
+except ImportError:
+    DB = None
+    DB_AVAILABLE = False
+
+
+def _cfg(key: str, default=None):
+    if not CFG_LOADED:
+        return default
+    return getattr(CFG, key, default)
+
+
+def _live_settings() -> tuple[int, int, int, int]:
+    """
+    Return (threads, rate_limit, timeout, retries) for the 'live' stage.
+    """
+    overrides = _cfg("MODULE_RATE_LIMITS", {}) or {}
+    entry = overrides.get("live", {})
+
+    threads = entry.get("concurrency", DEFAULT_THREADS)
+    rate    = entry.get("rate_limit", DEFAULT_RATE_LIMIT)
+    timeout = entry.get("timeout", DEFAULT_TIMEOUT)
+    retries = entry.get("retries", DEFAULT_RETRIES)
+
+    if not isinstance(threads, int) or threads < 1:
+        threads = DEFAULT_THREADS
+    if not isinstance(rate, int) or rate < 0:
+        rate = DEFAULT_RATE_LIMIT
+    if not isinstance(timeout, int) or timeout < 1:
+        timeout = DEFAULT_TIMEOUT
+    if not isinstance(retries, int) or retries < 0:
+        retries = DEFAULT_RETRIES
+
+    return threads, rate, timeout, retries
+
+
+def _headers_for_httpx() -> tuple[list[str], bool]:
+    """
+    Return (header_args, should_randomize_ua).
+
+    Header args are `-H "Name: Value"` pairs passed to httpx. If the user
+    has configured a User-Agent in ACTIVE_HEADERS, we disable -random-agent
+    (they conflict — httpx would pick one and ignore the other).
+    """
+    hdrs = _cfg("ACTIVE_HEADERS", {}) or {}
+    args: list[str] = []
+    has_ua = False
+    for k, v in hdrs.items():
+        args.extend(["-H", f"{k}: {v}"])
+        if k.lower() == "user-agent":
+            has_ua = True
+    return args, not has_ua
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CONSTANTS
 # ═════════════════════════════════════════════════════════════════════════════
 
 DEFAULT_THREADS    = 50
 DEFAULT_RATE_LIMIT = 150
 DEFAULT_TIMEOUT    = 10
 DEFAULT_RETRIES    = 2
-HTTPX_HARD_TIMEOUT = 3600   # overall wall-clock ceiling for the httpx process
+HTTPX_HARD_TIMEOUT = 3600
 
-# Enrichment toggles — disable slower ones if runtime matters
 ENABLE_TECH_DETECT      = True
 ENABLE_CNAME            = True
 ENABLE_CDN              = True
 ENABLE_FAVICON          = True
 ENABLE_JARM             = True
 ENABLE_FOLLOW_REDIRECTS = True
-ENABLE_TLS_GRAB         = False   # 2–3x slower — leave off by default
+ENABLE_TLS_GRAB         = False
 ENABLE_RANDOM_AGENT     = True
 
-# Geolocation (ip-api.com free tier: 45 req/min, 100 IPs/request)
 GEO_ENABLED      = True
 GEO_BATCH_SIZE   = 100
-GEO_RATE_SLEEP   = 1.5      # seconds between batches → ~40 req/min
+GEO_RATE_SLEEP   = 1.5
 GEO_TIMEOUT      = 15
 GEO_CACHE_FILE   = "geo_cache.json"
 
-# Attribution — read sources from subdomains.json if it exists
 ENRICH_FROM_SOURCES_JSON = True
 SOURCES_JSON_NAME = "subdomains.json"
 
-# Interesting-host thresholds
 INTERESTING_MIN_SCORE = 20
 
 
@@ -74,7 +149,6 @@ INTERESTING_MIN_SCORE = 20
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _normalize_host(name: str) -> Optional[str]:
-    """Lowercase, strip schemes / paths / ports. Returns None on empty."""
     if not name:
         return None
     s = name.strip().lower()
@@ -87,6 +161,14 @@ def _normalize_host(name: str) -> Optional[str]:
     return s or None
 
 
+def _first_or_none(value):
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return str(value[0]) if value else None
+    return str(value)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  HTTPX
 # ═════════════════════════════════════════════════════════════════════════════
@@ -97,8 +179,9 @@ def _build_httpx_cmd(
     rate_limit: int,
     timeout: int,
     retries: int,
+    header_args: list[str],
+    randomize_ua: bool,
 ) -> list[str]:
-    """Assemble the HTTPX command line with all enabled enrichment flags."""
     cmd = [
         "httpx",
         "-l", str(subs_file),
@@ -109,18 +192,23 @@ def _build_httpx_cmd(
         "-web-server",
         "-ip",
         "-threads",     str(threads),
-        "-rate-limit",  str(rate_limit),
         "-timeout",     str(timeout),
         "-retries",     str(retries),
     ]
+    if rate_limit and rate_limit > 0:
+        cmd.extend(["-rate-limit", str(rate_limit)])
+
     if ENABLE_TECH_DETECT:      cmd.append("-tech-detect")
-    if ENABLE_CNAME:            cmd.extend(["-cname"])
+    if ENABLE_CNAME:            cmd.append("-cname")
     if ENABLE_CDN:              cmd.append("-cdn")
     if ENABLE_FAVICON:          cmd.append("-favicon")
     if ENABLE_JARM:             cmd.append("-jarm")
     if ENABLE_FOLLOW_REDIRECTS: cmd.append("-follow-redirects")
     if ENABLE_TLS_GRAB:         cmd.append("-tls-grab")
-    if ENABLE_RANDOM_AGENT:     cmd.append("-random-agent")
+    if ENABLE_RANDOM_AGENT and randomize_ua:
+        cmd.append("-random-agent")
+
+    cmd.extend(header_args)
     return cmd
 
 
@@ -131,14 +219,17 @@ def _run_httpx(
     timeout: int,
     retries: int,
 ) -> list[dict]:
-    """Run HTTPX and return the parsed JSONL records."""
     if not shutil.which("httpx"):
         raise RuntimeError(
             "httpx not found on PATH. Run `python3 tools.py --only httpx` first."
         )
 
-    cmd = _build_httpx_cmd(subs_file, threads, rate_limit, timeout, retries)
-    log.info(f"    $ {' '.join(cmd)}")
+    header_args, randomize_ua = _headers_for_httpx()
+    cmd = _build_httpx_cmd(
+        subs_file, threads, rate_limit, timeout, retries,
+        header_args, randomize_ua,
+    )
+    log.info(f"    $ {' '.join(cmd[:8])}...  ({len(cmd)} args)")
 
     try:
         result = subprocess.run(
@@ -164,7 +255,6 @@ def _run_httpx(
         except json.JSONDecodeError:
             parse_errors += 1
             continue
-        # Skip dead hosts — httpx marks these failed:true (or no status)
         if obj.get("failed") is True:
             continue
         if obj.get("status_code") in (None, 0):
@@ -201,7 +291,6 @@ def _save_geo_cache(path: Path, cache: dict[str, dict]) -> None:
 
 
 def _geo_batch(ips: list[str]) -> dict[str, dict]:
-    """Query ip-api.com's batch endpoint. Returns ip → geo dict."""
     if not ips:
         return {}
     url = "http://ip-api.com/batch"
@@ -210,8 +299,8 @@ def _geo_batch(ips: list[str]) -> dict[str, dict]:
         url,
         data=payload,
         headers={
-            "Content-Type":     "application/json",
-            "User-Agent":       "argus-sub-discover/1.0",
+            "Content-Type": "application/json",
+            "User-Agent":   "argus-sub-discover/1.0",
         },
     )
     try:
@@ -250,11 +339,6 @@ def _geo_batch(ips: list[str]) -> dict[str, dict]:
 
 
 def _enrich_geo(records: list[dict], outdir: Path) -> dict[str, dict]:
-    """
-    Attach geo data to each record via `record["geo"]`.
-    Uses a persistent on-disk cache to minimise API calls.
-    """
-    # Collect all unique IPs across records
     all_ips: set[str] = set()
     for rec in records:
         for ip in _extract_ips(rec):
@@ -284,7 +368,6 @@ def _enrich_geo(records: list[dict], outdir: Path) -> dict[str, dict]:
     else:
         log.info(f"    Geo lookup: all {len(all_ips)} IP(s) served from cache")
 
-    # Attach to records
     for rec in records:
         ips = _extract_ips(rec)
         geo_list = [cache[ip] for ip in ips if ip in cache]
@@ -294,13 +377,11 @@ def _enrich_geo(records: list[dict], outdir: Path) -> dict[str, dict]:
 
 
 def _extract_ips(record: dict) -> list[str]:
-    """Pull IPv4/IPv6 addresses out of an httpx JSON record."""
     ips: list[str] = []
     for key in ("a", "aaaa"):
         val = record.get(key)
         if isinstance(val, list):
             ips.extend(str(x) for x in val if x)
-    # Some httpx versions use a single "ip" field
     single = record.get("ip")
     if single and single not in ips:
         ips.append(str(single))
@@ -312,7 +393,6 @@ def _extract_ips(record: dict) -> list[str]:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _load_source_map(outdir: Path) -> dict[str, dict]:
-    """Read subdomains.json and build subdomain → record mapping."""
     if not ENRICH_FROM_SOURCES_JSON:
         return {}
     path = outdir / SOURCES_JSON_NAME
@@ -332,7 +412,6 @@ def _load_source_map(outdir: Path) -> dict[str, dict]:
 
 
 def _attach_attribution(record: dict, source_map: dict[str, dict]) -> None:
-    """Add sources / first_seen from subdomains.json onto an httpx record."""
     if not source_map:
         return
     host = _normalize_host(record.get("input") or record.get("host") or "")
@@ -365,17 +444,6 @@ PATH_KEYWORDS = (
 
 
 def _classify(record: dict) -> tuple[bool, list[str], int]:
-    """
-    Return (interesting, reasons, score).
-
-    Score accumulates from independent signals:
-      +30  status 401/403 (protected resource — something is there)
-      +25  content-type is JSON/XML (API endpoint)
-      +20  sensitive word in title
-      +15  sensitive path segment in URL
-      +10  framework in tech stack implying admin (Jenkins, Grafana, etc.)
-      +10  status 5xx (potential bug)
-    """
     reasons: list[str] = []
     score = 0
 
@@ -383,7 +451,7 @@ def _classify(record: dict) -> tuple[bool, list[str], int]:
     title = (record.get("title") or "").lower()
     ct = (record.get("content_type") or "").lower()
     url = (record.get("url") or "").lower()
-    tech = [t.lower() for t in (record.get("tech") or [])]
+    tech = [t.lower() for t in (record.get("technologies") or [])]
 
     if status in (401, 403):
         reasons.append("access_gated")
@@ -419,9 +487,12 @@ def _classify(record: dict) -> tuple[bool, list[str], int]:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _build_host_record(raw: dict) -> dict:
-    """Flatten an httpx JSONL record into our canonical shape."""
     host_name = _normalize_host(raw.get("input") or raw.get("host") or "") or ""
     cdn = raw.get("cdn_name") or raw.get("cdn")
+
+    ip_val = raw.get("a") or raw.get("ip")
+    ipv6_val = raw.get("aaaa")
+
     return {
         "subdomain":       host_name,
         "url":             raw.get("url"),
@@ -438,8 +509,8 @@ def _build_host_record(raw: dict) -> dict:
         "cname":           raw.get("cname"),
         "cdn":             cdn,
         "cdn_type":        raw.get("cdn_type"),
-        "ip":              raw.get("a") or raw.get("ip"),
-        "ipv6":            raw.get("aaaa"),
+        "ip":              ip_val,
+        "ipv6":            ipv6_val,
         "response_time":   raw.get("time"),
         "favicon_hash":    raw.get("favicon"),
         "jarm_hash":       raw.get("jarm_hash"),
@@ -457,12 +528,60 @@ def _build_host_record(raw: dict) -> dict:
     }
 
 
+def _to_payload(rec: dict) -> Optional[dict]:
+    """Convert a local record to the wire shape live_hosts.upsert expects."""
+    url = rec.get("url")
+    if not url:
+        return None
+
+    first_seen = rec.get("first_seen")
+    first_seen_fmt = None
+    if first_seen:
+        first_seen_fmt = first_seen.replace("T", " ").split(".")[0].split("+")[0].rstrip("Z")
+
+    favicon = rec.get("favicon_hash")
+    favicon_str = str(favicon) if favicon is not None else None
+
+    return {
+        "subdomain":       rec.get("subdomain") or "",
+        "url":             url,
+        "root":            rec.get("root"),
+        "scheme":          rec.get("scheme"),
+        "host":            rec.get("host"),
+        "port":            str(rec["port"]) if rec.get("port") is not None else None,
+        "path":            rec.get("path"),
+        "status_code":     rec.get("status_code"),
+        "content_type":    rec.get("content_type"),
+        "content_length":  rec.get("content_length"),
+        "title":           rec.get("title"),
+        "web_server":      rec.get("web_server"),
+        "response_time":   rec.get("response_time"),
+        "final_url":       rec.get("final_url"),
+        "redirect_chain":  rec.get("redirect_chain"),
+        "ip":              _first_or_none(rec.get("ip")),
+        "ipv6":            _first_or_none(rec.get("ipv6")),
+        "cname":           rec.get("cname"),
+        "cdn":             rec.get("cdn"),
+        "cdn_type":        rec.get("cdn_type"),
+        "technologies":    rec.get("technologies") or [],
+        "favicon_hash":    favicon_str,
+        "jarm_hash":       rec.get("jarm_hash"),
+        "tls":             rec.get("tls"),
+        "sources":         rec.get("sources") or [],
+        "source_count":    rec.get("source_count", 0),
+        "first_seen":      first_seen_fmt,
+        "geo":             rec.get("geo") or [],
+        "interesting":     bool(rec.get("interesting")),
+        "reasons":         rec.get("reasons") or [],
+        "score":           int(rec.get("score", 0)),
+    }
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  OUTPUT WRITERS
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _write_live_hosts_txt(records: list[dict], outdir: Path) -> Path:
-    """Backward-compatible one-line-per-host file for nmap consumption."""
     lines = []
     for r in records:
         url = r.get("url") or ""
@@ -478,7 +597,6 @@ def _write_live_hosts_txt(records: list[dict], outdir: Path) -> Path:
 
 
 def _write_live_urls_txt(records: list[dict], outdir: Path) -> Path:
-    """Plain URLs, one per line."""
     urls = sorted({r["url"] for r in records if r.get("url")})
     path = outdir / "live_urls.txt"
     path.write_text("\n".join(urls) + ("\n" if urls else ""))
@@ -518,7 +636,6 @@ def _build_summary(records: list[dict]) -> dict:
 
         srv = r.get("web_server")
         if srv:
-            # Strip version numbers for grouping
             base = srv.split("/")[0].strip()
             by_server[base] = by_server.get(base, 0) + 1
 
@@ -539,6 +656,43 @@ def _build_summary(records: list[dict]) -> dict:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  REMOTE SYNC (self)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _self_sync(scan_id: int, records: list[dict]) -> None:
+    """Push live hosts to the bridge (standalone mode only)."""
+    if not records:
+        return
+    if not DB_AVAILABLE or DB is None:
+        log.warning("  DB sync: db.py not available — skipping")
+        return
+    if not _cfg("SYNC_TO_DB", True):
+        log.info("  DB sync: SYNC_TO_DB is False — skipping")
+        return
+    if not _cfg("BRIDGE_ENABLED", False):
+        log.info("  DB sync: BRIDGE_ENABLED is False — skipping")
+        return
+    if not DB.available:
+        log.warning("  DB sync: bridge client not ready (check BRIDGE_KEY)")
+        return
+
+    payloads = [_to_payload(r) for r in records]
+    payloads = [p for p in payloads if p and p.get("url")]
+    if not payloads:
+        log.warning("  DB sync: no valid payloads to send")
+        return
+
+    try:
+        result = DB.upsert_live_hosts(scan_id, payloads)
+        if result is None:
+            log.warning("  DB sync: bridge returned None")
+        else:
+            log.info(f"  DB sync: {result} live host(s) upserted (scan_id={scan_id})")
+    except Exception as e:
+        log.warning(f"  DB sync: exception — {e}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  PUBLIC ENTRY POINT
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -546,19 +700,34 @@ def discover_live(
     subs_file: Path,
     outdir: Path,
     *,
-    threads: int = DEFAULT_THREADS,
-    rate_limit: int = DEFAULT_RATE_LIMIT,
-    timeout: int = DEFAULT_TIMEOUT,
-    retries: int = DEFAULT_RETRIES,
+    threads: Optional[int] = None,
+    rate_limit: Optional[int] = None,
+    timeout: Optional[int] = None,
+    retries: Optional[int] = None,
     resolve_geo: bool = GEO_ENABLED,
     enrich_attribution: bool = ENRICH_FROM_SOURCES_JSON,
+    scan_id: Optional[int] = None,
 ) -> Path:
     """
     Probe every subdomain in `subs_file` for HTTP liveness and enrichment.
 
+    Threads, rate_limit, timeout, and retries are read from
+    config.py MODULE_RATE_LIMITS["live"] unless overridden.
+
+    If `scan_id` is provided AND db.py is available AND config allows it,
+    results are upserted to the remote database. In the pipeline, main.py
+    handles sync — passing scan_id here is only for standalone use.
+
     Returns the path to `live_hosts.json`.
     """
     start = time.monotonic()
+
+    # ── Resolve effective settings ──────────────────────────────────────────
+    cfg_threads, cfg_rate, cfg_timeout, cfg_retries = _live_settings()
+    eff_threads = threads if threads is not None else cfg_threads
+    eff_rate    = rate_limit if rate_limit is not None else cfg_rate
+    eff_timeout = timeout if timeout is not None else cfg_timeout
+    eff_retries = retries if retries is not None else cfg_retries
 
     # ── Inputs ──────────────────────────────────────────────────────────────
     if not subs_file.exists():
@@ -574,62 +743,83 @@ def discover_live(
     outdir.mkdir(parents=True, exist_ok=True)
 
     log.info(f"  Input  : {len(subs)} subdomain(s) from {subs_file.name}")
+
     if not subs:
         log.info("  (nothing to probe — writing empty report)")
         report = {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at":    datetime.now(timezone.utc).isoformat(),
             "elapsed_seconds": 0.0,
-            "input_file": str(subs_file),
-            "config": {
-                "threads": threads, "rate_limit": rate_limit,
-                "timeout": timeout, "retries": retries,
-            },
-            "totals": {"input": 0, "alive": 0},
-            "summary": {},
-            "hosts": [],
+            "input_file":      str(subs_file),
+            "config":          {"threads": eff_threads, "rate_limit": eff_rate},
+            "totals":          {"input": 0, "alive": 0},
+            "summary":         {},
+            "hosts":           [],
         }
         path = outdir / "live_hosts.json"
         path.write_text(json.dumps(report, indent=2) + "\n")
         return path
 
+    # ── Config display ──────────────────────────────────────────────────────
+    rate_label = f"{eff_rate}/s" if eff_rate else "unlimited"
+    log.info(f"  Config : threads={eff_threads}  rate_limit={rate_label}  "
+             f"timeout={eff_timeout}s  retries={eff_retries}")
+    log.info(f"           source: MODULE_RATE_LIMITS['live']")
+
+    if eff_rate and eff_rate < 10:
+        log.info("")
+        log.info(f"  {chr(9888)}  rate_limit={eff_rate}/s is very conservative for httpx.")
+        log.info(f"     httpx's default is {DEFAULT_RATE_LIMIT}/s. This stage DOES")
+        log.info(f"     send target traffic, so tune for your program's rules — but")
+        log.info(f"     if the program allows 50/s, consider raising it.")
+        log.info("")
+
+    # ── Headers (FIRST TARGET-TRAFFIC STAGE) ────────────────────────────────
+    hdrs = _cfg("ACTIVE_HEADERS", {}) or {}
+    if hdrs:
+        log.info(f"  Headers: {len(hdrs)} configured, applied to all httpx requests")
+        for k, v in hdrs.items():
+            v_short = v[:50] + "…" if len(v) > 50 else v
+            log.info(f"           · {k}: {v_short}")
+        if any(k.lower() == "user-agent" for k in hdrs):
+            log.info(f"           · (-random-agent disabled — UA set by config)")
+        log.info("")
+    else:
+        log.info(f"  Headers: none configured — httpx uses its default UA")
+        log.info("")
+
     # ── Run HTTPX ───────────────────────────────────────────────────────────
-    log.info("")
-    log.info(f"  Probing with httpx (threads={threads}, "
-             f"rate-limit={rate_limit}/s, timeout={timeout}s)...")
-    raw_records = _run_httpx(subs_file, threads, rate_limit, timeout, retries)
+    log.info(f"  Probing with httpx...")
+    raw_records = _run_httpx(
+        subs_file, eff_threads, eff_rate, eff_timeout, eff_retries,
+    )
     log.info(f"  Alive  : {len(raw_records)} / {len(subs)} responded")
 
     if not raw_records:
         log.warning("  No live hosts — writing empty report")
         report = {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at":    datetime.now(timezone.utc).isoformat(),
             "elapsed_seconds": round(time.monotonic() - start, 2),
-            "input_file": str(subs_file),
-            "config": {
-                "threads": threads, "rate_limit": rate_limit,
-                "timeout": timeout, "retries": retries,
-            },
-            "totals": {"input": len(subs), "alive": 0},
-            "summary": {},
-            "hosts": [],
+            "input_file":      str(subs_file),
+            "config":          {"threads": eff_threads, "rate_limit": eff_rate},
+            "totals":          {"input": len(subs), "alive": 0},
+            "summary":         {},
+            "hosts":           [],
         }
         path = outdir / "live_hosts.json"
         path.write_text(json.dumps(report, indent=2) + "\n")
-        # Still emit empty text companions
         _write_live_hosts_txt([], outdir)
         _write_live_urls_txt([], outdir)
         return path
 
-    # ── Normalize records ───────────────────────────────────────────────────
+    # ── Normalize ───────────────────────────────────────────────────────────
     log.info("  Normalizing records...")
     records = [_build_host_record(r) for r in raw_records]
 
-    # ── Source attribution ──────────────────────────────────────────────────
+    # ── Attribution ─────────────────────────────────────────────────────────
     if enrich_attribution:
         log.info("  Attaching source attribution from subdomains.json...")
         src_map = _load_source_map(outdir)
         for rec in records:
-            # Temporary proxy so _attach_attribution can read `input`
             proxy = {"input": rec.get("subdomain"), "host": rec.get("host")}
             _attach_attribution(proxy, src_map)
             if proxy.get("sources"):
@@ -638,21 +828,21 @@ def discover_live(
                 rec["first_seen"] = proxy.get("first_seen")
                 rec["root"] = proxy.get("root")
 
-    # ── Geo enrichment ──────────────────────────────────────────────────────
+    # ── Geo ─────────────────────────────────────────────────────────────────
     if resolve_geo:
         log.info("  Enriching with geo / ASN data...")
         _enrich_geo(records, outdir)
     else:
         log.info("  Geo enrichment disabled")
 
-    # ── Classification ──────────────────────────────────────────────────────
+    # ── Classify ────────────────────────────────────────────────────────────
     for rec in records:
         interesting, reasons, score = _classify(rec)
         rec["interesting"] = interesting
         rec["reasons"] = reasons
         rec["score"] = score
 
-    # ── Sort for triage priority ────────────────────────────────────────────
+    # ── Sort ────────────────────────────────────────────────────────────────
     STATUS_PRIORITY = {
         200: 1, 201: 1, 202: 1, 204: 1,
         401: 2, 403: 2,
@@ -676,10 +866,11 @@ def discover_live(
         "elapsed_seconds": round(elapsed, 2),
         "input_file":     str(subs_file),
         "config": {
-            "threads":              threads,
-            "rate_limit":           rate_limit,
-            "timeout":              timeout,
-            "retries":              retries,
+            "threads":              eff_threads,
+            "rate_limit":           eff_rate,
+            "timeout":              eff_timeout,
+            "retries":              eff_retries,
+            "headers_count":        len(hdrs),
             "tech_detect":          ENABLE_TECH_DETECT,
             "cname":                ENABLE_CNAME,
             "cdn":                  ENABLE_CDN,
@@ -698,12 +889,21 @@ def discover_live(
         "hosts": records,
     }
 
-    # ── Write outputs ───────────────────────────────────────────────────────
+    # ── Write local outputs ─────────────────────────────────────────────────
     json_path = outdir / "live_hosts.json"
     json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
     txt_path  = _write_live_hosts_txt(records, outdir)
     urls_path = _write_live_urls_txt(records, outdir)
+
+    # ── Self-sync (standalone only) ─────────────────────────────────────────
+    if scan_id is not None:
+        log.info("")
+        log.info(f"  Syncing to remote database (scan_id={scan_id})...")
+        _self_sync(scan_id, records)
+    else:
+        log.info("")
+        log.info("  DB sync  : deferred to main.py (no scan_id passed)")
 
     # ── Console summary ─────────────────────────────────────────────────────
     log.info("")
@@ -745,6 +945,8 @@ def discover_live(
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    import argparse
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
@@ -753,8 +955,23 @@ if __name__ == "__main__":
     base = Path(__file__).resolve().parent.parent
     subs = base / "output" / "all_subs.txt"
     out  = base / "output"
+
+    parser = argparse.ArgumentParser(description="Argus sub_discover (standalone)")
+    parser.add_argument("--scan-id", type=int, default=None,
+                        help="optional: scan_id for remote DB sync")
+    parser.add_argument("--threads", type=int, default=None)
+    parser.add_argument("--rate-limit", type=int, default=None)
+    parser.add_argument("--no-geo", action="store_true")
+    args = parser.parse_args()
+
     try:
-        discover_live(subs, out)
+        discover_live(
+            subs, out,
+            threads=args.threads,
+            rate_limit=args.rate_limit,
+            resolve_geo=not args.no_geo,
+            scan_id=args.scan_id,
+        )
     except Exception as e:
         log.error(f"failed: {e}")
         sys.exit(1)
