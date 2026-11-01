@@ -309,14 +309,15 @@ STAGE_ARTIFACTS = {
 # Recon artifacts use a different schema than findings.
 # Keyed by stage → (json filename, DB table kind).
 RECON_JSON_MAP: dict[str, tuple[str, str]] = {
-    "subs":  ("subdomains.json",  "subdomains"),
-    "dns":   ("dns_resolve.json", "dns_records"),
-    "live":  ("live_hosts.json",  "live_hosts"),
-    "crawl": ("site_pages.json",  "site_pages"),
-    "fuzz":  ("content_fuzz.json", "content_fuzz"),
-    "js":    ("js_findings.json",  "js_findings"),
-    "nmap":  ("nmap_scan.json",    "nmap"),
-    "nuclei":("nuclei_findings.json", "nuclei"),
+    "subs":   ("subdomains.json",     "subdomains"),
+    "dns":    ("dns_resolve.json",    "dns_records"),
+    "live":   ("live_hosts.json",     "live_hosts"),
+    "crawl":  ("site_pages.json",     "site_pages"),
+    "fuzz":   ("content_fuzz.json",   "content_fuzz"),
+    "js":     ("js_findings.json",    "js_findings"),
+    "nmap":   ("nmap_scan.json",      "nmap"),
+    "nuclei": ("nuclei_findings.json","nuclei"),
+    "params": ("param_findings.json", "param_findings"),
 }
 
 def resolve_stages(arg: str) -> list[str]:
@@ -801,7 +802,9 @@ def _run_params(outdir: Path) -> None:
         source, outdir,
         wildcard_file=WILDCARD_FILE,
         rate_limit=r.get("rate_limit", 3),
+        stable=r.get("stable", False),
         headers=_platform_headers() or None,
+        scan_id=_CURRENT_SCAN_ID,
     )
 
 
@@ -1156,6 +1159,31 @@ def _to_nmap_host_payload(h: dict) -> Optional[dict]:
         "first_seen":      h.get("first_seen"),
     }
 
+def _to_param_finding_payload(f: dict) -> Optional[dict]:
+    """Convert a param_findings.json record into the wire shape."""
+    url = f.get("url") or ""
+    param = f.get("parameter") or ""
+    method = (f.get("method") or "GET").upper()
+    if not url or not param:
+        return None
+
+    oracles = f.get("oracles") or []
+    if isinstance(oracles, str):
+        oracles = [oracles]
+
+    return {
+        "url":            url,
+        "method":         method,
+        "parameter":      param,
+        "oracles":        oracles,
+        "confidence":     int(f.get("confidence", 0)),
+        "vuln_classes":   f.get("vuln_classes") or [],
+        "already_in_url": bool(f.get("already_in_url")),
+        "evidence":       f.get("evidence") or [],
+        "auth_enabled":   bool(f.get("auth_enabled")),
+        "first_seen":     _format_dt(f.get("first_seen")),
+    }
+
 def _to_nuclei_finding_payload(f: dict) -> Optional[dict]:
     """Convert a nuclei_findings.json record into the wire shape."""
     tid = f.get("template_id") or ""
@@ -1425,6 +1453,23 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
                 if batches:
                     for batch in batches:
                         DB.save_nuclei_batch(scan_id, batch)
+                return
+
+            elif kind == "param_findings":
+                items = data.get("findings") or []
+                if not items:
+                    return
+                payloads = [_to_param_finding_payload(f) for f in items]
+                payloads = [p for p in payloads if p]
+                if not payloads:
+                    return
+                result = DB.upsert_param_findings(scan_id, payloads)
+                if result is None:
+                    _DB_FAIL_COUNT += 1
+                    log.debug("DB sync param_findings returned None")
+                else:
+                    _DB_FAIL_COUNT = 0
+                    log.info(f"DB sync params: {result} parameter(s) upserted")
                 return
 
         except Exception as e:

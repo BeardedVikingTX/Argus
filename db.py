@@ -396,6 +396,57 @@ class ArgusDB:
         r = self._call("query.nuclei_batches", {"scan_uuid": scan_uuid})
         return r.get("nuclei_batches") if r and r.get("ok") else None
 
+    def upsert_param_findings(
+        self, scan_id: int, findings: list[dict], chunk_size: int = 300,
+    ) -> Optional[int]:
+        """Upsert parameter findings in chunks."""
+        if not findings:
+            return 0
+
+        total = 0
+        for i in range(0, len(findings), chunk_size):
+            chunk = findings[i:i + chunk_size]
+            r = self._call("param_findings.upsert", {
+                "scan_id":        scan_id,
+                "param_findings": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"param_findings.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_param_findings(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        min_confidence: Optional[int] = None,
+        vuln_class: Optional[str] = None,
+        method: Optional[str] = None,
+        oracle: Optional[str] = None,
+        only_hidden: bool = False,
+        min_oracles: Optional[int] = None,
+    ) -> Optional[list]:
+        payload = {
+            "scan_uuid":   scan_uuid,
+            "limit":       limit,
+            "offset":      offset,
+            "only_hidden": only_hidden,
+        }
+        if min_confidence is not None:
+            payload["min_confidence"] = min_confidence
+        if vuln_class is not None:
+            payload["vuln_class"] = vuln_class
+        if method is not None:
+            payload["method"] = method
+        if oracle is not None:
+            payload["oracle"] = oracle
+        if min_oracles is not None:
+            payload["min_oracles"] = min_oracles
+        r = self._call("query.param_findings", payload)
+        return r.get("param_findings") if r and r.get("ok") else None
+
     def upsert_subdomains(
         self, scan_id: int, subdomains: list[dict], chunk_size: int = 500,
     ) -> Optional[int]:
