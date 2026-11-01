@@ -37,11 +37,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import sys
 import time
+import urllib.parse
 import uuid as _uuid
 from datetime import datetime
 from pathlib import Path
@@ -173,6 +175,7 @@ STAGE_META = {
     # ── Harvest ─────────────────────────────────────────────────────────────
     "urls":       ("HARVEST",   "URL Harvesting"),
     "categorize": ("HARVEST",   "URL Categorization"),
+    "crawl":      ("HARVEST",   "Site Crawler"),
     # ── Discover ────────────────────────────────────────────────────────────
     "js":         ("DISCOVER",  "JavaScript Analysis"),
     "params":     ("DISCOVER",  "Parameter Discovery"),
@@ -201,7 +204,7 @@ STAGE_META = {
 STAGE_GROUPS = {
     "recon":    ["subs", "dns", "takeover", "live", "nmap"],
     "harvest":  ["urls", "categorize"],
-    "discover": ["js", "params", "graphql", "crawl", "fuzz"],
+    "discover": ["js", "params", "graphql", "fuzz"],
     "scan":     ["nuclei", "cors", "smuggling", "cache"],
     "audit":    ["auth", "idor", "redirect", "race",
                  "sqli", "xss", "ssrf", "ssti", "xxe"],
@@ -223,7 +226,7 @@ STAGE_DEPS = {
     "takeover":   "subs",
     "live":       "subs",
     "nmap":       "live",
-    "crawl":      "lilve",
+    "crawl":      "live",
     "urls":       "live",
     "categorize": "urls",
     "js":         "urls",
@@ -251,14 +254,15 @@ GROUP_ORDER = ["RECON", "HARVEST", "DISCOVER", "SCAN", "AUDIT", "REPORT"]
 
 # Stages that produce a findings JSON the DB cares about
 FINDINGS_JSON_MAP: dict[str, str] = {
+    # Remove these:
+    #   "graphql": "graphql_findings.json",
+    #   "cache":   "cache_findings.json",
+    #   "auth":    "auth_findings.json",
     "takeover":  "takeover_findings.json",
     "js":        "js_findings.json",
-    "graphql":   "graphql_findings.json",
     "nuclei":    "nuclei_findings.json",
     "cors":      "cors_findings.json",
     "smuggling": "smuggling_findings.json",
-    "cache":     "cache_findings.json",
-    "auth":      "auth_findings.json",
     "idor":      "idor_findings.json",
     "redirect":  "open_redirect_findings.json",
     "race":      "race_findings.json",
@@ -369,7 +373,6 @@ def show_banner():
 
 def show_briefing(wildcards, stage_list, outdir, dry_run, fail_fast,
                   db_status: str, platform: str):
-    print(f"  {cyan(S['shield'])}  Auth         : {auth_status}")
 
     gap()
     print("  " + hline("═", 71, "cyan"))
@@ -453,6 +456,8 @@ ARTIFACT_GROUPS = {
         ("js_endpoints.txt",            "JS endpoints"),
         ("params_by_endpoint.txt",      "Parameters"),
         ("graphql_findings.json",       "GraphQL report"),
+        ("site_pages.json",             "Crawled pages"),
+        ("auth_pages.txt",              "Auth pages found"),
         ("fuzzed_interesting.txt",      "Interesting paths"),
     ],
     "SCAN": [
@@ -826,17 +831,18 @@ def _run_params(outdir: Path) -> None:
 def _run_graphql(outdir: Path) -> None:
     from auditing_tools.graphql_finder import run_graphql_audit
     source = _pick_existing(outdir, ["urls_with_params.txt", "all_urls.txt", "live_urls.txt"])
-    # If the user has manually registered two test accounts, use them
     user_a = _test_account("user_a")
     user_b = _test_account("user_b")
-    schema_path = outdir / "graphql_schema.json"
     r = _module_rate("graphql")
     run_graphql_audit(
         source, outdir,
+        rate_limit=r.get("rate_limit", 2),
+        concurrency=r.get("concurrency", 2),
+        headers=_platform_headers() or None,
         user_a_cookie=user_a.get("cookie") or None,
         user_b_cookie=user_b.get("cookie") or None,
         user_b_id=user_b.get("user_id") or None,
-        threads=r.get("concurrency", 5),
+        scan_id=_CURRENT_SCAN_ID,
     )
 
 
@@ -1431,15 +1437,6 @@ def _format_dt(value: Any) -> Optional[str]:
     return None
 
 def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> None:
-    """
-    Push artifacts for this stage to the bridge.
-
-    Two code paths:
-      1. Recon data (RECON_JSON_MAP) — subdomains, live hosts, site pages
-      2. Findings (FINDINGS_JSON_MAP) — vuln candidates from audit stages
-
-    Fail-safe: never raises, disables DB after N consecutive failures.
-    """
     global _DB_FAIL_COUNT
 
     if not scan_id:
@@ -1451,13 +1448,12 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
 
     log = logging.getLogger("argus")
 
-    # ── Path 1: Recon data ──────────────────────────────────────────────────
+    # ── Path 1: Recon-style data (RECON_JSON_MAP) ──────────────────────────
     if stage in RECON_JSON_MAP:
         fname, kind = RECON_JSON_MAP[stage]
         p = outdir / fname
         if not p.exists() or p.stat().st_size == 0:
             return
-
         try:
             data = json.loads(p.read_text())
         except Exception as e:
@@ -1465,109 +1461,83 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
             return
 
         try:
+            # ── Simple single-call paths
+            result = None
+            label = ""
+
             if kind == "subdomains":
                 items = data.get("subdomains") or []
-                if not items:
-                    return
-                result = DB.upsert_subdomains(scan_id, items)
-                label = "subdomain(s)"
+                if items:
+                    result = DB.upsert_subdomains(scan_id, items)
+                    label = "subdomain(s)"
 
             elif kind == "dns_records":
                 items = data.get("records") or []
-                if not items:
-                    return
-                result = DB.upsert_dns_records(scan_id, items)
-                label = "DNS record(s)"
+                if items:
+                    result = DB.upsert_dns_records(scan_id, items)
+                    label = "DNS record(s)"
 
             elif kind == "live_hosts":
                 items = data.get("hosts") or []
-                if not items:
-                    return
-                payloads = [_to_live_host_payload(h) for h in items]
-                payloads = [p for p in payloads if p and p.get("url")]
-                if not payloads:
-                    return
-                result = DB.upsert_live_hosts(scan_id, payloads)
-                label = "live host(s)"
+                if items:
+                    payloads = [_to_live_host_payload(h) for h in items]
+                    payloads = [p for p in payloads if p and p.get("url")]
+                    if payloads:
+                        result = DB.upsert_live_hosts(scan_id, payloads)
+                        label = "live host(s)"
 
             elif kind == "site_pages":
                 items = data.get("pages") or []
-                if not items:
-                    return
-                # Already in wire shape from PageRecord.to_dict()
-                result = DB.upsert_site_pages(scan_id, items)
-                label = "page(s)"
+                if items:
+                    result = DB.upsert_site_pages(scan_id, items)
+                    label = "page(s)"
 
             elif kind == "content_fuzz":
                 items = data.get("findings") or []
-                if not items:
-                    return
-                result = DB.upsert_content_fuzz(scan_id, items)
-                label = "endpoint(s)"
+                if items:
+                    result = DB.upsert_content_fuzz(scan_id, items)
+                    label = "endpoint(s)"
 
             elif kind == "js_findings":
                 items = data.get("findings") or []
-                if not items:
-                    return
-                result = DB.upsert_js_findings(scan_id, items)
-                label = "JS finding(s)"
+                if items:
+                    result = DB.upsert_js_findings(scan_id, items)
+                    label = "JS finding(s)"
 
+            # ── Multi-table paths — return explicitly
             elif kind == "nmap":
-                # nmap uses two tables — hosts first, then ports (which need host_ids)
                 hosts_data = data.get("hosts") or []
                 if not hosts_data:
                     return
-
-                # ── Step 1: upsert hosts
                 host_payloads = [_to_nmap_host_payload(h) for h in hosts_data]
                 host_payloads = [h for h in host_payloads if h and h.get("ip")]
                 if not host_payloads:
                     return
-
                 host_result = DB.upsert_nmap_hosts(scan_id, host_payloads)
                 if host_result is None:
                     _DB_FAIL_COUNT += 1
-                    log.debug(f"DB sync nmap hosts returned None")
+                    log.debug("DB sync nmap hosts returned None")
                     return
                 _DB_FAIL_COUNT = 0
                 host_ids = host_result.get("host_ids", {})
                 log.info(f"DB sync nmap: {host_result['count']} host(s) upserted")
-
-                # ── Step 2: upsert ports
                 port_payloads: list[dict] = []
                 for h in hosts_data:
                     ip = h.get("ip", "")
                     host_hash = hashlib.sha256(ip.encode()).hexdigest()
                     if host_hash not in host_ids:
                         continue
-                    for p in h.get("ports", []):
-                        pp = _to_nmap_port_payload(h, p, host_hash)
+                    for p2 in h.get("ports", []):
+                        pp = _to_nmap_port_payload(h, p2, host_hash)
                         if pp:
                             port_payloads.append(pp)
-
                 if port_payloads:
                     port_count = DB.upsert_nmap_ports(scan_id, port_payloads)
                     if port_count is not None:
                         log.info(f"DB sync nmap: {port_count} port(s) upserted")
-                    else:
-                        log.debug("DB sync nmap ports returned None")
                 return
-
-            else:
-                return
-
-            if result is None:
-                _DB_FAIL_COUNT += 1
-                log.debug(
-                    f"DB sync {stage} returned None "
-                    f"({_DB_FAIL_COUNT}/{_DB_MAX_FAILURES})"
-                )
-            else:
-                _DB_FAIL_COUNT = 0
-                log.info(f"DB sync {stage}: {result} {label} upserted")
 
             elif kind == "nuclei":
-                # Nuclei uses two tables — findings + per-batch metadata
                 items = data.get("findings") or []
                 if items:
                     payloads = [_to_nuclei_finding_payload(f) for f in items]
@@ -1580,12 +1550,8 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
                         else:
                             _DB_FAIL_COUNT = 0
                             log.info(f"DB sync nuclei: {result} finding(s) upserted")
-
-                # Batch metadata
-                batches = data.get("batches") or []
-                if batches:
-                    for batch in batches:
-                        DB.save_nuclei_batch(scan_id, batch)
+                for batch in (data.get("batches") or []):
+                    DB.save_nuclei_batch(scan_id, batch)
                 return
 
             elif kind == "param_findings":
@@ -1640,35 +1606,24 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
                 return
 
             elif kind == "url_categorize":
-                # The JSON report has per-category lists; we want one row per URL
-                # with its aggregate category data. Rebuild from priority_urls +
-                # all categories.
-                items: list[dict] = []
-
-                # Build URL → entry map
                 url_map: dict[str, dict] = {}
-
-                # Priority URLs have full category + weight data
-                for p in data.get("priority_urls") or []:
-                    url = p.get("url")
+                for p2 in data.get("priority_urls") or []:
+                    url = p2.get("url")
                     if not url:
                         continue
                     url_map[url] = {
                         "url":             url,
-                        "categories":      p.get("categories") or [],
-                        "category_count":  len(p.get("categories") or []),
-                        "weight":          int(p.get("weight") or 0),
-                        "param_names":     p.get("param_names") or [],
-                        "high_risk_count": 0,   # computed below
+                        "categories":      p2.get("categories") or [],
+                        "category_count":  len(p2.get("categories") or []),
+                        "weight":          int(p2.get("weight") or 0),
+                        "param_names":     p2.get("param_names") or [],
+                        "high_risk_count": 0,
                         "is_priority":     True,
                     }
-
-                # Also walk per-category lists to catch non-priority URLs
                 HIGH_RISK = {"sqli", "ssrf", "rce", "lfi", "ssti", "idor"}
                 for cat in data.get("categories") or []:
                     cat_name = (cat.get("name") or "").lower()
-                    cat_urls = cat.get("urls") or []
-                    for url in cat_urls:
+                    for url in (cat.get("urls") or []):
                         if not url:
                             continue
                         entry = url_map.setdefault(url, {
@@ -1682,14 +1637,10 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
                         })
                         if cat_name and cat_name not in entry["categories"]:
                             entry["categories"].append(cat_name)
-                            entry["category_count"] = len(entry["categories"])
-                        # Approximate weight by category
                         cat_weight = 3 if cat_name in HIGH_RISK else 2 if cat_name in (
                             "redirect", "graphql", "oauth", "upload",
                         ) else 1
-                        entry["weight"] = max(entry["weight"], 0) + cat_weight
-
-                # Compute high_risk_count and final weight
+                        entry["weight"] += cat_weight
                 for url, entry in url_map.items():
                     entry["high_risk_count"] = sum(
                         1 for c in entry["categories"] if c in HIGH_RISK
@@ -1699,13 +1650,10 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
                         entry["param_names"] = list(
                             urllib.parse.parse_qs(parsed.query).keys()
                         )
-                    # Refresh category_count in case we added categories
                     entry["category_count"] = len(entry["categories"])
-
                 items = list(url_map.values())
                 if not items:
                     return
-
                 result = DB.upsert_url_categorize(scan_id, items)
                 if result is None:
                     _DB_FAIL_COUNT += 1
@@ -1715,10 +1663,110 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
                     log.info(f"DB sync categorize: {result} URL(s) upserted")
                 return
 
+            else:
+                return
+
+            # ── Simple-path result check
+            if result is None:
+                _DB_FAIL_COUNT += 1
+                log.debug(
+                    f"DB sync {stage} returned None "
+                    f"({_DB_FAIL_COUNT}/{_DB_MAX_FAILURES})"
+                )
+            else:
+                _DB_FAIL_COUNT = 0
+                log.info(f"DB sync {stage}: {result} {label} upserted")
+
         except Exception as e:
             _DB_FAIL_COUNT += 1
             log.debug(f"DB sync exception on {stage}: {e}")
         return
+
+    # ── Special case: auth findings ─────────────────────────────────────────
+    if stage == "auth":
+        p = outdir / "auth_findings.json"
+        if not p.exists() or p.stat().st_size == 0:
+            return
+        try:
+            data = json.loads(p.read_text())
+        except Exception as e:
+            log.debug(f"DB sync: could not parse auth_findings.json: {e}")
+            return
+        items = data.get("findings") or []
+        if not items:
+            return
+        payloads = [_to_auth_payload(f) for f in items]
+        payloads = [x for x in payloads if x]
+        if not payloads:
+            return
+        try:
+            result = DB.upsert_auth_findings(scan_id, payloads)
+            if result is None:
+                _DB_FAIL_COUNT += 1
+                log.debug("DB sync auth returned None")
+            else:
+                _DB_FAIL_COUNT = 0
+                log.info(f"DB sync auth: {result} finding(s) upserted")
+        except Exception as e:
+            _DB_FAIL_COUNT += 1
+            log.debug(f"DB sync auth exception: {e}")
+        return
+
+    # ── Special case: cache findings ────────────────────────────────────────
+    if stage == "cache":
+        p = outdir / "cache_findings.json"
+        if not p.exists() or p.stat().st_size == 0:
+            return
+        try:
+            data = json.loads(p.read_text())
+        except Exception as e:
+            log.debug(f"DB sync: could not parse cache_findings.json: {e}")
+            return
+        items = data.get("findings") or []
+        if not items:
+            return
+        try:
+            result = DB.upsert_cache_findings(scan_id, items)
+            if result is None:
+                _DB_FAIL_COUNT += 1
+                log.debug("DB sync cache returned None")
+            else:
+                _DB_FAIL_COUNT = 0
+                log.info(f"DB sync cache: {result} finding(s) upserted")
+        except Exception as e:
+            _DB_FAIL_COUNT += 1
+            log.debug(f"DB sync cache exception: {e}")
+        return
+
+    # ── Path 2: Generic findings (FINDINGS_JSON_MAP) ────────────────────────
+    fname = FINDINGS_JSON_MAP.get(stage)
+    if not fname:
+        return
+    p = outdir / fname
+    if not p.exists() or p.stat().st_size == 0:
+        return
+    try:
+        data = json.loads(p.read_text())
+    except Exception as e:
+        log.debug(f"DB sync: could not parse {fname}: {e}")
+        return
+    findings = _normalize_findings(stage, data)
+    if not findings:
+        return
+    try:
+        result = DB.upsert_findings(scan_id, findings)
+        if result is None:
+            _DB_FAIL_COUNT += 1
+            log.debug(
+                f"DB sync for {stage} returned None "
+                f"({_DB_FAIL_COUNT}/{_DB_MAX_FAILURES})"
+            )
+        else:
+            _DB_FAIL_COUNT = 0
+            log.info(f"DB sync {stage}: {result} finding(s) upserted")
+    except Exception as e:
+        _DB_FAIL_COUNT += 1
+        log.debug(f"DB sync exception on {stage}: {e}")
 
     # ── Special case: auth findings go to the dedicated table ──────────────
     if stage == "auth":
@@ -1812,7 +1860,42 @@ def _run_crawl(outdir: Path) -> None:
     run_site_crawl(source, outdir)
 
 
-RUNNERS["crawl"] = _run_crawl
+RUNNERS = {
+    # ── Recon ───────────────────────────────────────────────────────────────
+    "subs":       _run_subs,
+    "dns":        _run_dns,
+    "takeover":   _run_takeover,
+    "live":       _run_live,
+    "nmap":       _run_nmap,
+    # ── Harvest ─────────────────────────────────────────────────────────────
+    "urls":       _run_urls,
+    "categorize": _run_categorize,
+    "crawl":      _run_crawl,
+    # ── Discover ────────────────────────────────────────────────────────────
+    "js":         _run_js,
+    "params":     _run_params,
+    "graphql":    _run_graphql,
+    "fuzz":       _run_fuzz,
+    # ── Scan ────────────────────────────────────────────────────────────────
+    "nuclei":     _run_nuclei,
+    "cors":       _run_cors,
+    "smuggling":  _run_smuggling,
+    "cache":      _run_cache,
+    # ── Audit ───────────────────────────────────────────────────────────────
+    "auth":       _run_auth,
+    "idor":       _run_idor,
+    "redirect":   _run_redirect,
+    "race":       _run_race,
+    "sqli":       _run_sqli,
+    "xss":        _run_xss,
+    "ssrf":       _run_ssrf,
+    "ssti":       _run_ssti,
+    "xxe":        _run_xxe,
+    # ── Report ──────────────────────────────────────────────────────────────
+    "mapping":    _run_mapping,
+    "triage":     _run_triage,
+}
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  LOGGING
 # ═════════════════════════════════════════════════════════════════════════════

@@ -723,6 +723,52 @@ class ArgusDB:
         r = self._call("query.cache_findings", payload)
         return r.get("cache_findings") if r and r.get("ok") else None
 
+    def upsert_graphql_findings(
+        self, scan_id: int, findings: list[dict], chunk_size: int = 200,
+    ) -> Optional[int]:
+        if not findings:
+            return 0
+        total = 0
+        for i in range(0, len(findings), chunk_size):
+            chunk = findings[i:i + chunk_size]
+            r = self._call("graphql_findings.upsert", {
+                "scan_id": scan_id, "graphql_findings": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(f"graphql_findings.upsert chunk failed ({len(chunk)} entries, offset {i})")
+        return total
+
+    def _run_graphql(outdir: Path) -> None:
+        from auditing_tools.graphql_finder import run_graphql_audit
+        source = _pick_existing(outdir, ["urls_with_params.txt", "live_urls.txt"])
+        r = _module_rate("graphql")
+        run_graphql_audit(
+            source, outdir,
+            rate_limit=r.get("rate_limit", 2),
+            concurrency=r.get("concurrency", 2),
+            headers=_platform_headers() or None,
+            user_a_cookie=_test_account("user_a").get("cookie") or None,
+            user_b_id=_test_account("user_b").get("user_id") or None,
+            scan_id=_CURRENT_SCAN_ID,
+        )
+
+    def get_graphql_findings(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        severity: Optional[str] = None, category: Optional[str] = None,
+        engine: Optional[str] = None, host: Optional[str] = None,
+        min_confidence: Optional[int] = None,
+    ) -> Optional[list]:
+        payload = {"scan_uuid": scan_uuid, "limit": limit, "offset": offset}
+        if severity is not None: payload["severity"] = severity
+        if category is not None: payload["category"] = category
+        if engine is not None: payload["engine"] = engine
+        if host is not None: payload["host"] = host
+        if min_confidence is not None: payload["min_confidence"] = min_confidence
+        r = self._call("query.graphql_findings", payload)
+        return r.get("graphql_findings") if r and r.get("ok") else None
+
     def upsert_subdomains(
         self, scan_id: int, subdomains: list[dict], chunk_size: int = 500,
     ) -> Optional[int]:

