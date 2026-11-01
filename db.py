@@ -235,6 +235,47 @@ class ArgusDB:
                 )
         return total
 
+    def upsert_site_pages(
+        self, scan_id: int, site_pages: list[dict], chunk_size: int = 100,
+    ) -> Optional[int]:
+        """
+        Upsert crawled pages in chunks.
+
+        Chunk size is smaller than live_hosts because the forms/links arrays
+        can be large. 100 pages × ~30KB payload ≈ 3MB, well under the
+        default post_max_size.
+        """
+        if not site_pages:
+            return 0
+
+        total = 0
+        for i in range(0, len(site_pages), chunk_size):
+            chunk = site_pages[i:i + chunk_size]
+            r = self._call("site_pages.upsert", {
+                "scan_id":    scan_id,
+                "site_pages": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"site_pages.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_site_pages(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        page_kind: Optional[str] = None, is_auth: Optional[bool] = None,
+    ) -> Optional[list]:
+        payload = {"scan_uuid": scan_uuid, "limit": limit, "offset": offset}
+        if page_kind is not None:
+            payload["page_kind"] = page_kind
+        if is_auth is not None:
+            payload["is_auth"] = is_auth
+        r = self._call("query.site_pages", payload)
+        return r.get("site_pages") if r and r.get("ok") else None
+
     def get_live_hosts(
         self, scan_uuid: str, limit: int = 100, offset: int = 0,
         interesting: Optional[bool] = None, min_score: Optional[int] = None,

@@ -201,25 +201,19 @@ STAGE_META = {
 STAGE_GROUPS = {
     "recon":    ["subs", "dns", "takeover", "live", "nmap"],
     "harvest":  ["urls", "categorize"],
-    "discover": ["js", "params", "graphql", "fuzz"],
+    "discover": ["js", "params", "graphql", "crawl", "fuzz"],
     "scan":     ["nuclei", "cors", "smuggling", "cache"],
     "audit":    ["auth", "idor", "redirect", "race",
                  "sqli", "xss", "ssrf", "ssti", "xxe"],
     "report":   ["mapping", "triage"],
     "quick":    ["subs", "dns", "live", "urls", "categorize", "triage"],
-    "all":      [
-        # Recon
+    "all": [
         "subs", "dns", "takeover", "live", "nmap",
-        # Harvest
         "urls", "categorize",
-        # Discover
-        "js", "params", "graphql", "fuzz",
-        # Scan
+        "js", "params", "graphql", "crawl", "fuzz",
         "nuclei", "cors", "smuggling", "cache",
-        # Audit
         "auth", "idor", "redirect", "race",
         "sqli", "xss", "ssrf", "ssti", "xxe",
-        # Report
         "mapping", "triage",
     ],
 }
@@ -229,6 +223,7 @@ STAGE_DEPS = {
     "takeover":   "subs",
     "live":       "subs",
     "nmap":       "live",
+    "crawl":      "lilve",
     "urls":       "live",
     "categorize": "urls",
     "js":         "urls",
@@ -308,6 +303,7 @@ STAGE_ARTIFACTS = {
     "mapping":    ["site_map.json", "site_map.md", "site_map_hosts.txt"],
     "triage":     ["triage_report.json", "triage_priority.md",
                    "triage_next_steps.txt"],
+    "crawl":      ["site_pages.json", "site_pages.txt", "auth_pages.txt"],
 }
 
 # Recon artifacts use a different schema than findings.
@@ -315,6 +311,7 @@ STAGE_ARTIFACTS = {
 RECON_JSON_MAP: dict[str, tuple[str, str]] = {
     "subs": ("subdomains.json", "subdomains"),
     "live": ("live_hosts.json", "live_hosts"),
+    "crawl": ("site_pages.json", "site_pages"),
 }
 def resolve_stages(arg: str) -> list[str]:
     if arg in STAGE_GROUPS:
@@ -362,6 +359,8 @@ def show_banner():
 
 def show_briefing(wildcards, stage_list, outdir, dry_run, fail_fast,
                   db_status: str, platform: str):
+    print(f"  {cyan(S['shield'])}  Auth         : {auth_status}")
+
     gap()
     print("  " + hline("═", 71, "cyan"))
     print("  " + bold(f"{S['sword']}  RAID BRIEFING"))
@@ -672,9 +671,17 @@ def _pick_existing(outdir: Path, candidates: list[str]) -> Path:
 
 
 def _platform_headers() -> dict[str, str]:
-    """Return the merged platform headers, or an empty dict."""
-    hdrs = _cfg("ACTIVE_HEADERS", {})
-    return dict(hdrs) if hdrs else {}
+    """
+    Return merged headers for target traffic.
+
+    Priority: auth headers (from request.txt) override platform headers.
+    """
+    h = dict(_cfg("ACTIVE_HEADERS", {}) or {})
+    if CFG_LOADED and getattr(CFG, "AUTH_ENABLED", False):
+        auth_hdrs = getattr(CFG, "AUTH_HEADERS", {}) or {}
+        if auth_hdrs:
+            h.update(auth_hdrs)
+    return h
 
 
 def _module_rate(stage: str) -> dict[str, Any]:
@@ -1263,6 +1270,13 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
         _DB_FAIL_COUNT += 1
         log.debug(f"DB sync exception on {stage}: {e}")
 
+            elif kind == "site_pages":
+                items = data.get("pages") or []
+                if not items:
+                    return
+                result = DB.upsert_site_pages(scan_id, items)
+                label = "page(s)"
+
 
 def _sync_oob(scan_id: Optional[int], outdir: Path) -> None:
     """Push OOB tokens and hits to the bridge."""
@@ -1286,7 +1300,13 @@ def _sync_oob(scan_id: Optional[int], outdir: Path) -> None:
     except Exception as e:
         logging.getLogger("argus").debug(f"OOB sync failed: {e}")
 
+def _run_crawl(outdir: Path) -> None:
+    from auditing_tools.site_crawler import run_site_crawl
+    source = _pick_existing(outdir, ["live_urls.txt"])
+    run_site_crawl(source, outdir)
 
+
+RUNNERS["crawl"] = _run_crawl
 # ═════════════════════════════════════════════════════════════════════════════
 #  LOGGING
 # ═════════════════════════════════════════════════════════════════════════════

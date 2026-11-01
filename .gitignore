@@ -23,6 +23,9 @@ config.*.py
 config_local.py
 config-dev.py
 !example_config.py
+request.txt
+request.*.txt
+screenshots/
 
 # Generic env / secret files
 .env
