@@ -253,14 +253,9 @@ STAGE_DEPS = {
 GROUP_ORDER = ["RECON", "HARVEST", "DISCOVER", "SCAN", "AUDIT", "REPORT"]
 
 # Stages that produce a findings JSON the DB cares about
-FINDINGS_JSON_MAP: dict[str, str] = {
-    # Remove these:
-    #   "graphql": "graphql_findings.json",
-    #   "cache":   "cache_findings.json",
-    #   "auth":    "auth_findings.json",
-    "takeover":  "takeover_findings.json",
-    "js":        "js_findings.json",
-    "nuclei":    "nuclei_findings.json",
+# Routing — only stages that fall through to the generic `findings` table.
+# MUST NOT overlap RECON_JSON_MAP or _SPECIAL_SYNC_STAGES.
+FINDINGS_JSON_MAP = {
     "cors":      "cors_findings.json",
     "smuggling": "smuggling_findings.json",
     "idor":      "idor_findings.json",
@@ -271,6 +266,15 @@ FINDINGS_JSON_MAP: dict[str, str] = {
     "ssrf":      "ssrf_findings.json",
     "ssti":      "ssti_findings.json",
     "xxe":       "xxe_findings.json",
+}
+
+# Aggregation — every findings-shaped JSON, regardless of DB routing.
+# Used only by _aggregate_severity() and _top_findings().
+AGGREGATION_JSON_MAP = {
+    **FINDINGS_JSON_MAP,
+    "takeover": "takeover_findings.json",
+    "js":       "js_findings.json",
+    "nuclei":   "nuclei_findings.json",
 }
 
 # Artifacts each stage typically writes — used for stage records and the final briefing
@@ -493,7 +497,7 @@ ARTIFACT_GROUPS = {
 def _aggregate_severity(outdir: Path) -> dict[str, int]:
     """Sum up CRITICAL/HIGH/MEDIUM/LOW/INFO across every finder JSON."""
     counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
-    for stage, fname in FINDINGS_JSON_MAP.items():
+    for stage, fname in AGGREGATION_JSON_MAP.items():    # ← was FINDINGS_JSON_MAP
         p = outdir / fname
         if not p.exists():
             continue
@@ -519,7 +523,7 @@ def _top_findings(outdir: Path, n: int = 5) -> list[dict]:
     all_findings: list[dict] = []
     sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
-    for stage, fname in FINDINGS_JSON_MAP.items():
+    for stage, fname in AGGREGATION_JSON_MAP.items():    # ← was FINDINGS_JSON_MAP
         p = outdir / fname
         if not p.exists():
             continue
@@ -582,6 +586,9 @@ def show_final_briefing(results: dict[str, str], outdir: Path,
     print(f"  {cyan(S['shield'])}  Scan UUID    : {dim(scan_uuid)}")
     if db_scan_id:
         print(f"  {cyan(S['db'])}  Database     : {green(f'synced (id={db_scan_id})')}")
+        summary = _sync_summary()                                    # ← add
+        if summary != "not synced":                                  # ← add
+            print(f"  {cyan(S['db'])}  Sync detail  : {dim(summary)}")  # ← add
     elif db_failures:
         print(f"  {cyan(S['db'])}  Database     : {yellow(f'unreachable ({db_failures} failure(s))')}")
     elif not DB_MODULE_AVAILABLE:
@@ -794,11 +801,16 @@ def _run_urls(outdir: Path) -> None:
         scan_id=_CURRENT_SCAN_ID,
     )
 
-
 def _run_categorize(outdir: Path) -> None:
     from recon_tools.url_categorize import run_url_categorize
     source = _pick_existing(outdir, ["urls_with_params.txt", "all_urls.txt"])
     run_url_categorize(source, outdir, scan_id=_CURRENT_SCAN_ID)
+
+
+def _run_crawl(outdir: Path) -> None:                # ← paste here
+    from auditing_tools.site_crawler import run_site_crawl
+    source = _pick_existing(outdir, ["live_urls.txt"])
+    run_site_crawl(source, outdir)
 
 
 def _run_js(outdir: Path) -> None:
@@ -939,9 +951,13 @@ def _run_redirect(outdir: Path) -> None:
     source = _pick_existing(
         outdir, ["gf_redirect.txt", "urls_with_params.txt", "live_urls.txt"],
     )
+    r = _module_rate("redirect")
     run_open_redirect_audit(
         source, outdir,
         headers=_platform_headers() or None,
+        rate_limit=r.get("rate_limit", 3),
+        concurrency=r.get("concurrency", 4),
+        scan_id=_CURRENT_SCAN_ID,
     )
 
 
@@ -1026,6 +1042,7 @@ RUNNERS = {
     "live":       _run_live,
     "nmap":       _run_nmap,
     "urls":       _run_urls,
+    "crawl":      _run_crawl,
     "categorize": _run_categorize,
     "js":         _run_js,
     "params":     _run_params,
@@ -1080,6 +1097,17 @@ _CURRENT_SCAN_ID: Optional[int] = None
 _DB_FAIL_COUNT = 0
 _DB_MAX_FAILURES = 3
 
+# Stages that own a dedicated DB table AND have no FINDINGS_JSON_MAP entry.
+# These are the ONLY stages that go through the "special" path. Format:
+#   stage → (json_filename, db_method_suffix)
+_SPECIAL_SYNC_STAGES: dict[str, tuple[str, str]] = {
+    "auth":  ("auth_findings.json",  "auth_findings"),
+    "cache": ("cache_findings.json", "cache_findings"),
+}
+
+# Populated by _sync_stage_artifacts; read by _sync_summary() in the
+# final briefing. Format: stage → {"ok": bool, "count": int, "note"|"error": str}
+_LAST_SYNC_STATUS: dict[str, dict] = {}
 
 def _normalize_findings(stage: str, data: dict) -> list[dict]:
     """Extract and normalize findings from a module's JSON output."""
@@ -1097,7 +1125,8 @@ def _normalize_findings(stage: str, data: dict) -> list[dict]:
             f.get("vuln_type") or f.get("technique")
             or f.get("template_id") or f.get("xss_type")
             or f.get("race_class") or f.get("variant")
-            or f.get("probe") or f.get("kind")
+            or f.get("probe") or f.get("vector")      # ← ADD THIS
+            or f.get("kind")
             or stage
         )
         target = (
@@ -1193,13 +1222,6 @@ def _to_nmap_host_payload(h: dict) -> Optional[dict]:
         "first_seen":      h.get("first_seen"),
     }
 
-_AUTH_CATEGORY_MAP = {
-    "jwt":     "jwt",
-    "oauth":   "oauth",
-    "saml":    "saml",
-    "cookie":  "cookie",
-    "csrf":    "csrf",
-}
 
 def _to_auth_payload(f: dict) -> Optional[dict]:
     """Convert an auth_findings.json record into the wire shape."""
@@ -1439,9 +1461,404 @@ def _format_dt(value: Any) -> Optional[str]:
         return value.replace("T", " ").split(".")[0].split("+")[0].rstrip("Z")
     return None
 
-def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> None:
+
+
+
+# ── Shared helpers ──────────────────────────────────────────────────────────
+
+def _load_json_artifact(outdir: Path, fname: str, log) -> Optional[dict]:
+    """Load a JSON artifact if present and non-empty. None on miss/parse error."""
+    p = outdir / fname
+    if not p.exists() or p.stat().st_size == 0:
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception as e:
+        log.debug(f"DB sync: could not parse {fname}: {e}")
+        return None
+
+
+def _sync_items(
+    db_method,
+    scan_id: int,
+    items: list,
+    stage: str,
+    log,
+    label: str = "finding(s)",
+) -> Optional[int]:
+    """
+    Call a single DB upsert with consistent fail-count + status tracking.
+
+    Every upsert call in this module funnels through here, so the
+    ``_DB_FAIL_COUNT`` ceiling is applied uniformly and the final
+    briefing can read ``_LAST_SYNC_STATUS`` for a truthful summary.
+
+    Returns:
+        count (int) on success (including 0 for empty input), None on failure.
+    """
     global _DB_FAIL_COUNT
 
+    if not items:
+        _LAST_SYNC_STATUS[stage] = {"ok": True, "count": 0, "note": "empty"}
+        return 0
+
+    try:
+        result = db_method(scan_id, items)
+    except Exception as e:
+        _DB_FAIL_COUNT += 1
+        _LAST_SYNC_STATUS[stage] = {"ok": False, "count": 0, "error": str(e)}
+        log.debug(f"DB sync {stage} exception: {e}")
+        return None
+
+    if result is None:
+        _DB_FAIL_COUNT += 1
+        _LAST_SYNC_STATUS[stage] = {"ok": False, "count": 0, "error": "None"}
+        log.debug(
+            f"DB sync {stage} returned None "
+            f"({_DB_FAIL_COUNT}/{_DB_MAX_FAILURES})"
+        )
+        return None
+
+    _DB_FAIL_COUNT = 0
+    _LAST_SYNC_STATUS[stage] = {"ok": True, "count": int(result)}
+    log.info(f"DB sync {stage}: {result} {label} upserted")
+    return int(result)
+
+
+def _sync_summary() -> str:
+    """One-line summary of the last sync, for the final briefing panel."""
+    if not _LAST_SYNC_STATUS:
+        return "not synced"
+    ok = sum(1 for s in _LAST_SYNC_STATUS.values() if s.get("ok"))
+    failed = sum(1 for s in _LAST_SYNC_STATUS.values() if not s.get("ok"))
+    total = sum(int(s.get("count", 0)) for s in _LAST_SYNC_STATUS.values())
+    parts: list[str] = []
+    if ok:
+        parts.append(f"{ok} stage(s)")
+    if failed:
+        parts.append(f"{failed} failed")
+    if not parts:
+        return "not synced"
+    return f"{' + '.join(parts)} · {total} row(s)"
+
+
+# ── Payload builders that don't fit the simple single-call pattern ──────────
+
+def _build_url_categorize_payloads(data: dict) -> list[dict]:
+    """
+    Merge url_categorize.json's two views (priority_urls + categories) into a
+    single per-URL record for the DB. Extracted so it's testable on its own.
+    """
+    HIGH_RISK = {"sqli", "ssrf", "rce", "lfi", "ssti", "idor"}
+    MED_RISK = {"redirect", "graphql", "oauth", "upload"}
+
+    url_map: dict[str, dict] = {}
+
+    for entry in data.get("priority_urls") or []:
+        url = entry.get("url")
+        if not url:
+            continue
+        cats = entry.get("categories") or []
+        url_map[url] = {
+            "url":             url,
+            "categories":      list(cats),
+            "category_count":  len(cats),
+            "weight":          int(entry.get("weight") or 0),
+            "param_names":     entry.get("param_names") or [],
+            "high_risk_count": 0,
+            "is_priority":     True,
+        }
+
+    for cat in data.get("categories") or []:
+        cat_name = (cat.get("name") or "").lower()
+        weight = 3 if cat_name in HIGH_RISK else 2 if cat_name in MED_RISK else 1
+        for url in (cat.get("urls") or []):
+            if not url:
+                continue
+            entry = url_map.setdefault(url, {
+                "url":             url,
+                "categories":      [],
+                "category_count":  0,
+                "weight":          0,
+                "param_names":     [],
+                "high_risk_count": 0,
+                "is_priority":     False,
+            })
+            if cat_name and cat_name not in entry["categories"]:
+                entry["categories"].append(cat_name)
+            entry["weight"] += weight
+
+    for url, entry in url_map.items():
+        entry["high_risk_count"] = sum(
+            1 for c in entry["categories"] if c in HIGH_RISK
+        )
+        if not entry["param_names"]:
+            parsed = urllib.parse.urlparse(url)
+            entry["param_names"] = list(
+                urllib.parse.parse_qs(parsed.query).keys()
+            )
+        entry["category_count"] = len(entry["categories"])
+
+    return list(url_map.values())
+
+
+# ── Path 1: RECON_JSON_MAP dispatch ─────────────────────────────────────────
+
+def _sync_nmap(scan_id: int, data: dict, log) -> None:
+    """
+    nmap writes two tables. Host ids returned by the first upsert feed the
+    port payloads for the second, so this stage can't be generalized.
+    """
+    global _DB_FAIL_COUNT
+
+    hosts_data = data.get("hosts") or []
+    if not hosts_data:
+        _LAST_SYNC_STATUS["nmap"] = {"ok": True, "count": 0, "note": "no hosts"}
+        return
+
+    host_payloads = [
+        h for h in (_to_nmap_host_payload(x) for x in hosts_data)
+        if h and h.get("ip")
+    ]
+    if not host_payloads:
+        _LAST_SYNC_STATUS["nmap"] = {"ok": True, "count": 0, "note": "no valid hosts"}
+        return
+
+    try:
+        host_result = DB.upsert_nmap_hosts(scan_id, host_payloads)
+    except Exception as e:
+        _DB_FAIL_COUNT += 1
+        _LAST_SYNC_STATUS["nmap"] = {"ok": False, "count": 0, "error": str(e)}
+        log.debug(f"DB sync nmap hosts exception: {e}")
+        return
+
+    if host_result is None:
+        _DB_FAIL_COUNT += 1
+        _LAST_SYNC_STATUS["nmap"] = {"ok": False, "count": 0, "error": "hosts None"}
+        log.debug("DB sync nmap hosts returned None")
+        return
+
+    _DB_FAIL_COUNT = 0
+    host_ids = host_result.get("host_ids", {}) if isinstance(host_result, dict) else {}
+    host_count = host_result.get("count", 0) if isinstance(host_result, dict) else 0
+    log.info(f"DB sync nmap: {host_count} host(s) upserted")
+
+    port_payloads: list[dict] = []
+    for h in hosts_data:
+        ip = h.get("ip", "")
+        if not ip:
+            continue
+        host_hash = hashlib.sha256(ip.encode()).hexdigest()
+        if host_hash not in host_ids:
+            continue
+        for p2 in h.get("ports", []):
+            pp = _to_nmap_port_payload(h, p2, host_hash)
+            if pp:
+                port_payloads.append(pp)
+
+    if not port_payloads:
+        _LAST_SYNC_STATUS["nmap"] = {
+            "ok": True, "count": host_count, "note": "no open ports",
+        }
+        return
+
+    try:
+        port_count = DB.upsert_nmap_ports(scan_id, port_payloads)
+    except Exception as e:
+        _DB_FAIL_COUNT += 1
+        _LAST_SYNC_STATUS["nmap"] = {
+            "ok": True, "count": host_count, "error": f"ports: {e}",
+        }
+        log.debug(f"DB sync nmap ports exception: {e}")
+        return
+
+    if port_count is not None:
+        log.info(f"DB sync nmap: {port_count} port(s) upserted")
+        _LAST_SYNC_STATUS["nmap"] = {
+            "ok": True, "count": host_count + int(port_count),
+        }
+    else:
+        _LAST_SYNC_STATUS["nmap"] = {
+            "ok": True, "count": host_count, "note": "ports None",
+        }
+
+
+def _sync_recon_stage(scan_id: int, stage: str, outdir: Path, log) -> None:
+    """
+    Handle any stage listed in RECON_JSON_MAP. Dispatches by `kind` (the
+    second tuple element). Always returns — no fallthrough to the generic path.
+    """
+    fname, kind = RECON_JSON_MAP[stage]
+    data = _load_json_artifact(outdir, fname, log)
+    if data is None:
+        _LAST_SYNC_STATUS[stage] = {"ok": True, "count": 0, "note": "empty"}
+        return
+
+    # ── Multi-table kinds (must return explicitly)
+    if kind == "nmap":
+        _sync_nmap(scan_id, data, log)
+        return
+
+    if kind == "nuclei":
+        items = [
+            p for p in (
+                _to_nuclei_finding_payload(f)
+                for f in (data.get("findings") or [])
+            ) if p
+        ]
+        if items:
+            _sync_items(
+                DB.upsert_nuclei_findings, scan_id, items,
+                "nuclei", log, "finding(s)",
+            )
+        for batch in (data.get("batches") or []):
+            try:
+                DB.save_nuclei_batch(scan_id, batch)
+            except Exception as e:
+                log.debug(f"DB save_nuclei_batch exception: {e}")
+        return
+
+    if kind == "url_categorize":
+        items = _build_url_categorize_payloads(data)
+        _sync_items(
+            DB.upsert_url_categorize, scan_id, items,
+            "url_categorize", log, "URL(s)",
+        )
+        return
+
+    # ── Transform-per-item kinds (dispatch by kind, then _sync_items)
+    if kind == "live_hosts":
+        items = [
+            p for p in (
+                _to_live_host_payload(h) for h in (data.get("hosts") or [])
+            ) if p and p.get("url")
+        ]
+        _sync_items(
+            DB.upsert_live_hosts, scan_id, items,
+            "live_hosts", log, "live host(s)",
+        )
+        return
+
+    if kind == "takeover_findings":
+        items = [
+            p for p in (
+                _to_takeover_payload(f) for f in (data.get("findings") or [])
+            ) if p
+        ]
+        _sync_items(
+            DB.upsert_takeover_findings, scan_id, items,
+            "takeover_findings", log, "finding(s)",
+        )
+        return
+
+    if kind == "param_findings":
+        items = [
+            p for p in (
+                _to_param_finding_payload(f) for f in (data.get("findings") or [])
+            ) if p
+        ]
+        _sync_items(
+            DB.upsert_param_findings, scan_id, items,
+            "param_findings", log, "parameter(s)",
+        )
+        return
+
+    if kind == "urls":
+        items = [
+            p for p in (
+                _to_url_payload(u) for u in (data.get("urls") or [])
+            ) if p
+        ]
+        _sync_items(
+            DB.upsert_urls, scan_id, items,
+            "urls", log, "URL(s)",
+        )
+        return
+
+    # ── Simple single-call kinds (no per-item transformation)
+    simple = {
+        "subdomains":   ("subdomains", DB.upsert_subdomains,   "subdomain(s)"),
+        "dns_records":  ("records",    DB.upsert_dns_records,  "DNS record(s)"),
+        "site_pages":   ("pages",      DB.upsert_site_pages,   "page(s)"),
+        "content_fuzz": ("findings",   DB.upsert_content_fuzz, "endpoint(s)"),
+        "js_findings":  ("findings",   DB.upsert_js_findings,  "JS finding(s)"),
+    }
+    handler = simple.get(kind)
+    if handler:
+        key, method, label = handler
+        items = data.get(key) or []
+        _sync_items(method, scan_id, items, stage, log, label)
+        return
+
+    # Unknown kind — log it, don't crash, but make it visible
+    _LAST_SYNC_STATUS[stage] = {
+        "ok": True, "count": 0, "note": f"no handler for kind '{kind}'",
+    }
+    log.debug(f"DB sync: no handler for kind '{kind}' (stage={stage})")
+
+
+# ── Path 2: dedicated-table stages without FINDINGS_JSON_MAP ────────────────
+
+def _sync_special_stage(scan_id: int, stage: str, outdir: Path, log) -> None:
+    """
+    Handle auth / cache (and any future stage added to _SPECIAL_SYNC_STAGES).
+    These have a dedicated DB table but no normalized `findings` row.
+
+    Per-stage transform:
+      • auth  — derive `category`, `target_host`, `first_seen` from the raw
+                record before it hits the bridge (see _to_auth_payload).
+      • cache — records are already in wire shape; pass through.
+    """
+    fname, suffix = _SPECIAL_SYNC_STAGES[stage]
+    data = _load_json_artifact(outdir, fname, log)
+    if data is None:
+        _LAST_SYNC_STATUS[stage] = {"ok": True, "count": 0, "note": "empty"}
+        return
+
+    items = data.get("findings") or []
+    if not items:
+        _LAST_SYNC_STATUS[stage] = {"ok": True, "count": 0, "note": "no findings"}
+        return
+
+    # Per-stage transform
+    if stage == "auth":
+        items = [x for x in (_to_auth_payload(f) for f in items) if x]
+        if not items:
+            _LAST_SYNC_STATUS[stage] = {
+                "ok": True, "count": 0, "note": "no valid findings",
+            }
+            return
+
+    method = getattr(DB, f"upsert_{suffix}", None)
+    if method is None:
+        _LAST_SYNC_STATUS[stage] = {
+            "ok": False, "count": 0,
+            "error": f"db.py has no upsert_{suffix}()",
+        }
+        log.warning(
+            f"DB sync {stage}: db.py is missing upsert_{suffix}() — "
+            f"add the method to enable {suffix} sync"
+        )
+        return
+
+    _sync_items(method, scan_id, items, stage, log, "finding(s)")
+
+# ── Top-level router ────────────────────────────────────────────────────────
+
+def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> None:
+    """
+    Route a stage's local JSON artifact(s) to the remote DB.
+
+    Three dispatch paths, tried strictly in order — each returns, no fallthrough:
+
+      1. RECON_JSON_MAP    — recon / harvest stages with per-kind payload builders
+      2. _SPECIAL_SYNC_STAGES — auth / cache (dedicated table, no generic row)
+      3. FINDINGS_JSON_MAP — everything else (generic `findings` table)
+
+    Failure tracking is shared via the module-level ``_DB_FAIL_COUNT`` counter,
+    reset to 0 on any successful sync. Per-stage outcomes are recorded in
+    ``_LAST_SYNC_STATUS`` for the final briefing.
+    """
     if not scan_id:
         return
     if not DB_MODULE_AVAILABLE or DB is None:
@@ -1451,389 +1868,37 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
 
     log = logging.getLogger("argus")
 
-    # ── Path 1: Recon-style data (RECON_JSON_MAP) ──────────────────────────
+    # ── Path 1: RECON stages with dedicated payload builders
     if stage in RECON_JSON_MAP:
-        fname, kind = RECON_JSON_MAP[stage]
-        p = outdir / fname
-        if not p.exists() or p.stat().st_size == 0:
-            return
-        try:
-            data = json.loads(p.read_text())
-        except Exception as e:
-            log.debug(f"DB sync: could not parse {fname}: {e}")
-            return
-
-        try:
-            # ── Simple single-call paths
-            result = None
-            label = ""
-
-            if kind == "subdomains":
-                items = data.get("subdomains") or []
-                if items:
-                    result = DB.upsert_subdomains(scan_id, items)
-                    label = "subdomain(s)"
-
-            elif kind == "dns_records":
-                items = data.get("records") or []
-                if items:
-                    result = DB.upsert_dns_records(scan_id, items)
-                    label = "DNS record(s)"
-
-            elif kind == "live_hosts":
-                items = data.get("hosts") or []
-                if items:
-                    payloads = [_to_live_host_payload(h) for h in items]
-                    payloads = [p for p in payloads if p and p.get("url")]
-                    if payloads:
-                        result = DB.upsert_live_hosts(scan_id, payloads)
-                        label = "live host(s)"
-
-            elif kind == "site_pages":
-                items = data.get("pages") or []
-                if items:
-                    result = DB.upsert_site_pages(scan_id, items)
-                    label = "page(s)"
-
-            elif kind == "content_fuzz":
-                items = data.get("findings") or []
-                if items:
-                    result = DB.upsert_content_fuzz(scan_id, items)
-                    label = "endpoint(s)"
-
-            elif kind == "js_findings":
-                items = data.get("findings") or []
-                if items:
-                    result = DB.upsert_js_findings(scan_id, items)
-                    label = "JS finding(s)"
-
-            # ── Multi-table paths — return explicitly
-            elif kind == "nmap":
-                hosts_data = data.get("hosts") or []
-                if not hosts_data:
-                    return
-                host_payloads = [_to_nmap_host_payload(h) for h in hosts_data]
-                host_payloads = [h for h in host_payloads if h and h.get("ip")]
-                if not host_payloads:
-                    return
-                host_result = DB.upsert_nmap_hosts(scan_id, host_payloads)
-                if host_result is None:
-                    _DB_FAIL_COUNT += 1
-                    log.debug("DB sync nmap hosts returned None")
-                    return
-                _DB_FAIL_COUNT = 0
-                host_ids = host_result.get("host_ids", {})
-                log.info(f"DB sync nmap: {host_result['count']} host(s) upserted")
-                port_payloads: list[dict] = []
-                for h in hosts_data:
-                    ip = h.get("ip", "")
-                    host_hash = hashlib.sha256(ip.encode()).hexdigest()
-                    if host_hash not in host_ids:
-                        continue
-                    for p2 in h.get("ports", []):
-                        pp = _to_nmap_port_payload(h, p2, host_hash)
-                        if pp:
-                            port_payloads.append(pp)
-                if port_payloads:
-                    port_count = DB.upsert_nmap_ports(scan_id, port_payloads)
-                    if port_count is not None:
-                        log.info(f"DB sync nmap: {port_count} port(s) upserted")
-                return
-
-            elif kind == "nuclei":
-                items = data.get("findings") or []
-                if items:
-                    payloads = [_to_nuclei_finding_payload(f) for f in items]
-                    payloads = [p for p in payloads if p]
-                    if payloads:
-                        result = DB.upsert_nuclei_findings(scan_id, payloads)
-                        if result is None:
-                            _DB_FAIL_COUNT += 1
-                            log.debug("DB sync nuclei findings returned None")
-                        else:
-                            _DB_FAIL_COUNT = 0
-                            log.info(f"DB sync nuclei: {result} finding(s) upserted")
-                for batch in (data.get("batches") or []):
-                    DB.save_nuclei_batch(scan_id, batch)
-                return
-
-            elif kind == "param_findings":
-                items = data.get("findings") or []
-                if not items:
-                    return
-                payloads = [_to_param_finding_payload(f) for f in items]
-                payloads = [p for p in payloads if p]
-                if not payloads:
-                    return
-                result = DB.upsert_param_findings(scan_id, payloads)
-                if result is None:
-                    _DB_FAIL_COUNT += 1
-                    log.debug("DB sync param_findings returned None")
-                else:
-                    _DB_FAIL_COUNT = 0
-                    log.info(f"DB sync params: {result} parameter(s) upserted")
-                return
-
-            elif kind == "takeover_findings":
-                items = data.get("findings") or []
-                if not items:
-                    return
-                payloads = [_to_takeover_payload(f) for f in items]
-                payloads = [p for p in payloads if p]
-                if not payloads:
-                    return
-                result = DB.upsert_takeover_findings(scan_id, payloads)
-                if result is None:
-                    _DB_FAIL_COUNT += 1
-                    log.debug("DB sync takeover_findings returned None")
-                else:
-                    _DB_FAIL_COUNT = 0
-                    log.info(f"DB sync takeover: {result} finding(s) upserted")
-                return
-
-            elif kind == "urls":
-                items = data.get("urls") or []
-                if not items:
-                    return
-                payloads = [_to_url_payload(u) for u in items]
-                payloads = [p for p in payloads if p]
-                if not payloads:
-                    return
-                result = DB.upsert_urls(scan_id, payloads)
-                if result is None:
-                    _DB_FAIL_COUNT += 1
-                    log.debug("DB sync urls returned None")
-                else:
-                    _DB_FAIL_COUNT = 0
-                    log.info(f"DB sync urls: {result} URL(s) upserted")
-                return
-
-            elif kind == "url_categorize":
-                url_map: dict[str, dict] = {}
-                for p2 in data.get("priority_urls") or []:
-                    url = p2.get("url")
-                    if not url:
-                        continue
-                    url_map[url] = {
-                        "url":             url,
-                        "categories":      p2.get("categories") or [],
-                        "category_count":  len(p2.get("categories") or []),
-                        "weight":          int(p2.get("weight") or 0),
-                        "param_names":     p2.get("param_names") or [],
-                        "high_risk_count": 0,
-                        "is_priority":     True,
-                    }
-                HIGH_RISK = {"sqli", "ssrf", "rce", "lfi", "ssti", "idor"}
-                for cat in data.get("categories") or []:
-                    cat_name = (cat.get("name") or "").lower()
-                    for url in (cat.get("urls") or []):
-                        if not url:
-                            continue
-                        entry = url_map.setdefault(url, {
-                            "url":             url,
-                            "categories":      [],
-                            "category_count":  0,
-                            "weight":          0,
-                            "param_names":     [],
-                            "high_risk_count": 0,
-                            "is_priority":     False,
-                        })
-                        if cat_name and cat_name not in entry["categories"]:
-                            entry["categories"].append(cat_name)
-                        cat_weight = 3 if cat_name in HIGH_RISK else 2 if cat_name in (
-                            "redirect", "graphql", "oauth", "upload",
-                        ) else 1
-                        entry["weight"] += cat_weight
-                for url, entry in url_map.items():
-                    entry["high_risk_count"] = sum(
-                        1 for c in entry["categories"] if c in HIGH_RISK
-                    )
-                    if not entry["param_names"]:
-                        parsed = urllib.parse.urlparse(url)
-                        entry["param_names"] = list(
-                            urllib.parse.parse_qs(parsed.query).keys()
-                        )
-                    entry["category_count"] = len(entry["categories"])
-                items = list(url_map.values())
-                if not items:
-                    return
-                result = DB.upsert_url_categorize(scan_id, items)
-                if result is None:
-                    _DB_FAIL_COUNT += 1
-                    log.debug("DB sync url_categorize returned None")
-                else:
-                    _DB_FAIL_COUNT = 0
-                    log.info(f"DB sync categorize: {result} URL(s) upserted")
-                return
-
-            else:
-                return
-
-            # ── Simple-path result check
-            if result is None:
-                _DB_FAIL_COUNT += 1
-                log.debug(
-                    f"DB sync {stage} returned None "
-                    f"({_DB_FAIL_COUNT}/{_DB_MAX_FAILURES})"
-                )
-            else:
-                _DB_FAIL_COUNT = 0
-                log.info(f"DB sync {stage}: {result} {label} upserted")
-
-        except Exception as e:
-            _DB_FAIL_COUNT += 1
-            log.debug(f"DB sync exception on {stage}: {e}")
+        _sync_recon_stage(scan_id, stage, outdir, log)
         return
 
-    # ── Special case: auth findings ─────────────────────────────────────────
-    if stage == "auth":
-        p = outdir / "auth_findings.json"
-        if not p.exists() or p.stat().st_size == 0:
-            return
-        try:
-            data = json.loads(p.read_text())
-        except Exception as e:
-            log.debug(f"DB sync: could not parse auth_findings.json: {e}")
-            return
-        items = data.get("findings") or []
-        if not items:
-            return
-        payloads = [_to_auth_payload(f) for f in items]
-        payloads = [x for x in payloads if x]
-        if not payloads:
-            return
-        try:
-            result = DB.upsert_auth_findings(scan_id, payloads)
-            if result is None:
-                _DB_FAIL_COUNT += 1
-                log.debug("DB sync auth returned None")
-            else:
-                _DB_FAIL_COUNT = 0
-                log.info(f"DB sync auth: {result} finding(s) upserted")
-        except Exception as e:
-            _DB_FAIL_COUNT += 1
-            log.debug(f"DB sync auth exception: {e}")
+    # ── Path 2: auth / cache — dedicated table, no generic findings row
+    if stage in _SPECIAL_SYNC_STAGES:
+        _sync_special_stage(scan_id, stage, outdir, log)
         return
 
-    # ── Special case: cache findings ────────────────────────────────────────
-    if stage == "cache":
-        p = outdir / "cache_findings.json"
-        if not p.exists() or p.stat().st_size == 0:
-            return
-        try:
-            data = json.loads(p.read_text())
-        except Exception as e:
-            log.debug(f"DB sync: could not parse cache_findings.json: {e}")
-            return
-        items = data.get("findings") or []
-        if not items:
-            return
-        try:
-            result = DB.upsert_cache_findings(scan_id, items)
-            if result is None:
-                _DB_FAIL_COUNT += 1
-                log.debug("DB sync cache returned None")
-            else:
-                _DB_FAIL_COUNT = 0
-                log.info(f"DB sync cache: {result} finding(s) upserted")
-        except Exception as e:
-            _DB_FAIL_COUNT += 1
-            log.debug(f"DB sync cache exception: {e}")
-        return
-
-    # ── Path 2: Generic findings (FINDINGS_JSON_MAP) ────────────────────────
+    # ── Path 3: everything else — normalized to the `findings` table
     fname = FINDINGS_JSON_MAP.get(stage)
     if not fname:
-        return
-    p = outdir / fname
-    if not p.exists() or p.stat().st_size == 0:
-        return
-    try:
-        data = json.loads(p.read_text())
-    except Exception as e:
-        log.debug(f"DB sync: could not parse {fname}: {e}")
-        return
-    findings = _normalize_findings(stage, data)
-    if not findings:
-        return
-    try:
-        result = DB.upsert_findings(scan_id, findings)
-        if result is None:
-            _DB_FAIL_COUNT += 1
-            log.debug(
-                f"DB sync for {stage} returned None "
-                f"({_DB_FAIL_COUNT}/{_DB_MAX_FAILURES})"
-            )
-        else:
-            _DB_FAIL_COUNT = 0
-            log.info(f"DB sync {stage}: {result} finding(s) upserted")
-    except Exception as e:
-        _DB_FAIL_COUNT += 1
-        log.debug(f"DB sync exception on {stage}: {e}")
-
-    # ── Special case: auth findings go to the dedicated table ──────────────
-    if stage == "auth":
-        p = outdir / "auth_findings.json"
-        if not p.exists() or p.stat().st_size == 0:
-            return
-        try:
-            data = json.loads(p.read_text())
-        except Exception as e:
-            log.debug(f"DB sync: could not parse auth_findings.json: {e}")
-            return
-        items = data.get("findings") or []
-        if not items:
-            return
-        payloads = [_to_auth_payload(f) for f in items]
-        payloads = [x for x in payloads if x]
-        if not payloads:
-            return
-        try:
-            result = DB.upsert_auth_findings(scan_id, payloads)
-            if result is None:
-                _DB_FAIL_COUNT += 1
-                log.debug("DB sync auth returned None")
-            else:
-                _DB_FAIL_COUNT = 0
-                log.info(f"DB sync auth: {result} finding(s) upserted")
-        except Exception as e:
-            _DB_FAIL_COUNT += 1
-            log.debug(f"DB sync auth exception: {e}")
+        _LAST_SYNC_STATUS[stage] = {"ok": True, "count": 0, "note": "no sync path"}
         return
 
-    # ── Path 2: Findings ────────────────────────────────────────────────────
-    fname = FINDINGS_JSON_MAP.get(stage)
-    if not fname:
-        return
-
-    p = outdir / fname
-    if not p.exists() or p.stat().st_size == 0:
-        return
-
-    try:
-        data = json.loads(p.read_text())
-    except Exception as e:
-        log.debug(f"DB sync: could not parse {fname}: {e}")
+    data = _load_json_artifact(outdir, fname, log)
+    if data is None:
+        _LAST_SYNC_STATUS[stage] = {"ok": True, "count": 0, "note": "empty"}
         return
 
     findings = _normalize_findings(stage, data)
     if not findings:
+        _LAST_SYNC_STATUS[stage] = {"ok": True, "count": 0, "note": "no findings"}
         return
 
-    try:
-        result = DB.upsert_findings(scan_id, findings)
-        if result is None:
-            _DB_FAIL_COUNT += 1
-            log.debug(
-                f"DB sync for {stage} returned None "
-                f"({_DB_FAIL_COUNT}/{_DB_MAX_FAILURES})"
-            )
-        else:
-            _DB_FAIL_COUNT = 0
-            log.info(f"DB sync {stage}: {result} finding(s) upserted")
-    except Exception as e:
-        _DB_FAIL_COUNT += 1
-        log.debug(f"DB sync exception on {stage}: {e}")
+    _sync_items(
+        DB.upsert_findings, scan_id, findings, stage, log, "finding(s)",
+    )
+    return
+
 
 def _sync_oob(scan_id: Optional[int], outdir: Path) -> None:
     """Push OOB tokens and hits to the bridge."""
@@ -1857,47 +1922,6 @@ def _sync_oob(scan_id: Optional[int], outdir: Path) -> None:
     except Exception as e:
         logging.getLogger("argus").debug(f"OOB sync failed: {e}")
 
-def _run_crawl(outdir: Path) -> None:
-    from auditing_tools.site_crawler import run_site_crawl
-    source = _pick_existing(outdir, ["live_urls.txt"])
-    run_site_crawl(source, outdir)
-
-
-RUNNERS = {
-    # ── Recon ───────────────────────────────────────────────────────────────
-    "subs":       _run_subs,
-    "dns":        _run_dns,
-    "takeover":   _run_takeover,
-    "live":       _run_live,
-    "nmap":       _run_nmap,
-    # ── Harvest ─────────────────────────────────────────────────────────────
-    "urls":       _run_urls,
-    "categorize": _run_categorize,
-    "crawl":      _run_crawl,
-    # ── Discover ────────────────────────────────────────────────────────────
-    "js":         _run_js,
-    "params":     _run_params,
-    "graphql":    _run_graphql,
-    "fuzz":       _run_fuzz,
-    # ── Scan ────────────────────────────────────────────────────────────────
-    "nuclei":     _run_nuclei,
-    "cors":       _run_cors,
-    "smuggling":  _run_smuggling,
-    "cache":      _run_cache,
-    # ── Audit ───────────────────────────────────────────────────────────────
-    "auth":       _run_auth,
-    "idor":       _run_idor,
-    "redirect":   _run_redirect,
-    "race":       _run_race,
-    "sqli":       _run_sqli,
-    "xss":        _run_xss,
-    "ssrf":       _run_ssrf,
-    "ssti":       _run_ssti,
-    "xxe":        _run_xxe,
-    # ── Report ──────────────────────────────────────────────────────────────
-    "mapping":    _run_mapping,
-    "triage":     _run_triage,
-}
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  LOGGING
@@ -2304,7 +2328,6 @@ def main(argv: list[str] | None = None) -> int:
         db_scan_id=db_scan_id,
         db_failures=_DB_FAIL_COUNT,
     )
-
     if interrupted:
         return 130
     if "failed" in results.values():
@@ -2316,9 +2339,96 @@ def main(argv: list[str] | None = None) -> int:
 #  ENTRY POINT
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _install_signal_handlers() -> None:
+    """
+    Route SIGTERM to KeyboardInterrupt so `docker stop` / `systemctl stop` /
+    `kill -15` take the same graceful shutdown path as Ctrl+C — main()'s inner
+    try-block catches it, runs _sync_oob() + finish_scan(), and shows the
+    final briefing instead of dying mid-stage.
+
+    SIGINT (Ctrl+C) is already handled by Python's default handler which
+    raises KeyboardInterrupt — no extra wiring needed.
+
+    SIGHUP is intentionally NOT caught: terminal-close should terminate the
+    process, and `nohup` users already have SIGHUP set to ignore at the OS
+    level. Overriding it here would surprise both groups.
+    """
+    if os.name != "posix":
+        return
+    try:
+        import signal
+        def _raise_keyboard_interrupt(signum, frame):
+            raise KeyboardInterrupt()
+        signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+    except (ImportError, ValueError, OSError):
+        # ImportError — signal module absent (unreachable on posix)
+        # ValueError  — not the main thread (e.g., imported from a test)
+        # OSError     — platform refused the signal (rare)
+        pass
+
+
+def _silence_broken_pipe() -> None:
+    """
+    Redirect stdout's underlying fd to /dev/null so Python's atexit flush
+    doesn't raise a second BrokenPipeError during interpreter shutdown.
+    Required for clean `argus | head` / `argus | less` behavior.
+
+    Technique is the one recommended by CPython's SIGPIPE note:
+    https://docs.python.org/3/library/signal.html#note-on-sigpipe
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        os.close(devnull)
+    except (OSError, AttributeError):
+        # AttributeError if sys.stdout has been replaced with None
+        pass
+
+
 if __name__ == "__main__":
+    _install_signal_handlers()
     try:
         sys.exit(main())
+    except SystemExit:
+        # main() and argparse already chose an exit code (0, 1, 2, 130) —
+        # pass it through without alteration.
+        raise
     except KeyboardInterrupt:
-        print(f"\n{C['yellow']}Interrupted.{C['reset']}")
+        # Reached only when the interrupt lands *before* main()'s inner
+        # try-block — during startup (banner, argparse, env validation,
+        # DB scan registration) or as SIGTERM before the handler routes
+        # it. main() itself catches the interrupt that arrives mid-stage.
+        try:
+            sys.stdout.flush()
+            # yellow() / dim() respect _USE_COLOR; the original line used
+            # the raw C['yellow'] escape and leaked ANSI under --no-color.
+            print(
+                f"\n{yellow('Interrupted.')} "
+                f"{dim('Returning to port with what we have.')}"
+            )
+        except Exception:
+            # flush() can raise on a broken pipe — swallow it so the
+            # exit code is still 130 and not an unhandled BrokenPipe.
+            pass
         sys.exit(130)
+    except BrokenPipeError:
+        # Consumer of stdout closed early (| head, | less, | grep -m1).
+        # Exit 141 = 128 + SIGPIPE, the Unix convention that lets
+        # `set -o pipefail` see the signal correctly.
+        _silence_broken_pipe()
+        sys.exit(141)
+    except Exception as exc:
+        # A genuine bug in the tool — not a user-facing error. Log a
+        # one-liner so it lands in argus.log, and print the full traceback
+        # to stderr (the Unix convention for every CLI tool).
+        try:
+            logging.getLogger("argus").error(
+                f"Unhandled exception in main(): {exc}"
+            )
+        except Exception:
+            # If logging itself is broken (setup_logging never ran),
+            # nothing else to do — the traceback on stderr is enough.
+            pass
+        import traceback
+        traceback.print_exc()
+        sys.exit(3)     # distinct from stage failure (1) and env error (2)
