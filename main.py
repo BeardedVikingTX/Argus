@@ -1170,7 +1170,7 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
     Push artifacts for this stage to the bridge.
 
     Two code paths:
-      1. Recon data (RECON_JSON_MAP) — subdomains, live hosts, etc.
+      1. Recon data (RECON_JSON_MAP) — subdomains, live hosts, site pages
       2. Findings (FINDINGS_JSON_MAP) — vuln candidates from audit stages
 
     Fail-safe: never raises, disables DB after N consecutive failures.
@@ -1211,13 +1211,20 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
                 items = data.get("hosts") or []
                 if not items:
                     return
-                # Convert the local record shape to the wire payload shape
                 payloads = [_to_live_host_payload(h) for h in items]
                 payloads = [p for p in payloads if p and p.get("url")]
                 if not payloads:
                     return
                 result = DB.upsert_live_hosts(scan_id, payloads)
                 label = "live host(s)"
+
+            elif kind == "site_pages":
+                items = data.get("pages") or []
+                if not items:
+                    return
+                # Already in wire shape from PageRecord.to_dict()
+                result = DB.upsert_site_pages(scan_id, items)
+                label = "page(s)"
 
             else:
                 return
@@ -1269,14 +1276,6 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
     except Exception as e:
         _DB_FAIL_COUNT += 1
         log.debug(f"DB sync exception on {stage}: {e}")
-
-            elif kind == "site_pages":
-                items = data.get("pages") or []
-                if not items:
-                    return
-                result = DB.upsert_site_pages(scan_id, items)
-                label = "page(s)"
-
 
 def _sync_oob(scan_id: Optional[int], outdir: Path) -> None:
     """Push OOB tokens and hits to the bridge."""
