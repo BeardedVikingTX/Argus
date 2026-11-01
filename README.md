@@ -272,7 +272,7 @@ That's it. No registry, no config file, no framework boilerplate.
 
 * * * * *
 
-📂 Output Structure
+# 📂 Output Structure
 -------------------
 ```
 output/
@@ -292,7 +292,7 @@ output/
 
 Candidate files are **tab-separated** so `awk`, `cut`, and `grep` work cleanly on them.
 
-⚙️ Configuration
+# ⚙️ Configuration
 ----------------
 
 Argus intentionally ships with **no YAML config** --- the whole surface is:
@@ -307,7 +307,7 @@ If you need tuning, edit the constants at the top of the relevant module. That's
 
 * * * * *
 
-⚖️ Ethics, Scope & Legal
+# ⚖️ Ethics, Scope & Legal
 ------------------------
 
 **Argus is a triage aid, not an auto-exploiter.** It is built for **authorized security testing only** --- bug bounty programs, penetration tests, CTFs, and your own infrastructure.
@@ -328,7 +328,7 @@ If you're new to bug bounty: read [HackerOne's disclosure guidelines](https://ww
 
 * * * * *
 
-🗺️ Roadmap
+# 🗺️ Roadmap
 -----------
 
 -   ☑ Modular pipeline: subdomains → live → nmap → URLs → flaggers
@@ -357,7 +357,7 @@ Have an idea? Open an issue.
 
 * * * * *
 
-🤝 Contributing
+# 🤝 Contributing
 ---------------
 
 Pull requests are welcome --- especially new modules in `auditing_tools/` and additional recon sources in `recon_tools/`.
@@ -382,7 +382,7 @@ git push origin feature/my-new-module
 # → open a PR against main
 ```
 
-👤 Author & Contact
+# 👤 Author & Contact
 -------------------
 
 **BeardedVikingTX** --- builder, breaker, bug bounty hunter.
@@ -400,11 +400,14 @@ Questions, ideas, war stories from the field --- reach out. If you find a bug in
 
 * * * * *
 
-📜 License
-----------
+## 📜 License
 
-Released under the [MIT License](https://opensource.org/licenses/MIT). Use it, fork it, build on it, ship it. Just don't use it against anything you're not authorized to test.
+Released under the [MIT License](LICENSE.md). Use it, fork it, build on it,
+ship it.
 
+Use of this software is subject to the [Acceptable Use Policy](ACCEPTABLE_USE.md).
+Argus is intended for **authorized security testing only**. The author assumes
+no liability for misuse.
 * * * * *
 
 <div align="center">
