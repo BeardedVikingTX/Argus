@@ -928,6 +928,43 @@ class ArgusDB:
         r = self._call("query.site_map_hosts", payload)
         return r.get("site_map_hosts") if r and r.get("ok") else None
 
+    def upsert_smuggling_findings(
+        self, scan_id: int, findings: list[dict], chunk_size: int = 200,
+    ) -> Optional[int]:
+        if not findings:
+            return 0
+        total = 0
+        for i in range(0, len(findings), chunk_size):
+            chunk = findings[i:i + chunk_size]
+            r = self._call("smuggling_findings.upsert", {
+                "scan_id": scan_id, "smuggling_findings": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"smuggling_findings.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_smuggling_findings(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        severity: Optional[str] = None, variant: Optional[str] = None,
+        host: Optional[str] = None, confirmed_only: bool = False,
+    ) -> Optional[list]:
+        payload = {
+            "scan_uuid":      scan_uuid,
+            "limit":          limit,
+            "offset":         offset,
+            "confirmed_only": confirmed_only,
+        }
+        if severity is not None: payload["severity"] = severity
+        if variant is not None:  payload["variant"] = variant
+        if host is not None:     payload["host"] = host
+        r = self._call("query.smuggling_findings", payload)
+        return r.get("smuggling_findings") if r and r.get("ok") else None
+
     def upsert_open_redirect_findings(
         self, scan_id: int, findings: list[dict], chunk_size: int = 200,
     ) -> Optional[int]:

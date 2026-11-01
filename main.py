@@ -894,7 +894,16 @@ def _run_cors(outdir: Path) -> None:
 def _run_smuggling(outdir: Path) -> None:
     from auditing_tools.smuggling_finder import run_smuggling_audit
     source = _pick_existing(outdir, ["live_urls.txt"])
-    run_smuggling_audit(source, outdir)
+    r = _module_rate("smuggling")
+    run_smuggling_audit(
+        source, outdir,
+        headers=_platform_headers() or None,
+        rate_limit=r.get("rate_limit", 20),
+        concurrency=r.get("concurrency", 5),
+        timeout=r.get("timeout", 10),
+        max_hosts=r.get("max_hosts", 200),
+        scan_id=_CURRENT_SCAN_ID,
+    )
 
 
 def _run_cache(outdir: Path) -> None:
