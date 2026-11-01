@@ -250,7 +250,7 @@ STAGE_DEPS = {
 GROUP_ORDER = ["RECON", "HARVEST", "DISCOVER", "SCAN", "AUDIT", "REPORT"]
 
 # Stages that produce a findings JSON the DB cares about
-FINDINGS_JSON_MAP = {
+FINDINGS_JSON_MAP: dict[str, str] = {
     "takeover":  "takeover_findings.json",
     "js":        "js_findings.json",
     "graphql":   "graphql_findings.json",
@@ -892,7 +892,14 @@ def _run_cache(outdir: Path) -> None:
 def _run_auth(outdir: Path) -> None:
     from auditing_tools.auth_tester import run_auth_tester
     source = _pick_existing(outdir, ["urls_with_params.txt", "live_urls.txt"])
-    run_auth_tester(source, outdir)
+    r = _module_rate("auth")
+    run_auth_tester(
+        source, outdir,
+        rate_limit=r.get("rate_limit", 2),
+        concurrency=r.get("concurrency", 2),
+        headers=_platform_headers() or None,
+        scan_id=_CURRENT_SCAN_ID,
+    )
 
 
 def _run_idor(outdir: Path) -> None:
@@ -1172,6 +1179,52 @@ def _to_nmap_host_payload(h: dict) -> Optional[dict]:
         "reasons":         h.get("reasons") or [],
         "open_port_count": len(h.get("ports", [])),
         "first_seen":      h.get("first_seen"),
+    }
+
+_AUTH_CATEGORY_MAP = {
+    "jwt":     "jwt",
+    "oauth":   "oauth",
+    "saml":    "saml",
+    "cookie":  "cookie",
+    "csrf":    "csrf",
+}
+
+def _to_auth_payload(f: dict) -> Optional[dict]:
+    """Convert an auth_findings.json record into the wire shape."""
+    target = f.get("target") or ""
+    vtype = f.get("vuln_type") or ""
+    if not target or not vtype:
+        return None
+
+    # Derive category from vuln_type prefix
+    category = "general"
+    vtype_lower = vtype.lower()
+    if vtype_lower.startswith("jwt_"):
+        category = "jwt"
+    elif vtype_lower.startswith("oauth_"):
+        category = "oauth"
+    elif vtype_lower.startswith("saml_"):
+        category = "saml"
+    elif vtype_lower.startswith("cookie_"):
+        category = "cookie"
+    elif vtype_lower.startswith("csrf_") or "csrf" in vtype_lower:
+        category = "csrf"
+
+    parsed = urllib.parse.urlparse(target)
+    host = parsed.hostname or ""
+
+    return {
+        "target":        target,
+        "target_host":   host,
+        "vuln_type":     vtype,
+        "category":      category,
+        "severity":      (f.get("severity") or "INFO").upper(),
+        "confidence":    int(f.get("confidence", 0)),
+        "evidence":      f.get("evidence", ""),
+        "details":       f.get("details") or {},
+        "remediation":   f.get("remediation", ""),
+        "auth_enabled":  bool(f.get("auth_enabled")),
+        "first_seen":    _format_dt(f.get("first_seen")),
     }
 
 def _to_url_payload(u: dict) -> Optional[dict]:
@@ -1662,6 +1715,36 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
         except Exception as e:
             _DB_FAIL_COUNT += 1
             log.debug(f"DB sync exception on {stage}: {e}")
+        return
+
+    # ── Special case: auth findings go to the dedicated table ──────────────
+    if stage == "auth":
+        p = outdir / "auth_findings.json"
+        if not p.exists() or p.stat().st_size == 0:
+            return
+        try:
+            data = json.loads(p.read_text())
+        except Exception as e:
+            log.debug(f"DB sync: could not parse auth_findings.json: {e}")
+            return
+        items = data.get("findings") or []
+        if not items:
+            return
+        payloads = [_to_auth_payload(f) for f in items]
+        payloads = [x for x in payloads if x]
+        if not payloads:
+            return
+        try:
+            result = DB.upsert_auth_findings(scan_id, payloads)
+            if result is None:
+                _DB_FAIL_COUNT += 1
+                log.debug("DB sync auth returned None")
+            else:
+                _DB_FAIL_COUNT = 0
+                log.info(f"DB sync auth: {result} finding(s) upserted")
+        except Exception as e:
+            _DB_FAIL_COUNT += 1
+            log.debug(f"DB sync auth exception: {e}")
         return
 
     # ── Path 2: Findings ────────────────────────────────────────────────────

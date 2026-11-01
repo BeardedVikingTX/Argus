@@ -632,6 +632,49 @@ class ArgusDB:
         r = self._call("query.triage_history", {"finding_hash": finding_hash})
         return r.get("history") if r and r.get("ok") else None
 
+    def upsert_auth_findings(
+        self, scan_id: int, findings: list[dict], chunk_size: int = 200,
+    ) -> Optional[int]:
+        """Upsert auth findings in chunks."""
+        if not findings:
+            return 0
+
+        total = 0
+        for i in range(0, len(findings), chunk_size):
+            chunk = findings[i:i + chunk_size]
+            r = self._call("auth_findings.upsert", {
+                "scan_id":        scan_id,
+                "auth_findings":  chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"auth_findings.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_auth_findings(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        severity: Optional[str] = None, category: Optional[str] = None,
+        vuln_type: Optional[str] = None, host: Optional[str] = None,
+        min_confidence: Optional[int] = None,
+    ) -> Optional[list]:
+        payload = {"scan_uuid": scan_uuid, "limit": limit, "offset": offset}
+        if severity is not None:
+            payload["severity"] = severity
+        if category is not None:
+            payload["category"] = category
+        if vuln_type is not None:
+            payload["vuln_type"] = vuln_type
+        if host is not None:
+            payload["host"] = host
+        if min_confidence is not None:
+            payload["min_confidence"] = min_confidence
+        r = self._call("query.auth_findings", payload)
+        return r.get("auth_findings") if r and r.get("ok") else None
+
     def upsert_subdomains(
         self, scan_id: int, subdomains: list[dict], chunk_size: int = 500,
     ) -> Optional[int]:
