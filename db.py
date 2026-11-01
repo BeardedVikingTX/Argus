@@ -165,6 +165,46 @@ class ArgusDB:
         r = self._call("endpoints.upsert", {"scan_id": scan_id, "endpoints": endpoints})
         return r.get("count") if r and r.get("ok") else None
 
+    def upsert_subdomains(
+        self, scan_id: int, subdomains: list[dict], chunk_size: int = 500,
+    ) -> Optional[int]:
+        """
+        Upsert subdomains in chunks. Returns total count upserted, or None
+        if the bridge is unavailable.
+
+        Chunking matters: a scan on a large scope can produce 5,000+ subdomains.
+        A single request with that payload would be slow to serialize and
+        could hit PHP's post_max_size limit.
+        """
+        if not subdomains:
+            return 0
+
+        total = 0
+        for i in range(0, len(subdomains), chunk_size):
+            chunk = subdomains[i:i + chunk_size]
+            r = self._call("subdomains.upsert", {
+                "scan_id":    scan_id,
+                "subdomains": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"subdomains.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_subdomains(
+        self, scan_uuid: str, limit: int = 500, offset: int = 0,
+        resolves: Optional[bool] = None,
+    ) -> Optional[list]:
+        payload = {"scan_uuid": scan_uuid, "limit": limit, "offset": offset}
+        if resolves is not None:
+            payload["resolves"] = resolves
+        r = self._call("query.subdomains", payload)
+        return r.get("subdomains") if r and r.get("ok") else None
+
     def upsert_findings(self, scan_id: int, findings: list[dict]) -> Optional[int]:
         r = self._call("findings.upsert", {"scan_id": scan_id, "findings": findings})
         return r.get("count") if r and r.get("ok") else None

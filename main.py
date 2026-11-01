@@ -310,7 +310,11 @@ STAGE_ARTIFACTS = {
                    "triage_next_steps.txt"],
 }
 
-
+# Recon artifacts use a different schema than findings.
+# Keyed by stage → (json filename, DB table kind).
+RECON_JSON_MAP: dict[str, tuple[str, str]] = {
+    "subs": ("subdomains.json", "subdomains"),
+}
 def resolve_stages(arg: str) -> list[str]:
     if arg in STAGE_GROUPS:
         return list(STAGE_GROUPS[arg])
@@ -1094,7 +1098,12 @@ def _collect_oob_tokens(outdir: Path) -> list[str]:
 
 def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> None:
     """
-    Push findings for this stage to the bridge.
+    Push artifacts for this stage to the bridge.
+
+    Two code paths:
+      1. Recon data (RECON_JSON_MAP) — subdomains, hosts, etc.
+      2. Findings (FINDINGS_JSON_MAP) — vuln candidates from audit stages
+
     Fail-safe: never raises, disables DB after N consecutive failures.
     """
     global _DB_FAIL_COUNT
@@ -1106,6 +1115,42 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
     if _DB_FAIL_COUNT >= _DB_MAX_FAILURES:
         return
 
+    log = logging.getLogger("argus")
+
+    # ── Path 1: Recon data ──────────────────────────────────────────────────
+    if stage in RECON_JSON_MAP:
+        fname, kind = RECON_JSON_MAP[stage]
+        p = outdir / fname
+        if not p.exists() or p.stat().st_size == 0:
+            return
+
+        try:
+            data = json.loads(p.read_text())
+        except Exception as e:
+            log.debug(f"DB sync: could not parse {fname}: {e}")
+            return
+
+        if kind == "subdomains":
+            items = data.get("subdomains") or []
+            if not items:
+                return
+            try:
+                result = DB.upsert_subdomains(scan_id, items)
+                if result is None:
+                    _DB_FAIL_COUNT += 1
+                    log.debug(
+                        f"DB sync {stage} returned None "
+                        f"({_DB_FAIL_COUNT}/{_DB_MAX_FAILURES})"
+                    )
+                else:
+                    _DB_FAIL_COUNT = 0
+                    log.info(f"DB sync {stage}: {result} subdomain(s) upserted")
+            except Exception as e:
+                _DB_FAIL_COUNT += 1
+                log.debug(f"DB sync exception on {stage}: {e}")
+        return
+
+    # ── Path 2: Findings ────────────────────────────────────────────────────
     fname = FINDINGS_JSON_MAP.get(stage)
     if not fname:
         return
@@ -1117,7 +1162,7 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
     try:
         data = json.loads(p.read_text())
     except Exception as e:
-        logging.getLogger("argus").debug(f"DB sync: could not parse {fname}: {e}")
+        log.debug(f"DB sync: could not parse {fname}: {e}")
         return
 
     findings = _normalize_findings(stage, data)
@@ -1128,18 +1173,16 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
         result = DB.upsert_findings(scan_id, findings)
         if result is None:
             _DB_FAIL_COUNT += 1
-            logging.getLogger("argus").debug(
-                f"DB sync for {stage} returned None ({_DB_FAIL_COUNT}/{_DB_MAX_FAILURES})"
+            log.debug(
+                f"DB sync for {stage} returned None "
+                f"({_DB_FAIL_COUNT}/{_DB_MAX_FAILURES})"
             )
         else:
-            # Reset failure count on success
             _DB_FAIL_COUNT = 0
-            logging.getLogger("argus").info(
-                f"DB sync {stage}: {result} finding(s) upserted"
-            )
+            log.info(f"DB sync {stage}: {result} finding(s) upserted")
     except Exception as e:
         _DB_FAIL_COUNT += 1
-        logging.getLogger("argus").debug(f"DB sync exception on {stage}: {e}")
+        log.debug(f"DB sync exception on {stage}: {e}")
 
 
 def _sync_oob(scan_id: Optional[int], outdir: Path) -> None:
