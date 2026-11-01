@@ -310,10 +310,12 @@ STAGE_ARTIFACTS = {
 # Keyed by stage → (json filename, DB table kind).
 RECON_JSON_MAP: dict[str, tuple[str, str]] = {
     "subs":  ("subdomains.json",  "subdomains"),
+    "dns":   ("dns_resolve.json", "dns_records"),
     "live":  ("live_hosts.json",  "live_hosts"),
     "crawl": ("site_pages.json",  "site_pages"),
     "fuzz":  ("content_fuzz.json", "content_fuzz"),
 }
+
 def resolve_stages(arg: str) -> list[str]:
     if arg in STAGE_GROUPS:
         return list(STAGE_GROUPS[arg])
@@ -721,9 +723,11 @@ def _run_dns(outdir: Path) -> None:
     source = _pick_existing(outdir, ["all_subs.txt"])
     r = _module_rate("dns")
     resolve_dns(
-        source, outdir, wildcard_file=WILDCARD_FILE,
+        source, outdir,
+        wildcard_file=WILDCARD_FILE,
         threads=r.get("concurrency", 10),
         rate_limit=r.get("rate_limit", 20),
+        scan_id=_CURRENT_SCAN_ID,
     )
 
 
@@ -1210,6 +1214,13 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
                     return
                 result = DB.upsert_subdomains(scan_id, items)
                 label = "subdomain(s)"
+
+            elif kind == "dns_records":
+                items = data.get("records") or []
+                if not items:
+                    return
+                result = DB.upsert_dns_records(scan_id, items)
+                label = "DNS record(s)"
 
             elif kind == "live_hosts":
                 items = data.get("hosts") or []

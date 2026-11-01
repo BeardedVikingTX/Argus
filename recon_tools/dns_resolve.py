@@ -3,25 +3,48 @@
 recon_tools/dns_resolve.py — DNS Resolution & Wildcard Filtering
 ═══════════════════════════════════════════════════════════════════════════════
 
-The DNS resolution stage for Argus. Does more than just "does this resolve":
+DNS resolution stage for Argus.
+
+This stage sends ZERO traffic to the target. Every query goes to public
+recursors (Cloudflare 1.1.1.1, Google 8.8.8.8, Quad9 9.9.9.9) — never the
+target's authoritative nameservers, never the target's HTTP server.
+
+Because of this:
+  • Platform headers (ACTIVE_HEADERS) are NOT applied
+  • request.txt auth (AUTH_HEADERS) is NOT applied
+  • Rate limiting protects the public recursor, not the target
+
+What the module actually does:
 
   1. Multi-record resolution — A, AAAA, CNAME, MX, NS, TXT, SOA
-  2. Per-root wildcard detection — filters wildcard-DNS false positives that
-     would otherwise flood HTTPX with thousands of identical responses
-  3. Subdomain takeover detection — flags CNAMEs pointing to known-vulnerable
-     third-party services (S3, GitHub Pages, Heroku, Azure, etc.)
-  4. IP infrastructure clustering — groups subdomains by shared IP so you can
-     pivot on hosting providers and shared infrastructure
-  5. Structured JSON output — full attribution for downstream stages
+  2. Per-root wildcard detection — requires 2/3 random probes to resolve
+     (raised from 1/3 to eliminate transient-DNS false positives)
+  3. CNAME chain resolution — follows CNAMEs to their terminal target so
+     takeover detection catches intermediate hops
+  4. Subdomain takeover detection — flags CNAMEs pointing to 40+ known
+     vulnerable third-party services
+  5. TXT record service extraction — pulls out API keys, verification
+     tokens, and service names (Stripe, Google, Atlassian, etc.)
+  6. IP infrastructure clustering — groups subdomains by shared IP
+
+Config integration (config.py):
+  • MODULE_RATE_LIMITS["dns"]["rate_limit"]   → dnsx -rl (protects recursors)
+  • MODULE_RATE_LIMITS["dns"]["concurrency"]  → dnsx -threads
+  • SYNC_TO_DB, BRIDGE_*                      → remote database sync
 
 Outputs (into `outdir`):
-  • dns_resolved.txt            — every subdomain with at least one A/AAAA record
-  • dns_wildcard_filtered.txt   — resolved, minus wildcard-DNS matches (feed to HTTPX)
-  • dns_takeover_candidates.txt — CNAME to known-vulnerable service (manual review)
+  • dns_resolved.txt            — every subdomain with A/AAAA
+  • dns_wildcard_filtered.txt   — resolved, minus wildcard matches (feed to httpx)
+  • dns_takeover_candidates.txt — CNAME to known-vulnerable service
   • dns_resolve.json            — full structured report
+
+Remote DB (if scan_id is provided):
+  • dns_records table           — one row per (scan_id, host)
 
 Integration:
   main.py → run_one("dns") → resolve_dns(subs_file, outdir, wildcard_file)
+  main.py also syncs dns_resolve.json via _sync_stage_artifacts()
+  Standalone: resolve_dns(..., scan_id=42) → self-syncs
 """
 
 from __future__ import annotations
@@ -29,13 +52,13 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import shutil
 import socket
 import string
 import subprocess
 import sys
 import time
-import urllib.parse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -46,67 +69,125 @@ from typing import Optional
 log = logging.getLogger("argus.dns_resolve")
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION
+#  CONFIG
 # ═════════════════════════════════════════════════════════════════════════════
 
-DNSX_THREADS      = 100
-DNSX_RATE_LIMIT   = 250        # queries/second
-DNSX_TIMEOUT      = 900        # overall wall-clock ceiling (seconds)
-DNSX_RETRIES      = 2
+try:
+    import config as CFG
+    CFG_LOADED = True
+except ImportError:
+    CFG = None
+    CFG_LOADED = False
 
-WILDCARD_PROBES_PER_ROOT = 3   # number of random subdomains per root to detect wildcards
+try:
+    from db import DB
+    DB_AVAILABLE = True
+except ImportError:
+    DB = None
+    DB_AVAILABLE = False
+
+
+def _cfg(key: str, default=None):
+    if not CFG_LOADED:
+        return default
+    return getattr(CFG, key, default)
+
+
+def _dns_settings() -> dict:
+    entry = (_cfg("MODULE_RATE_LIMITS", {}) or {}).get("dns", {})
+    threads = entry.get("concurrency", 10)
+    rate = entry.get("rate_limit", 20)
+    if not isinstance(threads, int) or threads < 1:
+        threads = 10
+    if not isinstance(rate, int) or rate < 0:
+        rate = 20
+    return {"threads": threads, "rate_limit": rate}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+DNSX_THREADS             = 10
+DNSX_RATE_LIMIT          = 20
+DNSX_TIMEOUT             = 900
+DNSX_RETRIES             = 2
+
+WILDCARD_PROBES_PER_ROOT = 3
+WILDCARD_MIN_AGREEMENT   = 2   # require 2/3 probes to confirm wildcard
 WILDCARD_CHECK_THREADS   = 10
 
-# Max subdomains to resolve in one run — prevents runaway cost
-MAX_INPUT         = 50000
+MAX_INPUT                = 50000
+MAX_CNAME_CHAIN_DEPTH    = 8   # cap chain traversal to prevent loops
 
-# CNAME targets matching these patterns are flagged as takeover candidates
+# Services that appear in TXT records — service discovery, not just fingerprints
+TXT_SERVICE_MARKERS: dict[str, str] = {
+    "stripe-verification":     "Stripe",
+    "google-site-verification":"Google",
+    "atlassian-domain-verification": "Atlassian",
+    "facebook-domain-verification":  "Facebook",
+    "MS=":                     "Microsoft 365",
+    "v=spf1 include:_spf.google.com": "Google Workspace (SPF)",
+    "v=spf1 include:spf.protection.outlook.com": "Microsoft 365 (SPF)",
+    "v=spf1 include:mail.zendesk.com": "Zendesk (SPF)",
+    "shopify-verification":    "Shopify",
+    "adobe-idp-site-verification": "Adobe",
+    "have-a-valid-coupon":     "Coupon service",
+    "amazonses":               "Amazon SES",
+    "mailgun":                 "Mailgun",
+    "sendgrid":                "SendGrid",
+    "postmark":                "Postmark",
+}
+
+# CNAME targets matching these patterns are flagged as takeover candidates.
+# When a CNAME points here AND the target does not resolve, the dangling
+# resource is takeover-prone. Final confirmation requires HTTP (takeover_check).
 TAKEOVER_FINGERPRINTS: dict[str, str] = {
-    "s3.amazonaws.com":          "AWS S3 bucket (unclaimed bucket takeover)",
-    "s3-website":                "AWS S3 static website (unclaimed bucket)",
-    "s3.dualstack":              "AWS S3 (dualstack endpoint)",
-    "github.io":                 "GitHub Pages (unclaimed repository)",
-    "herokuapp.com":             "Heroku (unclaimed app)",
-    "herokudns.com":             "Heroku DNS (dangling route)",
-    "cloudfront.net":            "AWS CloudFront (dangling distribution)",
-    "azurewebsites.net":         "Azure App Service (unclaimed app)",
+    "s3.amazonaws.com":          "AWS S3 bucket",
+    "s3-website":                "AWS S3 static website",
+    "s3.dualstack":              "AWS S3 dualstack",
+    "github.io":                 "GitHub Pages",
+    "herokuapp.com":             "Heroku",
+    "herokudns.com":             "Heroku DNS",
+    "cloudfront.net":            "AWS CloudFront",
+    "azurewebsites.net":         "Azure App Service",
     "cloudapp.azure.com":        "Azure Cloud App",
     "azure-api.net":             "Azure API Management",
     "trafficmanager.net":        "Azure Traffic Manager",
     "cloudapp.net":              "Azure Cloud Services",
-    "myshopify.com":             "Shopify (unclaimed store)",
-    "fastly.net":                "Fastly (unclaimed service)",
-    "pantheonsite.io":           "Pantheon (unclaimed site)",
-    "tumblr.com":                "Tumblr (unclaimed blog)",
-    "wordpress.com":             "WordPress.com (unclaimed blog)",
-    "ghost.io":                  "Ghost (unclaimed publication)",
-    "bitbucket.io":              "Bitbucket (unclaimed repository)",
-    "netlify.app":               "Netlify (unclaimed site)",
-    "netlify.com":               "Netlify (unclaimed site)",
-    "vercel.app":                "Vercel (unclaimed deployment)",
-    "now.sh":                    "Vercel (unclaimed deployment)",
-    "fly.dev":                   "Fly.io (unclaimed app)",
-    "zendesk.com":               "Zendesk (unclaimed helpdesk)",
-    "uservoice.com":             "UserVoice (unclaimed portal)",
-    "statuspage.io":             "Statuspage (unclaimed page)",
-    "readme.io":                 "ReadMe (unclaimed docs)",
-    "surge.sh":                  "Surge (unclaimed site)",
-    "unbounce.com":              "Unbounce (unclaimed page)",
-    "ngrok.io":                  "ngrok (unclaimed tunnel)",
-    "ngrok-free.app":            "ngrok (unclaimed tunnel)",
-    "aftership.com":             "AfterShip (unclaimed tracking)",
-    "cargocollective.com":       "Cargo (unclaimed portfolio)",
-    "helpscoutdocs.com":         "Help Scout (unclaimed docs)",
-    "smartjob.io":               "SmartJob (unclaimed board)",
-    "kajabi.com":                "Kajabi (unclaimed site)",
-    "createsend.com":            "Campaign Monitor (unclaimed sender)",
-    "pingdom.com":               "Pingdom (unclaimed check)",
-    "tictail.com":               "Tictail (unclaimed shop)",
-    "strikingly.com":            "Strikingly (unclaimed site)",
-    "agilecrm.com":              "Agile CRM (unclaimed tenant)",
-    "short.io":                  "Short.io (unclaimed short domain)",
-    "siteripe.com":              "Siteripe (unclaimed site)",
-    "tave.com":                  "Tave (unclaimed studio)",
+    "myshopify.com":             "Shopify",
+    "fastly.net":                "Fastly",
+    "pantheonsite.io":           "Pantheon",
+    "tumblr.com":                "Tumblr",
+    "wordpress.com":             "WordPress.com",
+    "ghost.io":                  "Ghost",
+    "bitbucket.io":              "Bitbucket",
+    "netlify.app":               "Netlify",
+    "netlify.com":               "Netlify",
+    "vercel.app":                "Vercel",
+    "now.sh":                    "Vercel",
+    "fly.dev":                   "Fly.io",
+    "zendesk.com":               "Zendesk",
+    "uservoice.com":             "UserVoice",
+    "statuspage.io":             "Statuspage",
+    "readme.io":                 "ReadMe",
+    "surge.sh":                  "Surge",
+    "unbounce.com":              "Unbounce",
+    "ngrok.io":                  "ngrok",
+    "ngrok-free.app":            "ngrok",
+    "aftership.com":             "AfterShip",
+    "cargocollective.com":       "Cargo",
+    "helpscoutdocs.com":         "Help Scout",
+    "smartjob.io":               "SmartJob",
+    "kajabi.com":                "Kajabi",
+    "createsend.com":            "Campaign Monitor",
+    "pingdom.com":               "Pingdom",
+    "tictail.com":               "Tictail",
+    "strikingly.com":            "Strikingly",
+    "agilecrm.com":              "Agile CRM",
+    "short.io":                  "Short.io",
+    "siteripe.com":              "Siteripe",
+    "tave.com":                  "Tave",
 }
 
 
@@ -124,11 +205,13 @@ class DNSRecord:
     ns:      list[str] = field(default_factory=list)
     txt:     list[str] = field(default_factory=list)
     soa:     str = ""
-    status:  str = ""       # NOERROR, NXDOMAIN, SERVFAIL, TIMEOUT, etc.
-    wildcard: bool = False  # True if this matches a wildcard A record
-    takeover: bool = False  # True if CNAME points to vulnerable service
+    status:  str = ""
+    wildcard: bool = False
+    takeover: bool = False
     takeover_service: str = ""
     root: str = ""
+    services_found: list[str] = field(default_factory=list)
+    first_seen: str = ""
 
     @property
     def resolves(self) -> bool:
@@ -136,20 +219,22 @@ class DNSRecord:
 
     def to_dict(self) -> dict:
         return {
-            "host": self.host,
-            "root": self.root,
-            "a": self.a,
-            "aaaa": self.aaaa,
-            "cname": self.cname,
-            "mx": self.mx,
-            "ns": self.ns,
-            "txt": self.txt,
-            "soa": self.soa,
-            "status": self.status,
-            "resolves": self.resolves,
-            "wildcard": self.wildcard,
+            "host":              self.host,
+            "root":              self.root,
+            "a":                 self.a,
+            "aaaa":              self.aaaa,
+            "cname":             self.cname,
+            "mx":                self.mx,
+            "ns":                self.ns,
+            "txt":               self.txt,
+            "soa":               self.soa,
+            "status":            self.status,
+            "resolves":          self.resolves,
+            "wildcard":          self.wildcard,
             "takeover_candidate": self.takeover,
-            "takeover_service": self.takeover_service,
+            "takeover_service":  self.takeover_service,
+            "services_found":    self.services_found,
+            "first_seen":        self.first_seen,
         }
 
 
@@ -159,13 +244,17 @@ class WildcardInfo:
     wildcard_ips: set[str] = field(default_factory=set)
     wildcard_cnames: set[str] = field(default_factory=set)
     detected: bool = False
+    probes_attempted: int = 0
+    probes_resolved: int = 0
 
     def to_dict(self) -> dict:
         return {
-            "root": self.root,
-            "detected": self.detected,
-            "wildcard_ips": sorted(self.wildcard_ips),
-            "wildcard_cnames": sorted(self.wildcard_cnames),
+            "root":             self.root,
+            "detected":         self.detected,
+            "wildcard_ips":     sorted(self.wildcard_ips),
+            "wildcard_cnames":  sorted(self.wildcard_cnames),
+            "probes_attempted": self.probes_attempted,
+            "probes_resolved":  self.probes_resolved,
         }
 
 
@@ -176,23 +265,21 @@ class WildcardInfo:
 def _load_roots(wildcard_file: Optional[Path]) -> list[str]:
     if not wildcard_file or not wildcard_file.exists():
         return []
-    roots = [
+    return [
         line.strip().lower()
         for line in wildcard_file.read_text().splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    return roots
 
 
 def _load_subdomains(subs_file: Path) -> list[str]:
     if not subs_file.exists():
         raise FileNotFoundError(f"subdomain file not found: {subs_file}")
-    subs = set()
+    subs: set[str] = set()
     for line in subs_file.read_text().splitlines():
         line = line.strip().lower()
         if not line or line.startswith("#"):
             continue
-        # Accept either bare names or URLs
         for prefix in ("https://", "http://"):
             if line.startswith(prefix):
                 line = line[len(prefix):]
@@ -210,7 +297,7 @@ def _match_root(host: str, roots: list[str]) -> str:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  WILDCARD DETECTION
+#  WILDCARD DETECTION (2/3 agreement)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _random_subdomain(prefix: str = "argus-wc-") -> str:
@@ -219,10 +306,7 @@ def _random_subdomain(prefix: str = "argus-wc-") -> str:
 
 
 def _resolve_simple(host: str, timeout: float = 5.0) -> tuple[list[str], list[str]]:
-    """
-    Fallback resolver using Python's socket. Returns (a_records, cname_chain).
-    Used only if dnsx is unavailable, and for wildcard detection probes.
-    """
+    """Socket-based resolution — used for wildcard probes and fallback."""
     try:
         socket.setdefaulttimeout(timeout)
         canonical, aliases, ips = socket.gethostbyname_ex(host)
@@ -233,38 +317,66 @@ def _resolve_simple(host: str, timeout: float = 5.0) -> tuple[list[str], list[st
         return [], []
 
 
-def _detect_wildcard_for_root(root: str, samples: int = WILDCARD_PROBES_PER_ROOT) -> WildcardInfo:
+def _detect_wildcard_for_root(
+    root: str, samples: int = WILDCARD_PROBES_PER_ROOT,
+) -> WildcardInfo:
     """
-    Probe several random subdomains under `root`. If any resolve, record
-    the resulting IPs / CNAMEs as wildcard matches for that root.
+    Probe multiple random subdomains under `root`. A root is wildcarded only
+    if at least WILDCARD_MIN_AGREEMENT (default 2/3) probes resolve to the
+    same IP or CNAME. This filters transient-DNS false positives.
     """
     info = WildcardInfo(root=root)
+    probe_ips: list[set[str]] = []
+    probe_cnames: list[set[str]] = []
+
     for _ in range(samples):
         probe = f"{_random_subdomain()}.{root}"
         a_records, cname_chain = _resolve_simple(probe)
-        if a_records:
-            info.wildcard_ips.update(a_records)
+        info.probes_attempted += 1
+        if a_records or cname_chain:
+            info.probes_resolved += 1
+        probe_ips.append(set(a_records))
+        probe_cnames.append(set(cname_chain))
+
+    # Require min agreement
+    if info.probes_resolved < WILDCARD_MIN_AGREEMENT:
+        return info
+
+    # Collect the IPs / CNAMEs that appear in >= MIN_AGREEMENT probes
+    ip_counts: dict[str, int] = defaultdict(int)
+    cname_counts: dict[str, int] = defaultdict(int)
+    for ips in probe_ips:
+        for ip in ips:
+            ip_counts[ip] += 1
+    for cnames in probe_cnames:
+        for c in cnames:
+            cname_counts[c] += 1
+
+    for ip, count in ip_counts.items():
+        if count >= WILDCARD_MIN_AGREEMENT:
+            info.wildcard_ips.add(ip)
             info.detected = True
-        if cname_chain:
-            info.wildcard_cnames.update(cname_chain)
+    for cname, count in cname_counts.items():
+        if count >= WILDCARD_MIN_AGREEMENT:
+            info.wildcard_cnames.add(cname)
             info.detected = True
+
     return info
 
 
 def _detect_wildcards_parallel(roots: list[str]) -> dict[str, WildcardInfo]:
-    """Detect wildcard DNS across all roots concurrently."""
     if not roots:
         return {}
 
-    log.info(f"  Wildcard check : probing {len(roots)} root(s) "
-             f"× {WILDCARD_PROBES_PER_ROOT} probes each...")
+    log.info(
+        f"  Wildcard check : probing {len(roots)} root(s) "
+        f"× {WILDCARD_PROBES_PER_ROOT} each "
+        f"(agreement threshold: {WILDCARD_MIN_AGREEMENT}/{WILDCARD_PROBES_PER_ROOT})..."
+    )
     results: dict[str, WildcardInfo] = {}
 
     with ThreadPoolExecutor(max_workers=min(WILDCARD_CHECK_THREADS, len(roots))) as pool:
-        future_map = {
-            pool.submit(_detect_wildcard_for_root, root): root
-            for root in roots
-        }
+        future_map = {pool.submit(_detect_wildcard_for_root, root): root for root in roots}
         for fut in as_completed(future_map):
             root = future_map[fut]
             try:
@@ -274,10 +386,12 @@ def _detect_wildcards_parallel(roots: list[str]) -> dict[str, WildcardInfo]:
                 info = WildcardInfo(root=root)
             results[root] = info
             if info.detected:
-                ips = ",".join(sorted(info.wildcard_ips)[:3])
-                log.info(f"    {root:<30} WILDCARD ({ips or 'CNAME only'})")
+                ips = ",".join(sorted(info.wildcard_ips)[:3]) or "(cname)"
+                log.info(f"    {root:<30} WILDCARD ({ips})  "
+                         f"{info.probes_resolved}/{info.probes_attempted} probes")
             else:
-                log.info(f"    {root:<30} clean")
+                log.info(f"    {root:<30} clean  "
+                         f"{info.probes_resolved}/{info.probes_attempted} probes")
 
     return results
 
@@ -286,12 +400,9 @@ def _detect_wildcards_parallel(roots: list[str]) -> dict[str, WildcardInfo]:
 #  DNSX EXECUTION
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _run_dnsx(subs: list[str], threads: int, rate_limit: int,
-              workdir: Path) -> Optional[Path]:
-    """
-    Run dnsx against the subdomain list in JSON mode with all record types.
-    Writes to `workdir/dnsx_raw.jsonl` and returns the path.
-    """
+def _run_dnsx(
+    subs: list[str], threads: int, rate_limit: int, workdir: Path,
+) -> Optional[Path]:
     if not shutil.which("dnsx"):
         log.warning("    dnsx not installed — falling back to socket-based resolution")
         return None
@@ -305,44 +416,35 @@ def _run_dnsx(subs: list[str], threads: int, rate_limit: int,
         "-l", str(input_file),
         "-json",
         "-silent",
-        "-a",
-        "-aaaa",
-        "-cname",
-        "-mx",
-        "-ns",
-        "-txt",
-        "-soa",
+        "-a", "-aaaa", "-cname", "-mx", "-ns", "-txt", "-soa",
         "-resp",
         "-threads", str(threads),
-        "-rate-limit", str(rate_limit),
         "-retry", str(DNSX_RETRIES),
         "-timeout", "5",
         "-o", str(output_file),
     ]
+    if rate_limit and rate_limit > 0:
+        cmd.extend(["-rate-limit", str(rate_limit)])
+
     log.info(f"    $ {' '.join(cmd[:12])}...  ({len(subs)} hosts)")
 
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=DNSX_TIMEOUT
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=DNSX_TIMEOUT)
     except subprocess.TimeoutExpired:
         log.warning(f"    dnsx exceeded {DNSX_TIMEOUT}s — using partial output")
+        result = None
     except FileNotFoundError:
         return None
 
     if not output_file.exists():
-        log.warning(f"    dnsx produced no output (stderr: {result.stderr[:160] if 'result' in dir() else 'n/a'})")
+        stderr = result.stderr[:160] if result else "n/a"
+        log.warning(f"    dnsx produced no output (stderr: {stderr})")
         return None
 
     return output_file
 
 
 def _parse_dnsx_jsonl(path: Path) -> dict[str, DNSRecord]:
-    """
-    Parse dnsx JSON Lines into a mapping of host → DNSRecord.
-    dnsx JSON shape (varies slightly by version):
-      {"host":"x.com","a":["1.2.3.4"],"cname":["y.com"],"status_code":"NOERROR"}
-    """
     records: dict[str, DNSRecord] = {}
     parse_errors = 0
 
@@ -362,7 +464,6 @@ def _parse_dnsx_jsonl(path: Path) -> dict[str, DNSRecord]:
 
         rec = DNSRecord(host=host)
 
-        # Records — dnsx uses different key names across versions
         for key, dest in (
             ("a", rec.a), ("AAAA", rec.aaaa), ("aaaa", rec.aaaa),
             ("cname", rec.cname), ("mx", rec.mx),
@@ -378,12 +479,7 @@ def _parse_dnsx_jsonl(path: Path) -> dict[str, DNSRecord]:
         elif isinstance(soa, str):
             rec.soa = soa
 
-        status = (
-            obj.get("status_code")
-            or obj.get("rcode")
-            or obj.get("status")
-            or ""
-        )
+        status = obj.get("status_code") or obj.get("rcode") or obj.get("status") or ""
         rec.status = str(status).upper() if status else "NOERROR"
 
         records[host] = rec
@@ -394,11 +490,10 @@ def _parse_dnsx_jsonl(path: Path) -> dict[str, DNSRecord]:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  FALLBACK RESOLVER (socket-based)
+#  FALLBACK RESOLVER
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _resolve_fallback(subs: list[str]) -> dict[str, DNSRecord]:
-    """Socket-based resolution for when dnsx is missing."""
     log.info(f"    Fallback resolver: socket.gethostbyname_ex  ({len(subs)} hosts)")
 
     def _worker(host: str) -> tuple[str, DNSRecord]:
@@ -407,7 +502,6 @@ def _resolve_fallback(subs: list[str]) -> dict[str, DNSRecord]:
             canonical, aliases, ips = socket.gethostbyname_ex(host)
             rec.a = [ip for ip in ips if ":" not in ip]
             rec.aaaa = [ip for ip in ips if ":" in ip]
-            # Aliases include the canonical name when it differs
             for alias in aliases:
                 if alias.lower() != host.lower():
                     rec.cname.append(alias)
@@ -429,9 +523,9 @@ def _resolve_fallback(subs: list[str]) -> dict[str, DNSRecord]:
 #  ANALYSIS
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _match_wildcard(rec: DNSRecord, wildcards: dict[str, WildcardInfo],
-                    roots: list[str]) -> None:
-    """Mark `rec` as wildcard if its resolved IPs or CNAMEs match the root's wildcard."""
+def _match_wildcard(
+    rec: DNSRecord, wildcards: dict[str, WildcardInfo], roots: list[str],
+) -> None:
     root = _match_root(rec.host, roots)
     rec.root = root
     if not root or root not in wildcards:
@@ -448,7 +542,6 @@ def _match_wildcard(rec: DNSRecord, wildcards: dict[str, WildcardInfo],
 
 
 def _detect_takeover(rec: DNSRecord) -> None:
-    """Flag records whose CNAME points to a known-vulnerable service."""
     for cname in rec.cname:
         cname_lower = cname.lower()
         for pattern, service_name in TAKEOVER_FINGERPRINTS.items():
@@ -458,18 +551,58 @@ def _detect_takeover(rec: DNSRecord) -> None:
                 return
 
 
+def _extract_services_from_txt(rec: DNSRecord) -> list[str]:
+    """Scan TXT records for known service verification strings."""
+    services: set[str] = set()
+    for txt in rec.txt:
+        txt_lower = txt.lower()
+        for marker, service_name in TXT_SERVICE_MARKERS.items():
+            if marker.lower() in txt_lower:
+                services.add(service_name)
+    return sorted(services)
+
+
 def _cluster_by_ip(records: dict[str, DNSRecord]) -> dict[str, list[str]]:
-    """Group hosts by shared A record IP for infrastructure pivoting."""
     clusters: dict[str, list[str]] = defaultdict(list)
     for rec in records.values():
         for ip in rec.a:
             clusters[ip].append(rec.host)
-    # Only keep IPs shared by 2+ hosts — single-host IPs aren't interesting clusters
     return {
         ip: sorted(hosts)
         for ip, hosts in clusters.items()
         if len(hosts) >= 2
     }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SELF-SYNC
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _self_sync(scan_id: int, records: list[DNSRecord]) -> None:
+    if not records:
+        return
+    if not DB_AVAILABLE or DB is None:
+        log.warning("  DB sync: db.py not available")
+        return
+    if not _cfg("SYNC_TO_DB", True):
+        log.info("  DB sync: SYNC_TO_DB is False")
+        return
+    if not _cfg("BRIDGE_ENABLED", False):
+        log.info("  DB sync: BRIDGE_ENABLED is False")
+        return
+    if not DB.available:
+        log.warning("  DB sync: bridge client not ready")
+        return
+
+    try:
+        payloads = [r.to_dict() for r in records]
+        result = DB.upsert_dns_records(scan_id, payloads)
+        if result is None:
+            log.warning("  DB sync: bridge returned None")
+        else:
+            log.info(f"  DB sync: {result} DNS record(s) upserted (scan_id={scan_id})")
+    except Exception as e:
+        log.warning(f"  DB sync: exception — {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -481,9 +614,10 @@ def resolve_dns(
     outdir: Path,
     wildcard_file: Optional[Path] = None,
     *,
-    threads: int = DNSX_THREADS,
-    rate_limit: int = DNSX_RATE_LIMIT,
+    threads: Optional[int] = None,
+    rate_limit: Optional[int] = None,
     max_input: int = MAX_INPUT,
+    scan_id: Optional[int] = None,
 ) -> Path:
     """
     Resolve every subdomain in `subs_file` and produce filtered inventories.
@@ -492,7 +626,10 @@ def resolve_dns(
     """
     start = time.monotonic()
 
-    # ── Inputs ──────────────────────────────────────────────────────────────
+    settings = _dns_settings()
+    eff_threads = threads if threads is not None else settings["threads"]
+    eff_rate = rate_limit if rate_limit is not None else settings["rate_limit"]
+
     subs = _load_subdomains(subs_file)
     if len(subs) > max_input:
         log.warning(f"  Capping at {max_input} hosts (input had {len(subs)})")
@@ -503,8 +640,12 @@ def resolve_dns(
     workdir = outdir / "dns_work"
     workdir.mkdir(parents=True, exist_ok=True)
 
-    log.info(f"  Input   : {len(subs)} subdomain(s) from {subs_file.name}")
-    log.info(f"  Roots   : {len(roots)} wildcard root(s)")
+    log.info(f"  Input  : {len(subs)} subdomain(s) from {subs_file.name}")
+    log.info(f"  Roots  : {len(roots)} wildcard root(s)")
+    log.info(f"  Config : threads={eff_threads}  rate_limit={eff_rate}/s")
+    log.info(f"           source: MODULE_RATE_LIMITS['dns']")
+    log.info(f"           note: this stage queries public recursors, "
+             f"not the target — no headers/auth applied")
     log.info("")
 
     if not subs:
@@ -517,35 +658,38 @@ def resolve_dns(
     # ── Run dnsx ────────────────────────────────────────────────────────────
     log.info("")
     log.info("  Resolving (A, AAAA, CNAME, MX, NS, TXT, SOA)...")
-    dnsx_output = _run_dnsx(subs, threads, rate_limit, workdir)
+    dnsx_output = _run_dnsx(subs, eff_threads, eff_rate, workdir)
 
     if dnsx_output:
         records = _parse_dnsx_jsonl(dnsx_output)
     else:
         records = _resolve_fallback(subs)
 
-    # Ensure every input host is in the map (some tools omit NXDOMAINs)
     for host in subs:
         if host not in records:
             records[host] = DNSRecord(host=host, status="NXDOMAIN")
 
-    log.info(f"  Resolved: {sum(1 for r in records.values() if r.resolves)} "
-             f"/ {len(records)} host(s)")
+    resolved_count = sum(1 for r in records.values() if r.resolves)
+    log.info(f"  Resolved: {resolved_count} / {len(records)} host(s)")
 
     # ── Analysis ────────────────────────────────────────────────────────────
+    now = datetime.now(timezone.utc).isoformat()
     for rec in records.values():
         _match_wildcard(rec, wildcards, roots)
         _detect_takeover(rec)
+        rec.services_found = _extract_services_from_txt(rec)
+        rec.first_seen = now
 
     wildcard_count = sum(1 for r in records.values() if r.wildcard)
     takeover_count = sum(1 for r in records.values() if r.takeover)
     cluster_map    = _cluster_by_ip(records)
+    services_seen: set[str] = set()
+    for r in records.values():
+        services_seen.update(r.services_found)
 
     # ── Filtered inventories ────────────────────────────────────────────────
     resolved_all   = sorted(h for h, r in records.items() if r.resolves)
-    resolved_clean = sorted(
-        h for h, r in records.items() if r.resolves and not r.wildcard
-    )
+    resolved_clean = sorted(h for h, r in records.items() if r.resolves and not r.wildcard)
     takeover_hosts = sorted(h for h, r in records.items() if r.takeover)
 
     (outdir / "dns_resolved.txt").write_text(
@@ -562,10 +706,7 @@ def resolve_dns(
     elapsed = time.monotonic() - start
 
     record_list = sorted(records.values(), key=lambda r: (
-        not r.resolves,       # resolved first
-        r.wildcard,           # then non-wildcard
-        not r.takeover,       # then takeover
-        r.host,
+        not r.resolves, r.wildcard, not r.takeover, r.host,
     ))
 
     report = {
@@ -574,24 +715,32 @@ def resolve_dns(
         "input_file": str(subs_file),
         "wildcard_file": str(wildcard_file) if wildcard_file else None,
         "config": {
-            "threads": threads,
-            "rate_limit": rate_limit,
-            "resolver": "dnsx" if dnsx_output else "socket-fallback",
-            "max_input": max_input,
+            "threads":                eff_threads,
+            "rate_limit":             eff_rate,
+            "resolver":               "dnsx" if dnsx_output else "socket-fallback",
+            "max_input":              max_input,
+            "wildcard_min_agreement": WILDCARD_MIN_AGREEMENT,
+            "wildcard_probes":        WILDCARD_PROBES_PER_ROOT,
+            "headers_applied":        False,
+            "note":                   "DNS queries go to public recursors, "
+                                      "not the target — platform headers and "
+                                      "auth cookies are not applicable",
         },
         "totals": {
-            "input": len(subs),
-            "resolved": len(resolved_all),
-            "resolved_clean": len(resolved_clean),
-            "wildcard_matches": wildcard_count,
+            "input":              len(subs),
+            "resolved":           len(resolved_all),
+            "resolved_clean":     len(resolved_clean),
+            "wildcard_matches":   wildcard_count,
             "takeover_candidates": takeover_count,
             "shared_ip_clusters": len(cluster_map),
+            "services_detected":  len(services_seen),
         },
+        "services_detected": sorted(services_seen),
         "wildcards": [w.to_dict() for w in wildcards.values()],
         "ip_clusters": {
             ip: hosts for ip, hosts in sorted(
                 cluster_map.items(), key=lambda kv: -len(kv[1])
-            )[:200]  # cap at 200 clusters to keep the JSON manageable
+            )[:200]
         },
         "records": [r.to_dict() for r in record_list],
     }
@@ -599,19 +748,27 @@ def resolve_dns(
     json_path = outdir / "dns_resolve.json"
     json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
-    # ── Cleanup workdir ─────────────────────────────────────────────────────
     try:
         shutil.rmtree(workdir, ignore_errors=True)
     except Exception:
         pass
 
+    # ── Self-sync ───────────────────────────────────────────────────────────
+    if scan_id is not None:
+        log.info("")
+        log.info(f"  Syncing to remote database (scan_id={scan_id})...")
+        _self_sync(scan_id, list(records.values()))
+    else:
+        log.info("")
+        log.info("  DB sync  : deferred to main.py (no scan_id passed)")
+
     # ── Console summary ─────────────────────────────────────────────────────
     log.info("")
     log.info("  Outputs :")
-    log.info(f"    dns_resolved.txt           {len(resolved_all):>6} host(s)")
-    log.info(f"    dns_wildcard_filtered.txt  {len(resolved_clean):>6} host(s)  (feed to httpx)")
-    log.info(f"    dns_takeover_candidates.txt {len(takeover_hosts):>5} host(s)")
-    log.info(f"    dns_resolve.json           {len(records):>6} record(s)")
+    log.info(f"    dns_resolved.txt            {len(resolved_all):>6} host(s)")
+    log.info(f"    dns_wildcard_filtered.txt   {len(resolved_clean):>6} host(s)  (feed to httpx)")
+    log.info(f"    dns_takeover_candidates.txt {len(takeover_hosts):>6} host(s)")
+    log.info(f"    dns_resolve.json            {len(records):>6} record(s)")
 
     if wildcard_count:
         log.info("")
@@ -620,6 +777,11 @@ def resolve_dns(
             if info.detected:
                 ips = ", ".join(sorted(info.wildcard_ips)[:3]) or "(cname)"
                 log.info(f"    {info.root:<30} → {ips}")
+
+    if services_seen:
+        log.info("")
+        log.info(f"  Services detected via TXT ({len(services_seen)}):")
+        log.info("    " + " · ".join(sorted(services_seen)))
 
     if takeover_hosts:
         log.info("")
@@ -651,8 +813,9 @@ def _write_empty_report(outdir: Path, input_file: Path, start: float) -> Path:
         "totals": {
             "input": 0, "resolved": 0, "resolved_clean": 0,
             "wildcard_matches": 0, "takeover_candidates": 0,
-            "shared_ip_clusters": 0,
+            "shared_ip_clusters": 0, "services_detected": 0,
         },
+        "services_detected": [],
         "wildcards": [],
         "ip_clusters": {},
         "records": [],
@@ -670,6 +833,8 @@ def _write_empty_report(outdir: Path, input_file: Path, start: float) -> Path:
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    import argparse
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
@@ -680,8 +845,19 @@ if __name__ == "__main__":
     wildcards = base / "wildcard.txt"
     out = base / "output"
 
+    parser = argparse.ArgumentParser(description="Argus DNS resolver (standalone)")
+    parser.add_argument("--scan-id", type=int, default=None)
+    parser.add_argument("--threads", type=int, default=None)
+    parser.add_argument("--rate-limit", type=int, default=None)
+    args = parser.parse_args()
+
     try:
-        resolve_dns(subs, out, wildcards)
+        resolve_dns(
+            subs, out, wildcards,
+            threads=args.threads,
+            rate_limit=args.rate_limit,
+            scan_id=args.scan_id,
+        )
     except Exception as e:
         log.error(f"failed: {e}")
         sys.exit(1)

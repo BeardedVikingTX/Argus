@@ -165,6 +165,47 @@ class ArgusDB:
         r = self._call("endpoints.upsert", {"scan_id": scan_id, "endpoints": endpoints})
         return r.get("count") if r and r.get("ok") else None
 
+    def upsert_dns_records(
+        self, scan_id: int, dns_records: list[dict], chunk_size: int = 300,
+    ) -> Optional[int]:
+        """Upsert DNS records in chunks."""
+        if not dns_records:
+            return 0
+
+        total = 0
+        for i in range(0, len(dns_records), chunk_size):
+            chunk = dns_records[i:i + chunk_size]
+            r = self._call("dns_records.upsert", {
+                "scan_id":     scan_id,
+                "dns_records": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"dns_records.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_dns_records(
+        self, scan_uuid: str, limit: int = 1000, offset: int = 0,
+        resolves: Optional[bool] = None, takeover: Optional[bool] = None,
+        exclude_wildcard: bool = False,
+    ) -> Optional[list]:
+        payload = {
+            "scan_uuid":       scan_uuid,
+            "limit":           limit,
+            "offset":          offset,
+            "exclude_wildcard": exclude_wildcard,
+        }
+        if resolves is not None:
+            payload["resolves"] = resolves
+        if takeover is not None:
+            payload["takeover"] = takeover
+        r = self._call("query.dns_records", payload)
+        return r.get("dns_records") if r and r.get("ok") else None
+
     def upsert_subdomains(
         self, scan_id: int, subdomains: list[dict], chunk_size: int = 500,
     ) -> Optional[int]:
