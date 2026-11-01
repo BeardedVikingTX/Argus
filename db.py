@@ -585,6 +585,53 @@ class ArgusDB:
         r = self._call("query.urls", payload)
         return r.get("urls") if r and r.get("ok") else None
 
+    def upsert_triage_findings(
+        self, scan_id: int, findings: list[dict], chunk_size: int = 200,
+    ) -> Optional[int]:
+        """Upsert triaged findings in chunks."""
+        if not findings:
+            return 0
+
+        total = 0
+        for i in range(0, len(findings), chunk_size):
+            chunk = findings[i:i + chunk_size]
+            r = self._call("triage_findings.upsert", {
+                "scan_id":           scan_id,
+                "triage_findings":   chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"triage_findings.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_triage_findings(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        min_score: Optional[float] = None, severity: Optional[str] = None,
+        finding_status: Optional[str] = None, kind: Optional[str] = None,
+        host: Optional[str] = None,
+    ) -> Optional[list]:
+        payload = {"scan_uuid": scan_uuid, "limit": limit, "offset": offset}
+        if min_score is not None:
+            payload["min_score"] = min_score
+        if severity is not None:
+            payload["severity"] = severity
+        if finding_status is not None:
+            payload["finding_status"] = finding_status
+        if kind is not None:
+            payload["kind"] = kind
+        if host is not None:
+            payload["host"] = host
+        r = self._call("query.triage_findings", payload)
+        return r.get("triage_findings") if r and r.get("ok") else None
+
+    def get_triage_history(self, finding_hash: str) -> Optional[list]:
+        r = self._call("query.triage_history", {"finding_hash": finding_hash})
+        return r.get("history") if r and r.get("ok") else None
+
     def upsert_subdomains(
         self, scan_id: int, subdomains: list[dict], chunk_size: int = 500,
     ) -> Optional[int]:

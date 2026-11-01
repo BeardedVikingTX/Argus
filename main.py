@@ -997,7 +997,7 @@ def _run_mapping(outdir: Path) -> None:
 
 def _run_triage(outdir: Path) -> None:
     from recon_tools.vuln_triage import run_vuln_triage
-    run_vuln_triage(outdir)
+    run_vuln_triage(outdir, scan_id=_CURRENT_SCAN_ID)
 
 
 RUNNERS = {
