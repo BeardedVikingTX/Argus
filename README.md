@@ -1,16 +1,17 @@
-Argus
-🔭 The all-seeing recon framework for bug bounty hunters.
+# Argus
 
-https://img.shields.io/badge/python-3.10%2B-blue.svg  
-https://img.shields.io/badge/License-MIT-yellow.svg  
-https://img.shields.io/badge/PRs-welcome-brightgreen.svg  
-https://img.shields.io/badge/maintained-yes-green.svg  
+### &#128301; The all-seeing recon framework for bug bounty hunters.
+
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/BeardedVikingTX/Argus/pulls)
+[![Maintained](https://img.shields.io/badge/maintained-yes-green.svg)](https://github.com/BeardedVikingTX/Argus)
 
     Argus (Ἄργος) — the hundred-eyed giant of Greek myth. The all-seeing watchman. A modular, file-driven recon pipeline that chains subdomain enumeration, liveness detection, service scanning, URL mining, and heuristic candidate flaggers into one clean, idempotent workflow.
 
 Argus does not exploit. Argus surfaces. Every finding it produces is a candidate — a flag on a map that says "look here, human." Manual triage is the point. That's what separates real findings from duplicate noise.
 
-📖 Table of Contents
+# 📖 Table of Contents
 --------------------
 
 -   Why Argus
@@ -43,7 +44,7 @@ Argus does not exploit. Argus surfaces. Every finding it produces is a candidate
 
 * * * * *
 
-🎯 Why Argus
+# 🎯 Why Argus
 ------------
 
 Most bug bounty tooling falls into two camps: **massive all-in-one frameworks** that are hard to reason about and slower to adapt, or **loose piles of bash scripts** that break the moment a tool changes its output format.
@@ -62,7 +63,7 @@ Recon is the game. Argus makes the game repeatable.
 
 * * * * *
 
-🔧 The Pipeline
+# 🔧 The Pipeline
 ---------------
 
 ```
@@ -122,7 +123,7 @@ wildcard.txt
   You. Burp Suite. Manual triage.
 ```
 
-✨ Features
+# ✨ Features
 ----------
 
 -   **🔗 Fully modular** --- one module per stage, no hidden coupling, no monolithic scripts.
@@ -147,7 +148,7 @@ wildcard.txt
 
 * * * * *
 
-📦 Installation
+# 📦 Installation
 ---------------
 
 ### Prerequisites
