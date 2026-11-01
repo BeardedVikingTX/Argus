@@ -309,15 +309,16 @@ STAGE_ARTIFACTS = {
 # Recon artifacts use a different schema than findings.
 # Keyed by stage → (json filename, DB table kind).
 RECON_JSON_MAP: dict[str, tuple[str, str]] = {
-    "subs":   ("subdomains.json",     "subdomains"),
-    "dns":    ("dns_resolve.json",    "dns_records"),
-    "live":   ("live_hosts.json",     "live_hosts"),
-    "crawl":  ("site_pages.json",     "site_pages"),
-    "fuzz":   ("content_fuzz.json",   "content_fuzz"),
-    "js":     ("js_findings.json",    "js_findings"),
-    "nmap":   ("nmap_scan.json",      "nmap"),
-    "nuclei": ("nuclei_findings.json","nuclei"),
-    "params": ("param_findings.json", "param_findings"),
+    "subs":     ("subdomains.json",        "subdomains"),
+    "dns":      ("dns_resolve.json",       "dns_records"),
+    "takeover": ("takeover_findings.json", "takeover_findings"),
+    "live":     ("live_hosts.json",        "live_hosts"),
+    "crawl":    ("site_pages.json",        "site_pages"),
+    "fuzz":     ("content_fuzz.json",      "content_fuzz"),
+    "js":       ("js_findings.json",       "js_findings"),
+    "nmap":     ("nmap_scan.json",         "nmap"),
+    "nuclei":   ("nuclei_findings.json",   "nuclei"),
+    "params":   ("param_findings.json",    "param_findings"),
 }
 
 def resolve_stages(arg: str) -> list[str]:
@@ -741,7 +742,12 @@ def _run_takeover(outdir: Path) -> None:
         outdir, ["dns_wildcard_filtered.txt", "dns_resolved.txt", "all_subs.txt"],
     )
     r = _module_rate("takeover")
-    run_takeover_check(source, outdir, http_threads=r.get("concurrency", 15))
+    run_takeover_check(
+        source, outdir,
+        http_threads=r.get("concurrency", 15),
+        headers=_platform_headers() or None,
+        scan_id=_CURRENT_SCAN_ID,
+    )
 
 
 def _run_live(outdir: Path) -> None:
@@ -1159,6 +1165,30 @@ def _to_nmap_host_payload(h: dict) -> Optional[dict]:
         "first_seen":      h.get("first_seen"),
     }
 
+def _to_takeover_payload(f: dict) -> Optional[dict]:
+    """Convert a takeover_findings.json record into the wire shape."""
+    subdomain = f.get("subdomain") or ""
+    if not subdomain:
+        return None
+    return {
+        "subdomain":       subdomain,
+        "cname_chain":     f.get("cname_chain") or [],
+        "service":         f.get("service", ""),
+        "status":          (f.get("status") or "SAFE").upper(),
+        "cname_match":     bool(f.get("cname_match")),
+        "http_confirmed":  bool(f.get("http_confirmed")),
+        "http_status":     f.get("http_status"),
+        "fingerprint":     f.get("fingerprint", ""),
+        "cvss":            f.get("cvss"),
+        "severity_score":  int(f.get("severity_score", 0)),
+        "dangling":        bool(f.get("dangling")),
+        "shared_cname":    bool(f.get("shared_cname")),
+        "notes":           f.get("notes", ""),
+        "error":           f.get("error", ""),
+        "auth_enabled":    bool(f.get("auth_enabled")),
+        "first_seen":      _format_dt(f.get("first_seen")),
+    }
+
 def _to_param_finding_payload(f: dict) -> Optional[dict]:
     """Convert a param_findings.json record into the wire shape."""
     url = f.get("url") or ""
@@ -1470,6 +1500,23 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
                 else:
                     _DB_FAIL_COUNT = 0
                     log.info(f"DB sync params: {result} parameter(s) upserted")
+                return
+
+            elif kind == "takeover_findings":
+                items = data.get("findings") or []
+                if not items:
+                    return
+                payloads = [_to_takeover_payload(f) for f in items]
+                payloads = [p for p in payloads if p]
+                if not payloads:
+                    return
+                result = DB.upsert_takeover_findings(scan_id, payloads)
+                if result is None:
+                    _DB_FAIL_COUNT += 1
+                    log.debug("DB sync takeover_findings returned None")
+                else:
+                    _DB_FAIL_COUNT = 0
+                    log.info(f"DB sync takeover: {result} finding(s) upserted")
                 return
 
         except Exception as e:

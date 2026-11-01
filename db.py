@@ -447,6 +447,50 @@ class ArgusDB:
         r = self._call("query.param_findings", payload)
         return r.get("param_findings") if r and r.get("ok") else None
 
+    def upsert_takeover_findings(
+        self, scan_id: int, findings: list[dict], chunk_size: int = 500,
+    ) -> Optional[int]:
+        """Upsert takeover findings in chunks."""
+        if not findings:
+            return 0
+
+        total = 0
+        for i in range(0, len(findings), chunk_size):
+            chunk = findings[i:i + chunk_size]
+            r = self._call("takeover_findings.upsert", {
+                "scan_id":            scan_id,
+                "takeover_findings":  chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"takeover_findings.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_takeover_findings(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        status: Optional[str] = None, service: Optional[str] = None,
+        vulnerable_only: bool = False, dangling_only: bool = False,
+        shared_only: bool = False,
+    ) -> Optional[list]:
+        payload = {
+            "scan_uuid":        scan_uuid,
+            "limit":            limit,
+            "offset":           offset,
+            "vulnerable_only":  vulnerable_only,
+            "dangling_only":    dangling_only,
+            "shared_only":      shared_only,
+        }
+        if status is not None:
+            payload["status"] = status
+        if service is not None:
+            payload["service"] = service
+        r = self._call("query.takeover_findings", payload)
+        return r.get("takeover_findings") if r and r.get("ok") else None
+
     def upsert_subdomains(
         self, scan_id: int, subdomains: list[dict], chunk_size: int = 500,
     ) -> Optional[int]:
