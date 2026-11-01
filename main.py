@@ -309,9 +309,10 @@ STAGE_ARTIFACTS = {
 # Recon artifacts use a different schema than findings.
 # Keyed by stage → (json filename, DB table kind).
 RECON_JSON_MAP: dict[str, tuple[str, str]] = {
-    "subs": ("subdomains.json", "subdomains"),
-    "live": ("live_hosts.json", "live_hosts"),
-    "crawl": ("site_pages.json", "site_pages"),
+    "subs":  ("subdomains.json",  "subdomains"),
+    "live":  ("live_hosts.json",  "live_hosts"),
+    "crawl": ("site_pages.json",  "site_pages"),
+    "fuzz":  ("content_fuzz.json", "content_fuzz"),
 }
 def resolve_stages(arg: str) -> list[str]:
     if arg in STAGE_GROUPS:
@@ -1225,6 +1226,13 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
                 # Already in wire shape from PageRecord.to_dict()
                 result = DB.upsert_site_pages(scan_id, items)
                 label = "page(s)"
+
+            elif kind == "content_fuzz":
+                items = data.get("findings") or []
+                if not items:
+                    return
+                result = DB.upsert_content_fuzz(scan_id, items)
+                label = "endpoint(s)"
 
             else:
                 return

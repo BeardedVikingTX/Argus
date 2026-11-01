@@ -264,6 +264,41 @@ class ArgusDB:
                 )
         return total
 
+    def upsert_content_fuzz(
+        self, scan_id: int, findings: list[dict], chunk_size: int = 300,
+    ) -> Optional[int]:
+        """Upsert content fuzz results in chunks."""
+        if not findings:
+            return 0
+
+        total = 0
+        for i in range(0, len(findings), chunk_size):
+            chunk = findings[i:i + chunk_size]
+            r = self._call("content_fuzz.upsert", {
+                "scan_id":      scan_id,
+                "content_fuzz": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"content_fuzz.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_content_fuzz(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        min_confidence: Optional[int] = None, source_tool: Optional[str] = None,
+    ) -> Optional[list]:
+        payload = {"scan_uuid": scan_uuid, "limit": limit, "offset": offset}
+        if min_confidence is not None:
+            payload["min_confidence"] = min_confidence
+        if source_tool is not None:
+            payload["source_tool"] = source_tool
+        r = self._call("query.content_fuzz", payload)
+        return r.get("content_fuzz") if r and r.get("ok") else None
+
     def get_site_pages(
         self, scan_uuid: str, limit: int = 100, offset: int = 0,
         page_kind: Optional[str] = None, is_auth: Optional[bool] = None,

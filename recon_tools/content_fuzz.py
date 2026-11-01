@@ -3,47 +3,35 @@
 recon_tools/content_fuzz.py — Content & Directory Discovery
 ═══════════════════════════════════════════════════════════════════════════════
 
-Purpose-built content discovery stage for Argus.
+Two-phase content discovery: feroxbuster (broad recursion) + ffuf (surgical).
 
-Two-phase strategy:
+THIS IS TARGET-TRAFFIC. Platform headers and request.txt auth are applied
+to every request. Rate limits are honored to stay within program rules.
 
-  Phase 1 — feroxbuster
-      Broad, automatic recursive mapping. Feroxbuster is purpose-built for
-      recursive directory discovery and will recurse into found directories
-      without manual re-invocation. This is the "map the surface" pass.
-
-  Phase 2 — ffuf
-      Surgical, extension-aware fuzzing on the root of every live host.
-      ffuf is the Swiss-army knife: fast, scriptable, and precise when you
-      supply a focused wordlist and a tight filter set.
-
-Both tools emit JSON. This module parses both formats, normalises them into a
-single record shape, deduplicates by URL, and classifies each result by
-confidence so the human triager can focus on signal, not noise.
-
-Filtering strategy:
-  • Soft-404s are detected per-host by probing a random 32-char path and
-    recording the response length; any result matching that length within a
-    tolerance band is discarded.
-  • Status codes are filtered against an allow-list (200, 201, 204, 301,
-    302, 307, 308, 401, 403, 500) rather than blindly accepting all 200s.
-  • Results are scored: access-gated (401/403) and backup/extension hits
-    receive higher confidence than generic 200s.
+Config integration (config.py):
+  • MODULE_RATE_LIMITS["fuzz"]              → threads + rate_limit for both tools
+  • ACTIVE_HEADERS + AUTH_HEADERS           → -H flags on feroxbuster and ffuf
+  • AUTH_COOKIES                            → applied to soft-404 baseline probes
+  • SYNC_TO_DB, BRIDGE_*                    → remote database sync
 
 Outputs (into `outdir`):
-  • content_fuzz.json        — structured report, primary output
-  • fuzzed_directories.txt   — one discovered URL per line (for nuclei/katana)
-  • fuzzed_interesting.txt   — high-confidence subset for manual review
+  • content_fuzz.json        — structured report
+  • fuzzed_directories.txt   — every discovered URL
+  • fuzzed_interesting.txt   — high-confidence subset
+
+Remote DB (if scan_id is provided and bridge is reachable):
+  • content_fuzz table       — one row per (scan_id, url_hash)
 
 Integration:
   main.py → run_one("fuzz") → run_content_fuzz(live_urls_file, outdir)
+  main.py also syncs content_fuzz.json via _sync_stage_artifacts()
+  Standalone: run_content_fuzz(..., scan_id=42) → self-syncs
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import random
 import re
 import shutil
@@ -60,54 +48,97 @@ from typing import Optional
 log = logging.getLogger("argus.content_fuzz")
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION
+#  CONFIG
 # ═════════════════════════════════════════════════════════════════════════════
 
-# ── Wordlists ────────────────────────────────────────────────────────────────
-# Order matters: smallest / fastest lists first for quick wins.
-# Each entry: (display_name, absolute_path, extensions_override_or_None)
-# If the path does not exist, the entry is skipped with a warning.
+try:
+    import config as CFG
+    CFG_LOADED = True
+except ImportError:
+    CFG = None
+    CFG_LOADED = False
+
+try:
+    from db import DB
+    DB_AVAILABLE = True
+except ImportError:
+    DB = None
+    DB_AVAILABLE = False
+
+
+def _cfg(key: str, default=None):
+    if not CFG_LOADED:
+        return default
+    return getattr(CFG, key, default)
+
+
+def _fuzz_settings() -> dict:
+    """Return effective (threads, rate_limit) for fuzzing tools."""
+    entry = (_cfg("MODULE_RATE_LIMITS", {}) or {}).get("fuzz", {})
+    threads = entry.get("concurrency", 50)
+    rate = entry.get("rate_limit", 100)
+    if not isinstance(threads, int) or threads < 1:
+        threads = 50
+    if not isinstance(rate, int) or rate < 0:
+        rate = 100
+    return {"threads": threads, "rate_limit": rate}
+
+
+def _target_headers() -> dict[str, str]:
+    """Return merged headers for target traffic (auth overrides platform)."""
+    h = dict(_cfg("ACTIVE_HEADERS", {}) or {})
+    if CFG_LOADED and getattr(CFG, "AUTH_ENABLED", False):
+        auth_hdrs = getattr(CFG, "AUTH_HEADERS", {}) or {}
+        if auth_hdrs:
+            h.update(auth_hdrs)
+    return h
+
+
+def _tool_header_args() -> list[str]:
+    """Return ['Name: Value', ...] for tools that accept -H."""
+    return [f"{k}: {v}" for k, v in _target_headers().items()]
+
+
+def _auth_cookies() -> dict[str, str]:
+    """Return auth cookies (for the soft-404 baseline probes)."""
+    if not CFG_LOADED or not getattr(CFG, "AUTH_ENABLED", False):
+        return {}
+    return dict(getattr(CFG, "AUTH_COOKIES", {}) or {})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ═════════════════════════════════════════════════════════════════════════════
+
 WORDLISTS: list[tuple[str, str, Optional[list[str]]]] = [
-    # Fast triage
-    ("common",               "/usr/share/seclists/Discovery/Web-Content/common.txt",                     None),
-    # Broad directory coverage
-    ("raft-medium-dirs",     "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt",    None),
-    # File-level discovery
-    ("raft-medium-files",    "/usr/share/seclists/Discovery/Web-Content/raft-medium-files.txt",          None),
-    # API surface
-    ("api-endpoints",        "/usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt",          None),
-    # Backup / source-file hunting
-    ("backup-files",         "/usr/share/seclists/Discovery/Web-Content/backup-files.txt",               [".bak", ".old", ".zip", ".tar.gz", ".sql", ".swp"]),
+    ("common",            "/usr/share/seclists/Discovery/Web-Content/common.txt",                  None),
+    ("raft-medium-dirs",  "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt", None),
+    ("raft-medium-files", "/usr/share/seclists/Discovery/Web-Content/raft-medium-files.txt",       None),
+    ("api-endpoints",     "/usr/share/seclists/Discovery/Web-Content/api/api-endpoints.txt",       None),
+    ("backup-files",      "/usr/share/seclists/Discovery/Web-Content/backup-files.txt",
+     [".bak", ".old", ".zip", ".tar.gz", ".sql", ".swp"]),
 ]
 
-# Extensions applied when the wordlist does not carry its own override.
 DEFAULT_EXTENSIONS = [".php", ".asp", ".aspx", ".jsp", ".json", ".xml", ".js", ".html"]
 
-# ── Execution limits ──────────────────────────────────────────────────────────
-FEROX_THREADS       = 50
-FEROX_RATE_LIMIT    = 100       # requests/second
-FEROX_TIMEOUT       = 600       # seconds per host
-FEROX_DEPTH         = 3
-FEROX_SCAN_LIMIT    = 20000     # max requests per host — prevents runaway scans
+FEROX_THREADS         = 50
+FEROX_RATE_LIMIT      = 100
+FEROX_TIMEOUT         = 600
+FEROX_DEPTH           = 3
+FEROX_SCAN_LIMIT      = 20000
 
-FFUF_THREADS        = 40
-FFUF_RATE_LIMIT     = 100
-FFUF_TIMEOUT        = 600
-FFUF_MAX_TIME       = 600       # --maxtime in seconds
+FFUF_THREADS          = 40
+FFUF_RATE_LIMIT       = 100
+FFUF_TIMEOUT          = 600
+FFUF_MAX_TIME         = 600
 
-# ── Filtering ────────────────────────────────────────────────────────────────
-SOFT_404_PROBE_LEN  = 32        # random path length used for soft-404 detection
-SOFT_404_TOLERANCE  = 50        # bytes of variance allowed around baseline
-ALLOWED_STATUS      = {200, 201, 204, 301, 302, 307, 308, 401, 403, 500}
+SOFT_404_PROBE_LEN    = 32
+SOFT_404_TOLERANCE    = 50
+ALLOWED_STATUS        = {200, 201, 204, 301, 302, 307, 308, 401, 403, 500}
 
-# ── Confidence scoring ───────────────────────────────────────────────────────
 CONFIDENCE_HIGH_THRESHOLD = 60
 
-# ── Paths ────────────────────────────────────────────────────────────────────
-SECLISTS_FALLBACK_PATHS = [
-    Path("/usr/share/seclists"),
-    Path("/opt/seclists"),
-]
+SECLISTS_FALLBACK_PATHS = [Path("/usr/share/seclists"), Path("/opt/seclists")]
 MINIMAL_WORDLIST_FALLBACK = [
     "admin", "api", "v1", "v2", "v3", "login", "dashboard", "internal",
     "debug", "test", "staging", "dev", "backup", "config", "actuator",
@@ -116,7 +147,7 @@ MINIMAL_WORDLIST_FALLBACK = [
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  RESULT DATA MODEL
+#  DATA MODEL
 # ═════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -135,23 +166,27 @@ class FuzzFinding:
     reasons: list[str] = field(default_factory=list)
     host: str = ""
     path: str = ""
+    auth_enabled: bool = False
+    first_seen: str = ""
 
     def to_dict(self) -> dict:
         return {
-            "url": self.url,
-            "host": self.host,
-            "path": self.path,
-            "status": self.status,
-            "length": self.length,
-            "words": self.words,
-            "lines": self.lines,
-            "content_type": self.content_type,
-            "redirect": self.redirect,
-            "source_tool": self.source_tool,
+            "url":             self.url,
+            "host":            self.host,
+            "path":            self.path,
+            "status":          self.status,
+            "length":          self.length,
+            "words":           self.words,
+            "lines":           self.lines,
+            "content_type":    self.content_type,
+            "redirect":        self.redirect,
+            "source_tool":     self.source_tool,
             "source_wordlist": self.source_wordlist,
-            "extension": self.extension,
-            "confidence": self.confidence,
-            "reasons": self.reasons,
+            "extension":       self.extension,
+            "confidence":      self.confidence,
+            "reasons":         self.reasons,
+            "auth_enabled":    self.auth_enabled,
+            "first_seen":      self.first_seen,
         }
 
 
@@ -160,10 +195,6 @@ class FuzzFinding:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _resolve_wordlists() -> list[tuple[str, Path, Optional[list[str]]]]:
-    """
-    Return only wordlists that actually exist. If none exist, write a
-    minimal fallback wordlist to outdir and return that instead.
-    """
     available: list[tuple[str, Path, Optional[list[str]]]] = []
     missing: list[str] = []
 
@@ -179,7 +210,6 @@ def _resolve_wordlists() -> list[tuple[str, Path, Optional[list[str]]]]:
 
     if not available:
         log.warning("    No SecLists wordlist found — writing minimal fallback.")
-        # Try to locate a SecLists root
         sec_root = next((p for p in SECLISTS_FALLBACK_PATHS if p.exists()), None)
         if sec_root:
             log.info(f"    SecLists root detected at {sec_root}, but none of the")
@@ -207,11 +237,6 @@ def _resolve_wordlists() -> list[tuple[str, Path, Optional[list[str]]]]:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _extract_hosts(input_file: Path) -> list[str]:
-    """
-    Accept either live_urls.txt (bare URLs) or live_hosts.txt
-    (httpx format: 'URL [status] [title] [tech]').
-    Returns a deduplicated, sorted list of scheme://host bases.
-    """
     if not input_file.exists():
         raise FileNotFoundError(f"input file not found: {input_file}")
 
@@ -234,15 +259,20 @@ def _extract_hosts(input_file: Path) -> list[str]:
 
 
 def _soft_404_baseline(base_url: str) -> tuple[int, int]:
-    """
-    Probe a random non-existent path and return (length, status).
-    Used to suppress false positives from catch-all responses.
-    """
+    """Probe a random path with headers + cookies to get a baseline."""
     rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=SOFT_404_PROBE_LEN))
     probe = f"{base_url}/{rand}"
     try:
         import requests
-        r = requests.get(probe, timeout=10, verify=False, allow_redirects=False)
+        cookies = _auth_cookies()
+        r = requests.get(
+            probe,
+            headers=_target_headers() or None,
+            cookies=cookies or None,
+            timeout=10,
+            verify=False,
+            allow_redirects=False,
+        )
         return len(r.content), r.status_code
     except Exception:
         return 0, 0
@@ -257,6 +287,8 @@ def _ferox_cmd(
     wordlist: Path,
     extensions: Optional[list[str]],
     output_file: Path,
+    threads: int,
+    rate_limit: int,
 ) -> list[str]:
     cmd = [
         "feroxbuster",
@@ -268,23 +300,25 @@ def _ferox_cmd(
         "--no-state",
         "--redirects",
         "--depth", str(FEROX_DEPTH),
-        "--threads", str(FEROX_THREADS),
-        "--rate-limit", str(FEROX_RATE_LIMIT),
+        "--threads", str(threads),
         "--scan-limit", str(FEROX_SCAN_LIMIT),
         "--timeout", "10",
         "--status-codes", ",".join(str(c) for c in sorted(ALLOWED_STATUS)),
     ]
+    if rate_limit and rate_limit > 0:
+        cmd.extend(["--rate-limit", str(rate_limit)])
     if extensions:
         cmd.extend(["--extensions", ",".join(extensions)])
+    for hdr in _tool_header_args():
+        cmd.extend(["-H", hdr])
     return cmd
 
 
-def _run_ferox(base_url: str, wordlist_name: str, wordlist: Path,
-               extensions: Optional[list[str]], workdir: Path) -> list[FuzzFinding]:
-    """
-    Run feroxbuster against one base URL with one wordlist.
-    Feroxbuster JSON is line-delimited: one JSON object per line.
-    """
+def _run_ferox(
+    base_url: str, wordlist_name: str, wordlist: Path,
+    extensions: Optional[list[str]], workdir: Path,
+    threads: int, rate_limit: int,
+) -> list[FuzzFinding]:
     if not shutil.which("feroxbuster"):
         log.warning("    feroxbuster not found — skipping recursive phase")
         return []
@@ -293,16 +327,11 @@ def _run_ferox(base_url: str, wordlist_name: str, wordlist: Path,
     wl_tag = re.sub(r"[^a-zA-Z0-9]+", "_", wordlist_name)
     out_file = workdir / f"ferox_{tag}_{wl_tag}.json"
 
-    cmd = _ferox_cmd(base_url, wordlist, extensions, out_file)
+    cmd = _ferox_cmd(base_url, wordlist, extensions, out_file, threads, rate_limit)
     log.info(f"      ferox  {base_url}  wl={wordlist_name}")
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=FEROX_TIMEOUT,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=FEROX_TIMEOUT)
     except subprocess.TimeoutExpired:
         log.warning(f"      ferox timeout after {FEROX_TIMEOUT}s on {base_url}")
         return []
@@ -313,6 +342,7 @@ def _run_ferox(base_url: str, wordlist_name: str, wordlist: Path,
         log.debug(f"      ferox produced no output file (stderr: {result.stderr[:160]})")
         return []
 
+    auth_on = bool(_cfg("AUTH_ENABLED", False))
     findings: list[FuzzFinding] = []
     for line in out_file.read_text(errors="ignore").splitlines():
         line = line.strip()
@@ -336,6 +366,7 @@ def _run_ferox(base_url: str, wordlist_name: str, wordlist: Path,
             tool="feroxbuster",
             wordlist=wordlist_name,
             extension=obj.get("extension", "") or "",
+            auth_enabled=auth_on,
         )
         if f:
             findings.append(f)
@@ -353,6 +384,8 @@ def _ffuf_cmd(
     extensions: Optional[list[str]],
     output_file: Path,
     baseline_length: int,
+    threads: int,
+    rate_limit: int,
 ) -> list[str]:
     cmd = [
         "ffuf",
@@ -360,26 +393,29 @@ def _ffuf_cmd(
         "-w", str(wordlist),
         "-json",
         "-o", str(output_file),
-        "-s",                                # silent
-        "-t", str(FFUF_THREADS),
-        "-rate", str(FFUF_RATE_LIMIT),
+        "-s",
+        "-t", str(threads),
         "-timeout", "10",
         "-maxtime", str(FFUF_MAX_TIME),
         "-mc", ",".join(str(c) for c in sorted(ALLOWED_STATUS)),
         "-noninteractive",
     ]
+    if rate_limit and rate_limit > 0:
+        cmd.extend(["-rate", str(rate_limit)])
     if extensions:
         cmd.extend(["-e", ",".join(extensions)])
-    # Filter soft-404 responses by size if we have a reliable baseline
     if baseline_length > 0:
         cmd.extend(["-fs", f"{max(0, baseline_length - SOFT_404_TOLERANCE)}-{baseline_length + SOFT_404_TOLERANCE}"])
+    for hdr in _tool_header_args():
+        cmd.extend(["-H", hdr])
     return cmd
 
 
-def _run_ffuf(base_url: str, wordlist_name: str, wordlist: Path,
-              extensions: Optional[list[str]], baseline_length: int,
-              workdir: Path) -> list[FuzzFinding]:
-    """Run ffuf against one base URL with one wordlist."""
+def _run_ffuf(
+    base_url: str, wordlist_name: str, wordlist: Path,
+    extensions: Optional[list[str]], baseline_length: int,
+    workdir: Path, threads: int, rate_limit: int,
+) -> list[FuzzFinding]:
     if not shutil.which("ffuf"):
         log.warning("    ffuf not found — skipping surgical phase")
         return []
@@ -388,16 +424,11 @@ def _run_ffuf(base_url: str, wordlist_name: str, wordlist: Path,
     wl_tag = re.sub(r"[^a-zA-Z0-9]+", "_", wordlist_name)
     out_file = workdir / f"ffuf_{tag}_{wl_tag}.json"
 
-    cmd = _ffuf_cmd(base_url, wordlist, extensions, out_file, baseline_length)
+    cmd = _ffuf_cmd(base_url, wordlist, extensions, out_file, baseline_length, threads, rate_limit)
     log.info(f"      ffuf   {base_url}  wl={wordlist_name}")
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=FFUF_TIMEOUT,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFUF_TIMEOUT)
     except subprocess.TimeoutExpired:
         log.warning(f"      ffuf timeout after {FFUF_TIMEOUT}s on {base_url}")
         return []
@@ -414,6 +445,7 @@ def _run_ffuf(base_url: str, wordlist_name: str, wordlist: Path,
         log.warning(f"      ffuf JSON parse error: {e}")
         return []
 
+    auth_on = bool(_cfg("AUTH_ENABLED", False))
     findings: list[FuzzFinding] = []
     for entry in data.get("results", []):
         f = _build_finding(
@@ -427,6 +459,7 @@ def _run_ffuf(base_url: str, wordlist_name: str, wordlist: Path,
             tool="ffuf",
             wordlist=wordlist_name,
             extension=entry.get("input", {}).get("FUZZ", "") or "",
+            auth_enabled=auth_on,
         )
         if f:
             findings.append(f)
@@ -435,20 +468,13 @@ def _run_ffuf(base_url: str, wordlist_name: str, wordlist: Path,
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  FINDING CONSTRUCTION & SCORING
+#  FINDING CONSTRUCTION
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _build_finding(
-    url: str,
-    status: int,
-    length: int,
-    words: int,
-    lines: int,
-    content_type: str,
-    redirect: str,
-    tool: str,
-    wordlist: str,
-    extension: str,
+    url: str, status: int, length: int, words: int, lines: int,
+    content_type: str, redirect: str, tool: str, wordlist: str,
+    extension: str, auth_enabled: bool = False,
 ) -> Optional[FuzzFinding]:
     if not url:
         return None
@@ -460,7 +486,8 @@ def _build_finding(
         url=url, status=status, length=length, words=words, lines=lines,
         content_type=content_type, redirect=redirect,
         source_tool=tool, source_wordlist=wordlist, extension=extension,
-        host=host, path=path,
+        host=host, path=path, auth_enabled=auth_enabled,
+        first_seen=datetime.now(timezone.utc).isoformat(),
     )
     _score_finding(f)
     return f
@@ -478,34 +505,27 @@ def _score_finding(f: FuzzFinding) -> None:
     score = 0
     reasons: list[str] = []
 
-    # Access-gated: 401/403 means something real is behind this path.
     if f.status in (401, 403):
         score += 40
         reasons.append("access_gated")
 
-    # Backup / source / config file extensions.
     if any(f.path.lower().endswith(ext) for ext in BACKUP_EXTENSIONS):
         score += 35
         reasons.append("backup_extension")
 
-    # Sensitive path keyword.
-    path_lower = f.path.lower()
-    if any(k in path_lower for k in SENSITIVE_PATH_WORDS):
+    if any(k in f.path.lower() for k in SENSITIVE_PATH_WORDS):
         score += 25
         reasons.append("sensitive_path")
 
-    # API content type.
     ct = (f.content_type or "").lower()
     if "json" in ct or "xml" in ct:
         score += 20
         reasons.append("api_content_type")
 
-    # Server error — potential injection or misconfiguration surface.
     if 500 <= f.status < 600:
         score += 15
         reasons.append("server_error")
 
-    # Generic 200 with meaningful body — low-but-nonzero signal.
     if f.status == 200 and f.length > 200:
         score += 10
         reasons.append("substantial_body")
@@ -514,16 +534,7 @@ def _score_finding(f: FuzzFinding) -> None:
     f.reasons = reasons
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  DEDUPLICATION
-# ═════════════════════════════════════════════════════════════════════════════
-
 def _dedupe(findings: list[FuzzFinding]) -> list[FuzzFinding]:
-    """
-    Keep the highest-confidence record for each unique URL.
-    If two records tie on confidence, prefer the one with more metadata
-    (longer content_type, non-empty redirect).
-    """
     best: dict[str, FuzzFinding] = {}
     for f in findings:
         key = f.url.rstrip("/").lower()
@@ -534,11 +545,40 @@ def _dedupe(findings: list[FuzzFinding]) -> list[FuzzFinding]:
         if f.confidence > existing.confidence:
             best[key] = f
         elif f.confidence == existing.confidence:
-            if (len(f.content_type) + len(f.redirect)) > (
-                len(existing.content_type) + len(existing.redirect)
-            ):
+            if (len(f.content_type) + len(f.redirect)) > (len(existing.content_type) + len(existing.redirect)):
                 best[key] = f
     return list(best.values())
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SELF-SYNC
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _self_sync(scan_id: int, findings: list[FuzzFinding]) -> None:
+    if not findings:
+        return
+    if not DB_AVAILABLE or DB is None:
+        log.warning("  DB sync: db.py not available")
+        return
+    if not _cfg("SYNC_TO_DB", True):
+        log.info("  DB sync: SYNC_TO_DB is False")
+        return
+    if not _cfg("BRIDGE_ENABLED", False):
+        log.info("  DB sync: BRIDGE_ENABLED is False")
+        return
+    if not DB.available:
+        log.warning("  DB sync: bridge client not ready")
+        return
+
+    try:
+        payloads = [f.to_dict() for f in findings]
+        result = DB.upsert_content_fuzz(scan_id, payloads)
+        if result is None:
+            log.warning("  DB sync: bridge returned None")
+        else:
+            log.info(f"  DB sync: {result} endpoint(s) upserted (scan_id={scan_id})")
+    except Exception as e:
+        log.warning(f"  DB sync: exception — {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -553,11 +593,15 @@ def run_content_fuzz(
     use_ffuf: bool = True,
     wordlists: Optional[list[tuple[str, Path, Optional[list[str]]]]] = None,
     max_hosts: Optional[int] = None,
+    threads: Optional[int] = None,
+    rate_limit: Optional[int] = None,
+    scan_id: Optional[int] = None,
 ) -> Path:
     """
     Run content discovery against every host in `live_urls_file`.
 
-    Returns the path to `content_fuzz.json`.
+    Threads and rate_limit are read from MODULE_RATE_LIMITS["fuzz"] unless
+    overridden. If scan_id is provided, self-syncs to the remote database.
     """
     start = time.monotonic()
 
@@ -566,6 +610,11 @@ def run_content_fuzz(
             "Neither feroxbuster nor ffuf is installed. "
             "Run `python3 tools.py --only feroxbuster,ffuf` first."
         )
+
+    # ── Effective settings ─────────────────────────────────────────────────
+    settings = _fuzz_settings()
+    eff_threads = threads if threads is not None else settings["threads"]
+    eff_rate = rate_limit if rate_limit is not None else settings["rate_limit"]
 
     # ── Inputs ──────────────────────────────────────────────────────────────
     bases = _extract_hosts(live_urls_file)
@@ -584,11 +633,44 @@ def run_content_fuzz(
 
     log.info(f"  Input  : {len(bases)} host(s) from {live_urls_file.name}")
 
-    # ── Resolve wordlists ───────────────────────────────────────────────────
+    # ── Config display ──────────────────────────────────────────────────────
+    rate_label = f"{eff_rate}/s" if eff_rate and eff_rate > 0 else "unlimited"
+    log.info(f"  Config : threads={eff_threads}  rate_limit={rate_label}")
+    log.info(f"           source: MODULE_RATE_LIMITS['fuzz']")
+
+    if eff_rate and 0 < eff_rate < 20:
+        log.info("")
+        log.info(f"  {chr(9888)}  rate_limit={eff_rate}/s is EXTREMELY slow for fuzzing.")
+        log.info(f"     Fuzzing sends thousands of requests per host. At {eff_rate}/s,")
+        log.info(f"     a single 20,000-request scan takes ~{20000//eff_rate//60} minutes.")
+        log.info(f"     If your program allows 50-100/s, raise this significantly.")
+        log.info("")
+
+    # ── Headers ─────────────────────────────────────────────────────────────
+    hdrs = _target_headers()
+    auth_on = bool(_cfg("AUTH_ENABLED", False))
+
+    if hdrs:
+        log.info(f"  Headers: {len(hdrs)} configured, applied to all fuzz requests")
+        for k, v in list(hdrs.items())[:4]:
+            v_short = v[:50] + "…" if len(v) > 50 else v
+            log.info(f"           · {k}: {v_short}")
+        if len(hdrs) > 4:
+            log.info(f"           · ... and {len(hdrs) - 4} more")
+    else:
+        log.info(f"  Headers: none configured")
+
+    if auth_on:
+        log.info(f"  Auth   : ENABLED (request.txt) — fuzzing authenticated surface")
+    else:
+        log.info(f"  Auth   : disabled — fuzzing unauthenticated only")
+    log.info("")
+
+    # ── Wordlists ───────────────────────────────────────────────────────────
     if wordlists is None:
         wordlists = _resolve_wordlists()
 
-    # ── Phase 0: soft-404 baselines ─────────────────────────────────────────
+    # ── Soft-404 baselines ──────────────────────────────────────────────────
     log.info("")
     log.info("  Establishing soft-404 baselines...")
     baselines: dict[str, int] = {}
@@ -600,7 +682,7 @@ def run_content_fuzz(
         else:
             log.info(f"    {base:<40} baseline unavailable (filtering by status only)")
 
-    # ── Phase 1: feroxbuster (broad recursion) ─────────────────────────────
+    # ── Phase 1: feroxbuster ───────────────────────────────────────────────
     all_findings: list[FuzzFinding] = []
 
     if use_ferox and shutil.which("feroxbuster"):
@@ -608,7 +690,10 @@ def run_content_fuzz(
         log.info("  Phase 1 — feroxbuster (broad recursive mapping)")
         for base in bases:
             for wl_name, wl_path, wl_exts in wordlists:
-                findings = _run_ferox(base, wl_name, wl_path, wl_exts, workdir)
+                findings = _run_ferox(
+                    base, wl_name, wl_path, wl_exts, workdir,
+                    threads=eff_threads, rate_limit=eff_rate,
+                )
                 all_findings.extend(findings)
                 if findings:
                     log.info(f"        → {len(findings)} hit(s)")
@@ -616,16 +701,17 @@ def run_content_fuzz(
         log.info("")
         log.info("  Phase 1 — feroxbuster skipped")
 
-    # ── Phase 2: ffuf (surgical, extension-aware) ──────────────────────────
+    # ── Phase 2: ffuf ──────────────────────────────────────────────────────
     if use_ffuf and shutil.which("ffuf"):
         log.info("")
         log.info("  Phase 2 — ffuf (surgical fuzzing)")
         for base in bases:
             baseline = baselines.get(base, 0)
             for wl_name, wl_path, wl_exts in wordlists:
-                # Skip the largest, slowest lists on the second pass unless
-                # the target is small; the goal of phase 2 is precision.
-                findings = _run_ffuf(base, wl_name, wl_path, wl_exts, baseline, workdir)
+                findings = _run_ffuf(
+                    base, wl_name, wl_path, wl_exts, baseline, workdir,
+                    threads=eff_threads, rate_limit=eff_rate,
+                )
                 all_findings.extend(findings)
                 if findings:
                     log.info(f"        → {len(findings)} hit(s)")
@@ -639,18 +725,10 @@ def run_content_fuzz(
     deduped = _dedupe(all_findings)
     log.info(f"  Unique : {len(deduped)} endpoint(s) after deduplication")
 
-    # ── Sort: confidence desc, then status priority, then URL ──────────────
     STATUS_PRIORITY = {200: 1, 201: 1, 204: 1, 401: 2, 403: 2,
                        301: 3, 302: 3, 307: 3, 308: 3, 500: 4}
 
-    def _sort_key(f: FuzzFinding) -> tuple:
-        return (
-            -f.confidence,
-            STATUS_PRIORITY.get(f.status, 5),
-            f.url,
-        )
-
-    deduped.sort(key=_sort_key)
+    deduped.sort(key=lambda f: (-f.confidence, STATUS_PRIORITY.get(f.status, 5), f.url))
 
     # ── Write outputs ───────────────────────────────────────────────────────
     all_urls = sorted({f.url for f in deduped})
@@ -686,25 +764,27 @@ def run_content_fuzz(
         "elapsed_seconds": round(elapsed, 2),
         "input_file": str(live_urls_file),
         "hosts_scanned": len(bases),
+        "auth_enabled": auth_on,
         "config": {
-            "ferox_threads": FEROX_THREADS,
-            "ferox_rate_limit": FEROX_RATE_LIMIT,
-            "ferox_depth": FEROX_DEPTH,
-            "ffuf_threads": FFUF_THREADS,
-            "ffuf_rate_limit": FFUF_RATE_LIMIT,
-            "allowed_status": sorted(ALLOWED_STATUS),
-            "soft_404_tolerance": SOFT_404_TOLERANCE,
-            "wordlists": [name for name, _, _ in wordlists],
+            "threads":              eff_threads,
+            "rate_limit":           eff_rate,
+            "headers_count":        len(hdrs),
+            "ferox_depth":          FEROX_DEPTH,
+            "ferox_scan_limit":     FEROX_SCAN_LIMIT,
+            "ffuf_max_time":        FFUF_MAX_TIME,
+            "allowed_status":       sorted(ALLOWED_STATUS),
+            "soft_404_tolerance":   SOFT_404_TOLERANCE,
+            "wordlists":            [name for name, _, _ in wordlists],
         },
         "totals": {
-            "raw_findings": len(all_findings),
-            "unique_endpoints": len(deduped),
-            "high_confidence": len(interesting),
+            "raw_findings":      len(all_findings),
+            "unique_endpoints":  len(deduped),
+            "high_confidence":   len(interesting),
         },
         "summary": {
-            "by_status": by_status,
-            "by_tool": by_tool,
-            "by_extension": dict(sorted(by_extension.items(), key=lambda kv: -kv[1])),
+            "by_status":     by_status,
+            "by_tool":       by_tool,
+            "by_extension":  dict(sorted(by_extension.items(), key=lambda kv: -kv[1])),
             "by_confidence": by_confidence,
         },
         "findings": [f.to_dict() for f in deduped],
@@ -713,15 +793,23 @@ def run_content_fuzz(
     json_path = outdir / "content_fuzz.json"
     json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
-    # ── Cleanup workdir ─────────────────────────────────────────────────────
     try:
         shutil.rmtree(workdir, ignore_errors=True)
     except Exception:
         pass
 
+    # ── Self-sync ───────────────────────────────────────────────────────────
+    if scan_id is not None:
+        log.info("")
+        log.info(f"  Syncing to remote database (scan_id={scan_id})...")
+        _self_sync(scan_id, deduped)
+    else:
+        log.info("")
+        log.info("  DB sync  : deferred to main.py (no scan_id passed)")
+
     # ── Console summary ─────────────────────────────────────────────────────
     log.info("")
-    log.info("  Outputs :")
+    log.info(f"  Outputs :")
     log.info(f"    {json_path.name:<24} {len(deduped):>5} endpoint(s)")
     log.info(f"    {txt_all.name:<24} {len(all_urls):>5} URL(s)")
     log.info(f"    {txt_interesting.name:<24} {len(interesting):>5} high-confidence URL(s)")
@@ -748,6 +836,7 @@ def _empty_report(input_file: Path, start: float) -> dict:
         "elapsed_seconds": round(time.monotonic() - start, 2),
         "input_file": str(input_file),
         "hosts_scanned": 0,
+        "auth_enabled": False,
         "config": {},
         "totals": {"raw_findings": 0, "unique_endpoints": 0, "high_confidence": 0},
         "summary": {"by_status": {}, "by_tool": {}, "by_extension": {}, "by_confidence": {}},
@@ -760,6 +849,8 @@ def _empty_report(input_file: Path, start: float) -> dict:
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    import argparse
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
@@ -768,8 +859,26 @@ if __name__ == "__main__":
     base = Path(__file__).resolve().parent.parent
     live_urls = base / "output" / "live_urls.txt"
     out = base / "output"
+
+    parser = argparse.ArgumentParser(description="Argus content fuzz (standalone)")
+    parser.add_argument("--input", type=Path, default=live_urls)
+    parser.add_argument("--output", type=Path, default=out)
+    parser.add_argument("--scan-id", type=int, default=None)
+    parser.add_argument("--threads", type=int, default=None)
+    parser.add_argument("--rate-limit", type=int, default=None)
+    parser.add_argument("--no-ferox", action="store_true")
+    parser.add_argument("--no-ffuf", action="store_true")
+    args = parser.parse_args()
+
     try:
-        run_content_fuzz(live_urls, out)
+        run_content_fuzz(
+            args.input, args.output,
+            use_ferox=not args.no_ferox,
+            use_ffuf=not args.no_ffuf,
+            threads=args.threads,
+            rate_limit=args.rate_limit,
+            scan_id=args.scan_id,
+        )
     except Exception as e:
         log.error(f"failed: {e}")
         sys.exit(1)
