@@ -964,9 +964,13 @@ def _run_redirect(outdir: Path) -> None:
 def _run_race(outdir: Path) -> None:
     from auditing_tools.race_condition import run_race_audit
     source = _pick_existing(outdir, ["urls_with_params.txt", "all_urls.txt", "live_urls.txt"])
+    r = _module_rate("race")
     run_race_audit(
         source, outdir,
         headers=_platform_headers() or None,
+        rate_limit=r.get("rate_limit", 3),
+        concurrency=r.get("concurrency", 10),
+        scan_id=_CURRENT_SCAN_ID,
     )
 
 

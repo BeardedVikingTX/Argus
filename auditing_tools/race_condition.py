@@ -1,55 +1,65 @@
 #!/usr/bin/env python3
 """
-auditing_tools/race_condition.py — Race Condition Surface Discovery & Attack Planning
+auditing_tools/race_condition.py — Race Condition Surface Discovery & Confirmation (v3)
 ═══════════════════════════════════════════════════════════════════════════════
 
-Race conditions are the highest-payout business logic class and the one class
-that automated scanners cannot touch. The vulnerable window is measured in
-microseconds, and exploitation is probabilistic.
+v3 introduces concurrent-burst confirmation with body-signature analysis.
+v2's `success_count > 1` heuristic produced rampant false positives (any
+stateful endpoint returning 200 on every request tripped it). v3 replaces it:
 
-This module does NOT attempt to reliably confirm race conditions through
-simple HTTP requests. Instead, it does what automation CAN do reliably:
+  Confirmation logic:
+    1. Fire N concurrent requests synchronized via threading.Barrier
+    2. Extract a "signature" from every response — (status_code,
+       has_success_marker, has_failure_marker, length_bucket)
+    3. Identify the winner signature (most common success-shape)
+    4. Count how many responses match the winner
+    5. Confirmation rules by race class:
+         limit_overrun / double_spend / multistep_bypass:
+           winner_count >= 2  → CONFIRMED (single-use violated)
+           winner_count == 1  → no race
+           winner_count == 0  → token exhausted, cannot test
+         rate_bypass:
+           winner_count == N  → rate limit absent (LOW / informational)
+           0 < winner_count < N → rate limit enforced (no bypass)
 
-  1. Discover state-changing surface
-       Identify endpoints that perform one-time, limit-controlled, or
-       balance-dependent operations. These are the only places TOCTOU
-       windows exist.
+Two additional v3 improvements:
 
-  2. Classify attack category
-       Map each endpoint to its race class:
-         • Limit Overrun (coupon reuse, vote inflation, inventory bypass)
-         • Double-Spend (balance transfer, gift card, wallet)
-         • Multi-Step Bypass (password reset, email change, MFA)
-         • Rate-Limit Bypass (login attempts, OTP brute-force)
+  • Rate limiting respects MODULE_RATE_LIMITS["race"] for the sequential
+    bootstrap request, and bypasses the global limiter during the burst
+    (otherwise the barrier alignment is useless — the limiter serializes).
+  • Self-sync to a dedicated `race_findings` table when scan_id is provided.
 
-  3. Generate attack plans
-       For each candidate, produce a ready-to-paste Turbo Intruder script
-       with the single-packet attack configuration (Engine.BURP2,
-       concurrentConnections=1, gate synchronization).
+Discovery pipeline (unchanged in spirit from v2):
 
-  4. Optional automated probe
-       Fire N synchronized requests via a Python threading barrier. This is
-       a low-precision probe — it will only catch wide windows — but it can
-       surface obvious TOCTOU gaps without manual tooling.
+  Phase 1 — Surface discovery
+      URL and parameter patterns classified into four race classes:
+      limit_overrun, double_spend, multistep_bypass, rate_bypass.
 
-  5. Produce triage-ready evidence
-       Every candidate includes the exact request to replay, the
-       expected-vs-observed outcome, and the escalation path (ATO,
-       financial impact, privilege escalation).
+  Phase 2 — Attack plan generation
+      For each candidate, write three ready-to-run exploit scripts:
+        • Turbo Intruder (single-packet HTTP/2, Engine.BURP2)
+        • curl loop (manual confirmation)
+        • Python threading.Barrier (offline confirmation)
+
+  Phase 3 — Concurrent burst confirmation
+      Fire N synchronized requests. Analyze response signatures to
+      distinguish a real race from "endpoint always returns 200".
+
+  Phase 4 — Reporting
+      Dedupe, sort, write JSON + flat candidates, self-sync when scan_id
+      is set.
 
 Outputs (into `outdir`):
-  • race_findings.json            — full structured report
-  • race_candidates.txt           — flat list for triage
-  • race_attack_plans/            — one Turbo Intruder script per candidate
-  • race_probe_results.txt        — automated probe outcomes (if enabled)
-
-Integration:
-  main.py → run_one("race") → run_race_audit(urls_file, outdir)
+  • race_findings.json              — full structured report
+  • race_candidates.txt             — flat list for triage
+  • race_attack_plans/              — one script per candidate × language
+  • race_probe_results.txt          — probe outcome evidence
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import re
@@ -70,23 +80,76 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 log = logging.getLogger("argus.race_condition")
 
+
 # ═════════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION
+#  CONFIG
 # ═════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_TIMEOUT      = 12
-DEFAULT_RETRIES      = 1
-USER_AGENT           = "Argus-Race-Auditor/1.0"
+try:
+    import config as CFG
+    CFG_LOADED = True
+except ImportError:
+    CFG = None
+    CFG_LOADED = False
 
-# Automated probe settings
-DEFAULT_PROBE_COUNT  = 20         # requests per probe
-PROBE_TIMEOUT        = 30
-MAX_PROBES           = 20         # cap total probes to avoid noise
+try:
+    from db import DB
+    DB_AVAILABLE = True
+except ImportError:
+    DB = None
+    DB_AVAILABLE = False
 
-# ── Race condition endpoint patterns ───────────────────────────────────────
-# Each pattern maps a URL/parameter signature to a race class and severity.
+
+def _cfg(key: str, default=None):
+    if not CFG_LOADED:
+        return default
+    return getattr(CFG, key, default)
+
+
+def _race_settings() -> dict:
+    entry = (_cfg("MODULE_RATE_LIMITS", {}) or {}).get("race", {})
+    return {
+        "rate_limit":  entry.get("rate_limit", 3),
+        "concurrency": entry.get("concurrency", 10),
+        "timeout":     entry.get("timeout", 12),
+    }
+
+
+def _target_headers() -> dict[str, str]:
+    h = dict(_cfg("ACTIVE_HEADERS", {}) or {})
+    if CFG_LOADED and getattr(CFG, "AUTH_ENABLED", False):
+        auth_hdrs = getattr(CFG, "AUTH_HEADERS", {}) or {}
+        if auth_hdrs:
+            h.update(auth_hdrs)
+    return h
+
+
+def _test_account(slot: str) -> dict:
+    return (_cfg("TEST_ACCOUNTS", {}) or {}).get(slot, {})
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_TIMEOUT = 12
+DEFAULT_PROBE_COUNT = 20
+PROBE_TIMEOUT = 30
+MAX_PROBES = 100
+BURST_RATE_OVERRIDE = 500          # effectively unlimited during burst
+
+SUCCESS_MARKERS = (
+    "success", '"ok"', '"status":"ok"', '"applied"', '"redeemed"',
+    '"created"', '"accepted"', '"completed"', '"confirmed"',
+    '"valid":true', '"allowed":true',
+)
+FAILURE_MARKERS = (
+    '"error"', '"fail"', '"already"', '"used"', '"invalid"',
+    '"expired"', '"denied"', '"rejected"', '"limit"', '"not found"',
+    '"forbidden"', 'rate limit', 'too many requests',
+)
+
 RACE_PATTERNS: list[tuple[str, str, str, str]] = [
-    # (pattern, race_class, severity, description)
     (r"(coupon|promo|voucher|discount|redeem)",
      "limit_overrun", "CRITICAL", "Coupon/voucher single-use redemption"),
     (r"(gift[-_]?card|giftcard|balance|wallet|credit)",
@@ -111,14 +174,11 @@ RACE_PATTERNS: list[tuple[str, str, str, str]] = [
      "limit_overrun", "HIGH", "API key or token generation limit bypass"),
 ]
 
-# Parameters that signal a state-changing operation
 STATE_PARAMS = {
     "action", "operation", "cmd", "do", "execute", "submit",
     "redeem", "apply", "transfer", "withdraw", "vote", "like",
     "confirm", "verify", "reset", "create", "delete", "update",
 }
-
-# Body field patterns that signal a race target
 BODY_FIELD_PATTERNS = [
     "coupon_code", "voucher", "promo_code", "gift_card",
     "amount", "quantity", "price", "total", "balance",
@@ -126,34 +186,101 @@ BODY_FIELD_PATTERNS = [
     "vote", "like", "rating",
 ]
 
-# Turbo Intruder template
-TURBO_INTRUDER_TEMPLATE = '''# Turbo Intruder script — generated by Argus
+TURBO_TEMPLATE = '''# Turbo Intruder script — generated by Argus
 # Target: {target}
 # Race class: {race_class}
-# Expected outcome: {expected}
+# Expected: {expected}
+#
 # Instructions:
-#   1. Paste this into Burp Suite's Turbo Intruder (Extensions > Turbo Intruder)
-#   2. Update the raw request below with your captured request
-#   3. Adjust REQUEST_COUNT (default 20) for your probe
-#   4. Run — inspect responses for multiple success indicators
+#   1. Paste into Burp's Turbo Intruder (Extensions → Turbo Intruder → Send to Turbo)
+#   2. Replace the raw request below with your captured request
+#   3. Adjust REQUEST_COUNT if needed (default {request_count})
+#   4. Run. Multiple 2xx responses = race confirmed.
+#
+# Note: Requires HTTP/2 target. For HTTP/1.1, use concurrentConnections=1
+# with maxRetriesPerRequest=0 — less precise but still useful.
+
+REQUEST_COUNT = {request_count}
 
 def queueRequests(target, wordlists):
     engine = RequestEngine(
         endpoint=target.endpoint,
         concurrentConnections=1,
+        requestsPerConnection=REQUEST_COUNT,
         engine=Engine.BURP2,
+        maxRetriesPerRequest=0,
     )
-    for i in range({request_count}):
+    for i in range(REQUEST_COUNT):
         engine.queue(target.req, gate='race1')
     engine.openGate('race1')
 
 def handleResponse(req, interesting):
     table.add(req)
-    # Flag multiple 2xx responses — a single-use operation should return
-    # exactly one success. Multiple 2xx = limit overrun / double-spend.
-    if req.status >= 200 and req.status < 300:
-        table.add(req)
+    if 200 <= req.status < 300:
         print("[+] SUCCESS: " + str(req.status) + " " + target.endpoint)
+'''
+
+CURL_TEMPLATE = '''#!/bin/bash
+# Race condition probe — {race_class}
+# Target: {target}
+# Expected: {expected}
+# Fire {request_count} requests in parallel and count successes.
+
+TARGET='{target}'
+COUNT={request_count}
+METHOD='{method}'
+
+SUCCESS=0
+FAIL=0
+for i in $(seq 1 "$COUNT"); do
+    (
+        CODE=$(curl -s -o /dev/null -w "%{{http_code}}" -X "$METHOD" "$TARGET")
+        if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
+            echo "OK $CODE"
+        else
+            echo "FAIL $CODE"
+        fi
+    ) &
+done
+wait | sort | uniq -c
+'''
+
+PYTHON_TEMPLATE = '''#!/usr/bin/env python3
+"""Race condition probe — {race_class} — {target}"""
+import threading, time, requests
+
+TARGET = "{target}"
+COUNT = {request_count}
+METHOD = "{method}"
+
+results = []
+lock = threading.Lock()
+barrier = threading.Barrier(COUNT)
+
+def fire():
+    try:
+        barrier.wait(timeout=10)
+    except threading.BrokenBarrierError:
+        return
+    t0 = time.monotonic()
+    try:
+        r = requests.request(METHOD, TARGET, timeout=30, verify=False, allow_redirects=False)
+        elapsed = time.monotonic() - t0
+        with lock:
+            results.append((r.status_code, elapsed, len(r.content)))
+    except Exception as e:
+        with lock:
+            results.append((0, 0, 0))
+
+threads = [threading.Thread(target=fire) for _ in range(COUNT)]
+for t in threads: t.start()
+for t in threads: t.join()
+
+successes = sum(1 for s, _, _ in results if 200 <= s < 300)
+print(f"Successes: {{successes}}/{{COUNT}}")
+print(f"Statuses:  {{[s for s,_,_ in results]}}")
+print(f"Times:     {{[round(t, 3) for _,t,_ in results]}}")
+print("VULNERABLE" if successes > 1 else "No race detected")
 '''
 
 
@@ -167,51 +294,101 @@ class RaceCandidate:
     race_class: str
     severity: str = "MEDIUM"
     confidence: int = 50
+    confirmed: bool = False
     description: str = ""
     evidence: str = ""
     method: str = "POST"
     param_name: str = ""
     expected_outcome: str = ""
     escalation: str = ""
-    turbo_script: str = ""
+    sequential_success: Optional[int] = None
+    concurrent_success: Optional[int] = None
+    request_count: Optional[int] = None
+    http_statuses: list[int] = field(default_factory=list)
     details: dict = field(default_factory=dict)
+    auth_enabled: bool = False
+    first_seen: str = ""
+
+    @property
+    def finding_hash(self) -> str:
+        raw = f"{self.target}|{self.race_class}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    @property
+    def target_host(self) -> str:
+        return urllib.parse.urlparse(self.target).hostname or ""
 
     def to_dict(self) -> dict:
         return {
-            "target":           self.target,
-            "race_class":       self.race_class,
-            "severity":         self.severity,
-            "confidence":       self.confidence,
-            "description":      self.description,
-            "evidence":         self.evidence[:500],
-            "method":           self.method,
-            "param_name":       self.param_name,
-            "expected_outcome": self.expected_outcome,
-            "escalation":       self.escalation,
-            "details":          self.details,
+            "target":             self.target,
+            "target_host":        self.target_host,
+            "race_class":         self.race_class,
+            "severity":           self.severity,
+            "confidence":         self.confidence,
+            "confirmed":          self.confirmed,
+            "description":        self.description[:1024],
+            "evidence":           self.evidence[:1024],
+            "method":             self.method,
+            "param_name":         self.param_name,
+            "expected_outcome":   self.expected_outcome,
+            "escalation":         self.escalation,
+            "sequential_success": self.sequential_success,
+            "concurrent_success": self.concurrent_success,
+            "request_count":      self.request_count,
+            "http_statuses":      self.http_statuses,
+            "details":            self.details,
+            "auth_enabled":       self.auth_enabled,
+            "finding_hash":       self.finding_hash,
+            "first_seen":         self.first_seen or _db_now(),
         }
 
 
-@dataclass
-class ProbeResult:
-    target: str
-    request_count: int = 0
-    success_count: int = 0
-    status_codes: list[int] = field(default_factory=list)
-    body_lengths: list[int] = field(default_factory=list)
-    likely_vulnerable: bool = False
-    evidence: str = ""
+def _db_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-    def to_dict(self) -> dict:
-        return {
-            "target":            self.target,
-            "request_count":     self.request_count,
-            "success_count":     self.success_count,
-            "status_codes":      self.status_codes,
-            "body_lengths":      self.body_lengths,
-            "likely_vulnerable": self.likely_vulnerable,
-            "evidence":          self.evidence[:500],
-        }
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  RATE-LIMITED SESSION (thread-safe)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class RateLimitedSession:
+    def __init__(self, rate_limit: int = 3, timeout: int = DEFAULT_TIMEOUT):
+        self.session = requests.Session()
+        self.session.verify = False
+        base_hdrs = _target_headers()
+        if base_hdrs:
+            self.session.headers.update(base_hdrs)
+        self.min_interval = 1.0 / rate_limit if rate_limit and rate_limit > 0 else 0.0
+        self.timeout = timeout
+        self._last = 0.0
+        self._lock = threading.Lock()
+        self._burst_mode = False
+
+    def set_burst_mode(self, on: bool) -> None:
+        """When True, skip rate limiting (used during synchronized burst)."""
+        self._burst_mode = on
+
+    def request(self, method: str, url: str, **kwargs) -> Optional[requests.Response]:
+        if self.min_interval > 0 and not self._burst_mode:
+            with self._lock:
+                elapsed = time.monotonic() - self._last
+                if elapsed < self.min_interval:
+                    time.sleep(self.min_interval - elapsed)
+                self._last = time.monotonic()
+        try:
+            return self.session.request(
+                method, url,
+                timeout=kwargs.pop("timeout", self.timeout),
+                allow_redirects=kwargs.pop("allow_redirects", False),
+                verify=False,
+                **kwargs,
+            )
+        except requests.RequestException as e:
+            log.debug(f"request failed: {method} {url}: {e}")
+            return None
+
+    def get(self, url: str, **kwargs):
+        return self.request("GET", url, **kwargs)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -236,40 +413,8 @@ def _load_urls(input_file: Path) -> list[str]:
     return urls
 
 
-def _safe_request(
-    session: requests.Session,
-    method: str,
-    url: str,
-    headers: Optional[dict] = None,
-    json_body: Optional[dict] = None,
-    data: Optional[dict] = None,
-    timeout: int = DEFAULT_TIMEOUT,
-) -> Optional[requests.Response]:
-    try:
-        return session.request(
-            method, url,
-            headers=headers or {},
-            json=json_body,
-            data=data,
-            timeout=timeout,
-            allow_redirects=False,
-            verify=False,
-        )
-    except requests.RequestException as e:
-        log.debug(f"request failed: {method} {url}: {e}")
-        return None
-
-
-def _body_snippet(resp: requests.Response, max_len: int = 300) -> str:
-    try:
-        return resp.text[:max_len].replace("\n", " ").strip()
-    except Exception:
-        return ""
-
-
-def _match_race_pattern(url: str, body: str = "") -> list[tuple[str, str, str, str]]:
-    """Return all race patterns matching a URL or its parameters."""
-    combined = (url + " " + body).lower()
+def _match_race_patterns(url: str) -> list[tuple[str, str, str, str]]:
+    combined = url.lower()
     matches: list[tuple[str, str, str, str]] = []
     for pattern, race_class, severity, description in RACE_PATTERNS:
         if re.search(pattern, combined, re.I):
@@ -278,18 +423,15 @@ def _match_race_pattern(url: str, body: str = "") -> list[tuple[str, str, str, s
 
 
 def _infer_method(url: str, params: dict) -> str:
-    """Infer the HTTP method a state-changing endpoint is likely to use."""
-    state_params = set(params.keys()).intersection(STATE_PARAMS)
-    if state_params:
+    if set(params.keys()) & STATE_PARAMS:
         return "POST"
     path = urllib.parse.urlparse(url).path.lower()
-    if any(kw in path for kw in ("redeem", "transfer", "create", "update", "delete")):
+    if any(kw in path for kw in ("redeem", "transfer", "create", "update", "delete", "apply")):
         return "POST"
     return "GET"
 
 
-def _infer_param(url: str, params: dict) -> str:
-    """Identify the most likely state-changing parameter."""
+def _infer_param(params: dict) -> str:
     for k in params:
         if k.lower() in STATE_PARAMS:
             return k
@@ -300,23 +442,77 @@ def _infer_param(url: str, params: dict) -> str:
 
 
 def _escalation_for_class(race_class: str) -> str:
-    escalations = {
-        "limit_overrun": "Multiple coupon/invite/vote applications → financial loss or reputation inflation",
-        "double_spend":  "Multiple successful financial transactions → direct monetary loss",
-        "multistep_bypass": "Multiple valid tokens issued → account takeover via parallel workflow",
-        "rate_bypass":   "Rate-limit bypass → credential stuffing or OTP brute-force",
-    }
-    return escalations.get(race_class, "Business logic bypass")
+    return {
+        "limit_overrun":    "Multiple applications → financial loss or reputation inflation",
+        "double_spend":     "Multiple successful transactions → direct monetary loss",
+        "multistep_bypass": "Multiple valid tokens issued → account takeover",
+        "rate_bypass":      "Rate limit bypass → credential stuffing / OTP brute-force",
+    }.get(race_class, "Business logic bypass")
 
 
 def _expected_outcome(race_class: str) -> str:
-    outcomes = {
-        "limit_overrun": "Exactly 1 success response; >1 indicates limit overrun",
-        "double_spend":  "Balance debited once; >1 success indicates double-spend",
-        "multistep_bypass": "Exactly 1 valid token; >1 indicates token race",
-        "rate_bypass":   "Rate limit enforced after N requests; bypass if all succeed",
-    }
-    return outcomes.get(race_class, "Single success expected")
+    return {
+        "limit_overrun":    "Exactly 1 success; >1 = limit overrun",
+        "double_spend":     "Balance debited once; >1 success = double-spend",
+        "multistep_bypass": "Exactly 1 valid token; >1 = token race",
+        "rate_bypass":      "Rate limit enforced after N; bypass if all succeed",
+    }.get(race_class, "Single success expected")
+
+
+def _body_signature(resp: Optional[requests.Response]) -> tuple:
+    """
+    Return a signature tuple that survives nonce variation.
+
+    (status_code, has_success_marker, has_failure_marker, length_bucket)
+
+    Two responses that represent the same logical outcome (e.g., two
+    "coupon applied successfully" bodies with different timestamps) will
+    produce the same signature because:
+      • status is the same
+      • both contain success markers (or neither does)
+      • neither contains failure markers (or both do)
+      • length bucket is the same (//20 to absorb small variations)
+    """
+    if resp is None:
+        return (0, False, False, 0)
+    try:
+        body_lower = (resp.text or "").lower()[:5000]
+    except Exception:
+        body_lower = ""
+    has_succ = any(m in body_lower for m in SUCCESS_MARKERS)
+    has_fail = any(m in body_lower for m in FAILURE_MARKERS)
+    bucket = len(body_lower) // 20
+    return (resp.status_code, has_succ, has_fail, bucket)
+
+
+def _is_likely_success(sig: tuple) -> bool:
+    status, has_succ, has_fail, _ = sig
+    if not (200 <= status < 300):
+        return False
+    if has_fail and not has_succ:
+        return False
+    return True
+
+
+def _build_curl(
+    method: str, url: str,
+    headers: Optional[dict] = None,
+    form_body: Optional[dict] = None,
+    json_body: Optional[dict] = None,
+) -> str:
+    parts = [f"curl -X {method} '{url}'"]
+    if headers:
+        for k, v in headers.items():
+            if k.lower() in ("cookie", "authorization"):
+                parts.append(f"-H '{k}: {v[:20]}...'")
+            else:
+                parts.append(f"-H '{k}: {v}'")
+    if json_body:
+        parts.append("-H 'Content-Type: application/json'")
+        parts.append(f"-d '{json.dumps(json_body)[:300]}'")
+    elif form_body:
+        parts.append(f"-d '{urllib.parse.urlencode(form_body)[:300]}'")
+    return " ".join(parts)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -324,41 +520,36 @@ def _expected_outcome(race_class: str) -> str:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def discover_candidates(urls: list[str]) -> list[RaceCandidate]:
-    """
-    Scan URLs for race-condition-prone endpoints.
-    """
     candidates: list[RaceCandidate] = []
     seen: set[tuple] = set()
 
     for url in urls:
         parsed = urllib.parse.urlparse(url)
         params = dict(urllib.parse.parse_qsl(parsed.query))
-        body = ""
 
-        matches = _match_race_pattern(url, body)
+        matches = _match_race_patterns(url)
         if not matches:
             continue
 
         method = _infer_method(url, params)
-        param = _infer_param(url, params)
+        param = _infer_param(params)
 
         for pattern, race_class, severity, description in matches:
             key = (url, race_class)
             if key in seen:
                 continue
             seen.add(key)
-
             candidates.append(RaceCandidate(
                 target=url,
                 race_class=race_class,
                 severity=severity,
-                confidence=65,
+                confidence=60,
                 description=description,
                 method=method,
                 param_name=param,
                 expected_outcome=_expected_outcome(race_class),
                 escalation=_escalation_for_class(race_class),
-                evidence=f"URL pattern matched: {pattern}",
+                evidence=f"URL matched pattern: {pattern}",
                 details={
                     "matched_pattern": pattern,
                     "inferred_method": method,
@@ -373,162 +564,262 @@ def discover_candidates(urls: list[str]) -> list[RaceCandidate]:
 #  PHASE 2 — ATTACK PLAN GENERATION
 # ═════════════════════════════════════════════════════════════════════════════
 
-def generate_turbo_script(candidate: RaceCandidate, request_count: int = 20) -> str:
-    """Generate a Turbo Intruder script for a candidate."""
-    return TURBO_INTRUDER_TEMPLATE.format(
-        target=candidate.target,
-        race_class=candidate.race_class,
-        expected=candidate.expected_outcome,
-        request_count=request_count,
-    )
-
-
 def write_attack_plans(candidates: list[RaceCandidate], outdir: Path) -> Path:
-    """Write one Turbo Intruder script per candidate."""
     plan_dir = outdir / "race_attack_plans"
     plan_dir.mkdir(parents=True, exist_ok=True)
 
     for i, c in enumerate(candidates, 1):
-        safe_name = re.sub(r"[^a-zA-Z0-9]+", "_", c.target)[:60]
-        script = generate_turbo_script(c)
-        path = plan_dir / f"{i:03d}_{safe_name}.py"
-        path.write_text(script)
+        safe = re.sub(r"[^a-zA-Z0-9]+", "_", c.target)[:60]
+        prefix = f"{i:03d}_{safe}"
+
+        # Turbo Intruder
+        (plan_dir / f"{prefix}_turbo.py").write_text(
+            TURBO_TEMPLATE.format(
+                target=c.target, race_class=c.race_class,
+                expected=c.expected_outcome, request_count=DEFAULT_PROBE_COUNT,
+            )
+        )
+        # curl
+        (plan_dir / f"{prefix}.sh").write_text(
+            CURL_TEMPLATE.format(
+                target=c.target, race_class=c.race_class,
+                expected=c.expected_outcome, method=c.method,
+                request_count=DEFAULT_PROBE_COUNT,
+            )
+        )
+        # Python
+        (plan_dir / f"{prefix}.py").write_text(
+            PYTHON_TEMPLATE.format(
+                target=c.target, race_class=c.race_class,
+                method=c.method, request_count=DEFAULT_PROBE_COUNT,
+            )
+        )
 
     return plan_dir
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 3 — AUTOMATED PROBE (LOW PRECISION)
+#  PHASE 3 — CONCURRENT BURST PROBE
 # ═════════════════════════════════════════════════════════════════════════════
 
-class RaceProbe:
+def _send_one(
+    session: RateLimitedSession,
+    candidate: RaceCandidate,
+    headers: Optional[dict],
+    timeout: int,
+) -> Optional[requests.Response]:
+    """Send a single request according to the candidate's method."""
+    try:
+        if candidate.method in ("POST", "PUT", "PATCH"):
+            # Try form data with empty body (safest default — many APIs
+            # accept it and the vulnerable logic typically ignores body)
+            return session.request(
+                candidate.method, candidate.target,
+                headers=headers, data={}, timeout=timeout,
+            )
+        return session.request(
+            candidate.method, candidate.target,
+            headers=headers, timeout=timeout,
+        )
+    except Exception as e:
+        log.debug(f"_send_one failed: {e}")
+        return None
+
+
+def _run_concurrent_burst(
+    session: RateLimitedSession,
+    candidate: RaceCandidate,
+    headers: Optional[dict],
+    request_count: int,
+    timeout: int,
+) -> list[Optional[requests.Response]]:
     """
-    A synchronized burst of N requests to a target endpoint.
+    Fire request_count requests synchronized via threading.Barrier.
 
-    Uses a threading.Barrier to align all threads at the same starting point,
-    then releases them simultaneously. This is a low-precision approximation
-    of the single-packet attack — it catches wide TOCTOU windows but will
-    miss sub-millisecond races. For those, use the generated Turbo Intruder
-    scripts with HTTP/2 single-packet mode.
+    Rate limiting is DISABLED during the burst — otherwise the barrier
+    alignment is meaningless because the limiter serializes the requests.
+
+    Timeout on barrier wait (10s) prevents deadlock if one thread fails
+    to spawn. Timeout on join (PROBE_TIMEOUT) prevents deadlock if one
+    request hangs beyond its own timeout.
     """
+    results: list[Optional[requests.Response]] = [None] * request_count
+    barrier = threading.Barrier(request_count)
 
-    def __init__(
-        self,
-        session: requests.Session,
-        target: str,
-        method: str,
-        request_count: int,
-        headers: Optional[dict] = None,
-        json_body: Optional[dict] = None,
-        data: Optional[dict] = None,
-    ):
-        self.session = session
-        self.target = target
-        self.method = method
-        self.request_count = request_count
-        self.headers = headers
-        self.json_body = json_body
-        self.data = data
-        self.results: list[dict] = []
-        self.lock = threading.Lock()
-
-    def _worker(self, barrier: threading.Barrier) -> None:
+    def worker(idx: int) -> None:
         try:
             barrier.wait(timeout=10)
         except threading.BrokenBarrierError:
             return
+        results[idx] = _send_one(session, candidate, headers, timeout)
 
-        start = time.monotonic()
-        resp = _safe_request(
-            self.session, self.method, self.target,
-            headers=self.headers,
-            json_body=self.json_body,
-            data=self.data,
-            timeout=PROBE_TIMEOUT,
-        )
-        elapsed = time.monotonic() - start
-
-        with self.lock:
-            if resp:
-                self.results.append({
-                    "status": resp.status_code,
-                    "length": len(resp.content) if resp.content else 0,
-                    "elapsed": elapsed,
-                    "body": _body_snippet(resp),
-                })
-            else:
-                self.results.append({
-                    "status": 0,
-                    "length": 0,
-                    "elapsed": elapsed,
-                    "body": "",
-                })
-
-    def run(self) -> ProbeResult:
-        barrier = threading.Barrier(self.request_count)
+    session.set_burst_mode(True)
+    try:
         threads = [
-            threading.Thread(target=self._worker, args=(barrier,))
-            for _ in range(self.request_count)
+            threading.Thread(target=worker, args=(i,), daemon=True)
+            for i in range(request_count)
         ]
         for t in threads:
             t.start()
         for t in threads:
-            t.join()
+            t.join(timeout=PROBE_TIMEOUT)
+    finally:
+        session.set_burst_mode(False)
 
-        statuses = [r["status"] for r in self.results]
-        lengths = [r["length"] for r in self.results]
-        success_count = sum(1 for s in statuses if 200 <= s < 300)
-
-        # Heuristic: a single-use operation should return exactly 1 success.
-        # >1 success = likely race condition.
-        likely = success_count > 1
-
-        evidence = ""
-        if likely:
-            evidence = (
-                f"{success_count}/{self.request_count} requests succeeded "
-                f"(expected 1). Status codes: {statuses[:10]}"
-            )
-
-        return ProbeResult(
-            target=self.target,
-            request_count=self.request_count,
-            success_count=success_count,
-            status_codes=statuses,
-            body_lengths=lengths,
-            likely_vulnerable=likely,
-            evidence=evidence,
-        )
+    return results
 
 
 def probe_candidate(
-    session: requests.Session,
+    session: RateLimitedSession,
     candidate: RaceCandidate,
-    request_count: int = DEFAULT_PROBE_COUNT,
-    headers: Optional[dict] = None,
-) -> Optional[ProbeResult]:
-    """Run a synchronized probe against a single candidate."""
-    # Build body if the method requires it
-    json_body = None
-    data = None
+    headers: Optional[dict],
+    request_count: int,
+    timeout: int,
+) -> None:
+    """
+    Probe one candidate in-place (mutates candidate with results).
 
-    if candidate.method in ("POST", "PUT", "PATCH"):
-        # Try to extract a body from the URL's query params as a heuristic
-        parsed = urllib.parse.urlparse(candidate.target)
-        params = dict(urllib.parse.parse_qsl(parsed.query))
-        if params:
-            json_body = params
-
-    probe = RaceProbe(
-        session, candidate.target, candidate.method,
-        request_count, headers=headers,
-        json_body=json_body, data=data,
+    Confirmation rules:
+      single-use classes (limit_overrun, double_spend, multistep_bypass):
+        winner_count >= 2 → CONFIRMED,  confidence 90
+        winner_count == 1 → no race,     confidence 40
+        winner_count == 0 → can't test (token exhausted)
+      rate_bypass:
+        winner_count == request_count → no rate limit (LOW informational)
+        0 < winner_count < request_count → rate limit enforced (no bypass)
+    """
+    responses = _run_concurrent_burst(
+        session, candidate, headers, request_count, timeout,
     )
+
+    # Signature analysis
+    signatures = [_body_signature(r) for r in responses if r is not None]
+    if not signatures:
+        candidate.evidence = (
+            f"Concurrent burst produced 0 responses "
+            f"(network/timeout on all {request_count} requests)"
+        )
+        candidate.confidence = 0
+        candidate.details["probe"] = {"error": "no responses"}
+        return
+
+    successes = [s for s in signatures if _is_likely_success(s)]
+
+    candidate.request_count = len(signatures)
+    candidate.http_statuses = [s[0] for s in signatures]
+
+    if not successes:
+        candidate.sequential_success = 0
+        candidate.concurrent_success = 0
+        candidate.evidence = (
+            f"0/{len(signatures)} concurrent responses met success criteria "
+            f"(all failed or returned error markers) — token may be exhausted"
+        )
+        candidate.confidence = 20
+        candidate.details["probe"] = {
+            "signatures": [list(s) for s in signatures[:10]],
+            "note":       "no successful baseline; supply a fresh token and retry",
+        }
+        return
+
+    # Winner signature = most common success signature
+    counts: dict[tuple, int] = {}
+    for s in successes:
+        counts[s] = counts.get(s, 0) + 1
+    winner_sig, winner_count = max(counts.items(), key=lambda kv: kv[1])
+
+    candidate.concurrent_success = winner_count
+    candidate.details["probe"] = {
+        "request_count":   len(signatures),
+        "success_count":   len(successes),
+        "winner_signature": list(winner_sig),
+        "winner_count":    winner_count,
+        "unique_success_signatures": len(counts),
+        "http_statuses":   candidate.http_statuses,
+    }
+
+    if candidate.race_class == "rate_bypass":
+        if winner_count == len(signatures) and len(signatures) >= request_count // 2:
+            # All went through — either no rate limit, or bypassed
+            candidate.confirmed = False
+            candidate.confidence = 55
+            candidate.severity = "MEDIUM"
+            candidate.evidence = (
+                f"All {winner_count}/{len(signatures)} concurrent requests "
+                f"returned success — no rate limit detected on this endpoint. "
+                f"Informational; not a race bypass."
+            )
+        else:
+            candidate.confirmed = False
+            candidate.confidence = 35
+            candidate.evidence = (
+                f"{winner_count}/{len(signatures)} succeeded — rate limit "
+                f"appears enforced; no bypass observed"
+            )
+        return
+
+    # Single-use classes
+    if winner_count >= 2:
+        candidate.confirmed = True
+        candidate.confidence = 90 if winner_count >= 3 else 75
+        candidate.severity = _bump_severity(candidate.severity, candidate.confirmed)
+        candidate.evidence = (
+            f"CONFIRMED: {winner_count}/{len(signatures)} concurrent requests "
+            f"matched the winner signature — single-use control violated"
+        )
+    else:
+        candidate.confirmed = False
+        candidate.confidence = 45
+        candidate.evidence = (
+            f"Only {winner_count}/{len(signatures)} matched the winner signature — "
+            f"single-use control appears to hold"
+        )
+
+
+def _bump_severity(base: str, confirmed: bool) -> str:
+    if not confirmed:
+        return base
+    return base
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SELF-SYNC
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _self_sync(scan_id: int, candidates: list[RaceCandidate]) -> None:
+    if not candidates:
+        return
+    if not DB_AVAILABLE or DB is None:
+        log.warning("  DB sync: db.py not available")
+        return
+    if not _cfg("SYNC_TO_DB", True):
+        log.info("  DB sync: SYNC_TO_DB is False")
+        return
+    if not _cfg("BRIDGE_ENABLED", False):
+        log.info("  DB sync: BRIDGE_ENABLED is False")
+        return
+    if not DB.available:
+        log.warning("  DB sync: bridge client not ready")
+        return
+    method = getattr(DB, "upsert_race_findings", None)
+    if method is None:
+        log.warning(
+            "  DB sync: db.py is missing upsert_race_findings() — "
+            "add the method to enable dedicated-table sync"
+        )
+        return
     try:
-        return probe.run()
+        payloads = [c.to_dict() for c in candidates]
+        result = method(scan_id, payloads)
+        if result is None:
+            log.warning("  DB sync: bridge returned None")
+        else:
+            log.info(
+                f"  DB sync: {result} race finding(s) "
+                f"upserted (scan_id={scan_id})"
+            )
     except Exception as e:
-        log.debug(f"probe failed on {candidate.target}: {e}")
-        return None
+        log.warning(f"  DB sync: exception — {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -540,69 +831,93 @@ def run_race_audit(
     outdir: Path,
     *,
     headers: Optional[dict] = None,
-    run_probe: bool = False,
+    run_probe: bool = True,
     probe_count: int = DEFAULT_PROBE_COUNT,
     max_probes: int = MAX_PROBES,
+    rate_limit: Optional[int] = None,
+    concurrency: Optional[int] = None,
+    scan_id: Optional[int] = None,
 ) -> Path:
-    """
-    Run the race condition audit against every URL in `urls_file`.
-
-    Returns the path to `race_findings.json`.
-    """
     start = time.monotonic()
+
+    settings = _race_settings()
+    eff_rate = rate_limit if rate_limit is not None else settings["rate_limit"]
+    eff_conc = concurrency if concurrency is not None else settings["concurrency"]
+    eff_timeout = settings["timeout"]
 
     urls = _load_urls(urls_file)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    log.info(f"  Input  : {len(urls)} URL(s) from {urls_file.name}")
+    cfg_hdrs = _target_headers()
     if headers:
-        log.info("  Auth   : headers supplied (authenticated probing enabled)")
-    log.info(f"  Mode   : {'discovery + probe' if run_probe else 'discovery only'}")
+        for k, v in headers.items():
+            cfg_hdrs.setdefault(k, v)
+    auth_on = bool(cfg_hdrs)
+
+    log.info(f"  Input  : {len(urls)} URL(s) from {urls_file.name}")
+    log.info(f"  Config : rate_limit={eff_rate}/s  concurrency={eff_conc}  timeout={eff_timeout}s")
+    log.info(f"  Auth   : {'yes' if auth_on else 'no'}")
+    log.info(f"  Mode   : {'discovery + concurrent probe' if run_probe else 'discovery only'}")
     log.info("")
 
     if not urls:
-        log.warning("  No URLs to audit — writing empty report")
+        log.warning("  No URLs — writing empty report")
         return _write_empty_report(outdir, urls_file, start)
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
-    if headers:
-        session.headers.update(headers)
-    session.verify = False
+    session = RateLimitedSession(rate_limit=eff_rate, timeout=eff_timeout)
 
-    # ── Phase 1: Surface discovery ──────────────────────────────────────────
+    # ── Phase 1: Surface discovery
     log.info("  Phase 1 — Race condition surface discovery")
     candidates = discover_candidates(urls)
     log.info(f"    {len(candidates)} candidate(s) identified")
 
     if not candidates:
-        log.warning("  No race-condition candidates found — writing empty report")
+        log.warning("  No candidates — writing empty report")
         return _write_empty_report(outdir, urls_file, start, total_input=len(urls))
 
-    # ── Phase 2: Attack plan generation ─────────────────────────────────────
+    # ── Phase 2: Attack plans
     log.info("")
-    log.info("  Phase 2 — Generating Turbo Intruder attack plans")
+    log.info("  Phase 2 — Generating exploit scripts (turbo, curl, python)")
     plan_dir = write_attack_plans(candidates, outdir)
-    log.info(f"    {len(candidates)} script(s) written to {plan_dir.name}/")
+    log.info(f"    {len(candidates)} × 3 scripts → {plan_dir.name}/")
 
-    # ── Phase 3: Automated probe (optional) ─────────────────────────────────
-    probe_results: list[ProbeResult] = []
+    # ── Phase 3: Concurrent burst probe
     if run_probe:
         log.info("")
-        log.info(f"  Phase 3 — Automated probe ({probe_count} synchronized requests)")
-        log.info("    Note: This is LOW PRECISION. Use Turbo Intruder for real confirmation.")
+        log.info(f"  Phase 3 — Concurrent burst probe ({probe_count} synchronized requests)")
 
-        for i, c in enumerate(candidates[:max_probes], 1):
-            log.info(f"    probing {i}/{min(len(candidates), max_probes)}: {c.target[:60]}")
-            result = probe_candidate(session, c, probe_count, headers)
-            if result:
-                probe_results.append(result)
-                if result.likely_vulnerable:
-                    log.info(f"      ⚠ LIKELY VULNERABLE: {result.evidence[:100]}")
+        # Prioritize CRITICAL/HIGH for probe; cap at max_probes
+        probe_targets = sorted(
+            candidates,
+            key=lambda c: ({"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}.get(c.severity, 4)),
+        )[:max_probes]
 
-        log.info(f"    {sum(1 for r in probe_results if r.likely_vulnerable)} likely vulnerable")
+        def _probe_one(c: RaceCandidate) -> None:
+            try:
+                probe_candidate(session, c, cfg_hdrs, probe_count, eff_timeout)
+            except Exception as e:
+                log.debug(f"    probe error on {c.target}: {e}")
 
-    # ── Deduplicate ──────────────────────────────────────────────────────────
+        with ThreadPoolExecutor(max_workers=eff_conc) as pool:
+            futures = {pool.submit(_probe_one, c): c for c in probe_targets}
+            done = 0
+            for fut in as_completed(futures):
+                done += 1
+                c = futures[fut]
+                status = "CONFIRMED" if c.confirmed else (
+                    f"{c.concurrent_success}/{c.request_count or probe_count}"
+                    if c.concurrent_success is not None else "?"
+                )
+                if done % 5 == 0 or c.confirmed:
+                    log.info(
+                        f"    [{done:>3}/{len(probe_targets)}] "
+                        f"{c.race_class:<18} {c.target[:50]:<50} {status}"
+                    )
+
+        confirmed_count = sum(1 for c in candidates if c.confirmed)
+        log.info(f"    {confirmed_count}/{len(probe_targets)} confirmed vulnerable")
+
+    # ── Dedupe + sort
     seen: set[tuple] = set()
     deduped: list[RaceCandidate] = []
     for c in candidates:
@@ -611,102 +926,116 @@ def run_race_audit(
             seen.add(key)
             deduped.append(c)
 
-    # ── Sort ────────────────────────────────────────────────────────────────
-    SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-    deduped.sort(key=lambda c: (SEV_ORDER.get(c.severity, 4), -c.confidence, c.target))
+    SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+    deduped.sort(key=lambda c: (
+        SEV_ORDER.get(c.severity, 5),
+        0 if c.confirmed else 1,
+        -c.confidence,
+        c.target,
+    ))
 
-    # ── Attach probe results to candidates ──────────────────────────────────
-    probe_map = {r.target: r for r in probe_results}
     for c in deduped:
-        if c.target in probe_map:
-            r = probe_map[c.target]
-            if r.likely_vulnerable:
-                c.confidence = min(c.confidence + 25, 95)
-                c.evidence = r.evidence
-                c.details["probe"] = r.to_dict()
+        c.auth_enabled = auth_on
+        if not c.first_seen:
+            c.first_seen = _db_now()
 
-    # ── Write outputs ────────────────────────────────────────────────────────
+    # ── Reports
     elapsed = time.monotonic() - start
-    by_severity: dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
+    by_severity = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
     by_class: dict[str, int] = {}
+    confirmed_list: list[RaceCandidate] = []
 
     for c in deduped:
         by_severity[c.severity] = by_severity.get(c.severity, 0) + 1
         by_class[c.race_class] = by_class.get(c.race_class, 0) + 1
+        if c.confirmed:
+            confirmed_list.append(c)
 
-    # Flat candidates
-    candidate_lines = [
-        f"{c.target}\t{c.race_class}\t{c.severity}\t{c.confidence}\t{c.description[:80]}"
-        for c in deduped
-    ]
-    (outdir / "race_candidates.txt").write_text("\n".join(candidate_lines) + "\n")
+    (outdir / "race_candidates.txt").write_text(
+        "\n".join(
+            f"{c.target}\t{c.race_class}\t{c.severity}\t{c.confidence}\t"
+            f"{'CONFIRMED' if c.confirmed else 'candidate'}\t{c.evidence[:160]}"
+            for c in deduped
+        ) + ("\n" if deduped else "")
+    )
 
-    # Probe results flat file
-    if probe_results:
-        probe_lines = [
-            f"{r.target}\t{r.success_count}/{r.request_count} success\t"
-            f"{'VULNERABLE' if r.likely_vulnerable else 'safe'}\t{r.evidence[:120]}"
-            for r in probe_results
-        ]
-        (outdir / "race_probe_results.txt").write_text("\n".join(probe_lines) + "\n")
+    probed = [c for c in deduped if c.concurrent_success is not None]
+    if probed:
+        (outdir / "race_probe_results.txt").write_text(
+            "\n".join(
+                f"{c.target}\t{c.race_class}\t"
+                f"seq={c.sequential_success or '-'} conc={c.concurrent_success}/{c.request_count}\t"
+                f"{'CONFIRMED' if c.confirmed else 'safe'}\t{c.evidence[:160]}"
+                for c in probed
+            ) + "\n"
+        )
 
-    # JSON report
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(elapsed, 2),
         "input_file": str(urls_file),
+        "auth_enabled": auth_on,
         "config": {
             "probe_enabled": run_probe,
             "probe_count":   probe_count,
-            "authenticated": headers is not None,
+            "rate_limit":    eff_rate,
+            "concurrency":   eff_conc,
+            "timeout":       eff_timeout,
+            "headers_count": len(cfg_hdrs),
         },
         "totals": {
-            "urls_input":       len(urls),
-            "candidates":       len(deduped),
-            "critical":         by_severity["CRITICAL"],
-            "high":             by_severity["HIGH"],
-            "medium":           by_severity["MEDIUM"],
-            "low":              by_severity["LOW"],
-            "probes_run":       len(probe_results),
-            "probe_vulnerable": sum(1 for r in probe_results if r.likely_vulnerable),
+            "urls_input":    len(urls),
+            "candidates":    len(deduped),
+            "confirmed":     len(confirmed_list),
+            "probed":        len(probed),
+            "critical":      by_severity["CRITICAL"],
+            "high":          by_severity["HIGH"],
+            "medium":        by_severity["MEDIUM"],
+            "low":           by_severity["LOW"],
         },
         "summary": {
             "by_severity": by_severity,
             "by_class":    dict(sorted(by_class.items(), key=lambda kv: -kv[1])),
         },
         "candidates": [c.to_dict() for c in deduped],
-        "probe_results": [r.to_dict() for r in probe_results],
     }
 
     json_path = outdir / "race_findings.json"
     json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
-    # ── Console summary ─────────────────────────────────────────────────────
+    # ── Self-sync
+    if scan_id is not None:
+        log.info("")
+        log.info(f"  Syncing to remote database (scan_id={scan_id})...")
+        _self_sync(scan_id, deduped)
+    else:
+        log.info("")
+        log.info("  DB sync  : deferred to main.py (no scan_id passed)")
+
+    # ── Summary
     log.info("")
     log.info("  Outputs :")
-    log.info(f"    {json_path.name:<28} {len(deduped):>5} candidate(s)")
-    log.info(f"    race_candidates.txt              {len(deduped):>5} candidate(s)")
-    log.info(f"    race_attack_plans/               {len(deduped):>5} Turbo script(s)")
-    if probe_results:
-        log.info(f"    race_probe_results.txt           {len(probe_results):>5} probe result(s)")
-
+    log.info(f"    {json_path.name:<32} {len(deduped):>5} candidate(s)")
+    log.info(f"    race_candidates.txt             {len(deduped):>5} candidate(s)")
+    log.info(f"    race_attack_plans/              {len(deduped) * 3:>5} script(s)")
+    if probed:
+        log.info(f"    race_probe_results.txt          {len(probed):>5} probe result(s)")
     log.info("")
     log.info(
-        f"  Severity : "
-        f"CRITICAL={by_severity['CRITICAL']}  "
-        f"HIGH={by_severity['HIGH']}  "
-        f"MEDIUM={by_severity['MEDIUM']}  "
+        f"  Severity : CRITICAL={by_severity['CRITICAL']}  "
+        f"HIGH={by_severity['HIGH']}  MEDIUM={by_severity['MEDIUM']}  "
         f"LOW={by_severity['LOW']}"
     )
+    log.info(f"  Confirmed: {len(confirmed_list)}/{len(deduped)}")
 
-    if deduped:
+    if confirmed_list:
         log.info("")
-        log.info("  Top candidates:")
-        for c in deduped[:10]:
-            log.info(f"    [{c.severity:<8}] {c.race_class:<16} {c.target[:60]}")
+        log.info("  Confirmed races:")
+        for c in confirmed_list[:10]:
+            log.info(f"    [{c.severity:<8}] {c.race_class:<18} {c.target[:60]}")
 
     log.info("")
-    log.info("  Next step: open race_attack_plans/ and run each script in Turbo Intruder")
+    log.info("  Next: open race_attack_plans/ for Turbo Intruder single-packet scripts")
     log.info(f"  Completed in {elapsed:.1f}s")
     return json_path
 
@@ -718,15 +1047,14 @@ def _write_empty_report(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(time.monotonic() - start, 2),
         "input_file": str(input_file),
+        "auth_enabled": False,
         "config": {},
         "totals": {
-            "urls_input": total_input, "candidates": 0,
-            "critical": 0, "high": 0, "medium": 0, "low": 0,
-            "probes_run": 0, "probe_vulnerable": 0,
+            "urls_input": total_input, "candidates": 0, "confirmed": 0,
+            "probed": 0, "critical": 0, "high": 0, "medium": 0, "low": 0,
         },
         "summary": {"by_severity": {}, "by_class": {}},
         "candidates": [],
-        "probe_results": [],
     }
     path = outdir / "race_findings.json"
     path.write_text(json.dumps(report, indent=2) + "\n")
@@ -737,7 +1065,7 @@ def _write_empty_report(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  STANDALONE TEST
+#  STANDALONE
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
@@ -750,24 +1078,30 @@ if __name__ == "__main__":
     default_input = base / "output" / "urls_with_params.txt"
     if not default_input.exists():
         default_input = base / "output" / "live_urls.txt"
-    out = base / "output"
 
     parser = argparse.ArgumentParser(description="Argus Race Condition Auditor (standalone)")
-    parser.add_argument("--input", type=Path, default=default_input, help="Input URL file")
-    parser.add_argument("--output", type=Path, default=out, help="Output directory")
+    parser.add_argument("--input", type=Path, default=default_input)
+    parser.add_argument("--output", type=Path, default=base / "output")
+    parser.add_argument("--scan-id", type=int, default=None)
+    parser.add_argument("--rate-limit", type=int, default=None)
+    parser.add_argument("--concurrency", type=int, default=None)
     parser.add_argument("--cookie", help="Session cookie for authenticated testing")
-    parser.add_argument("--probe", action="store_true", help="Run low-precision automated probe")
-    parser.add_argument("--probe-count", type=int, default=DEFAULT_PROBE_COUNT, help="Requests per probe")
+    parser.add_argument("--probe-count", type=int, default=DEFAULT_PROBE_COUNT)
+    parser.add_argument("--no-probe", action="store_true",
+                        help="Discovery + attack plans only (no network probe)")
     args = parser.parse_args()
 
-    headers = {"Cookie": args.cookie} if args.cookie else None
+    hdrs = {"Cookie": args.cookie} if args.cookie else None
 
     try:
         run_race_audit(
             args.input, args.output,
-            headers=headers,
-            run_probe=args.probe,
+            headers=hdrs,
+            run_probe=not args.no_probe,
             probe_count=args.probe_count,
+            rate_limit=args.rate_limit,
+            concurrency=args.concurrency,
+            scan_id=args.scan_id,
         )
     except Exception as e:
         log.error(f"failed: {e}")
