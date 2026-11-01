@@ -491,6 +491,52 @@ class ArgusDB:
         r = self._call("query.takeover_findings", payload)
         return r.get("takeover_findings") if r and r.get("ok") else None
 
+    def upsert_url_categorize(
+        self, scan_id: int, entries: list[dict], chunk_size: int = 500,
+    ) -> Optional[int]:
+        """Upsert per-URL category data in chunks."""
+        if not entries:
+            return 0
+
+        total = 0
+        for i in range(0, len(entries), chunk_size):
+            chunk = entries[i:i + chunk_size]
+            r = self._call("url_categorize.upsert", {
+                "scan_id":        scan_id,
+                "url_categorize": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"url_categorize.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_url_categorize(
+        self, scan_uuid: str, limit: int = 1000, offset: int = 0,
+        category: Optional[str] = None, min_weight: Optional[int] = None,
+        min_categories: Optional[int] = None, priority_only: bool = False,
+        param_contains: Optional[str] = None,
+    ) -> Optional[list]:
+        payload = {
+            "scan_uuid":     scan_uuid,
+            "limit":         limit,
+            "offset":        offset,
+            "priority_only": priority_only,
+        }
+        if category is not None:
+            payload["category"] = category
+        if min_weight is not None:
+            payload["min_weight"] = min_weight
+        if min_categories is not None:
+            payload["min_categories"] = min_categories
+        if param_contains is not None:
+            payload["param_contains"] = param_contains
+        r = self._call("query.url_categorize", payload)
+        return r.get("url_categorize") if r and r.get("ok") else None
+
     def upsert_subdomains(
         self, scan_id: int, subdomains: list[dict], chunk_size: int = 500,
     ) -> Optional[int]:

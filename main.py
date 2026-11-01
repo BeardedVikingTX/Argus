@@ -309,16 +309,18 @@ STAGE_ARTIFACTS = {
 # Recon artifacts use a different schema than findings.
 # Keyed by stage → (json filename, DB table kind).
 RECON_JSON_MAP: dict[str, tuple[str, str]] = {
-    "subs":     ("subdomains.json",        "subdomains"),
-    "dns":      ("dns_resolve.json",       "dns_records"),
-    "takeover": ("takeover_findings.json", "takeover_findings"),
-    "live":     ("live_hosts.json",        "live_hosts"),
-    "crawl":    ("site_pages.json",        "site_pages"),
-    "fuzz":     ("content_fuzz.json",      "content_fuzz"),
-    "js":       ("js_findings.json",       "js_findings"),
-    "nmap":     ("nmap_scan.json",         "nmap"),
-    "nuclei":   ("nuclei_findings.json",   "nuclei"),
-    "params":   ("param_findings.json",    "param_findings"),
+    "subs":       ("subdomains.json",        "subdomains"),
+    "dns":        ("dns_resolve.json",       "dns_records"),
+    "takeover":   ("takeover_findings.json", "takeover_findings"),
+    "live":       ("live_hosts.json",        "live_hosts"),
+    "urls":       ("url_harvest.json",       "urls"),
+    "categorize": ("url_categorize.json",    "url_categorize"),
+    "crawl":      ("site_pages.json",        "site_pages"),
+    "fuzz":       ("content_fuzz.json",      "content_fuzz"),
+    "js":         ("js_findings.json",       "js_findings"),
+    "nmap":       ("nmap_scan.json",         "nmap"),
+    "nuclei":     ("nuclei_findings.json",   "nuclei"),
+    "params":     ("param_findings.json",    "param_findings"),
 }
 
 def resolve_stages(arg: str) -> list[str]:
@@ -784,7 +786,7 @@ def _run_urls(outdir: Path) -> None:
 def _run_categorize(outdir: Path) -> None:
     from recon_tools.url_categorize import run_url_categorize
     source = _pick_existing(outdir, ["urls_with_params.txt", "all_urls.txt"])
-    run_url_categorize(source, outdir)
+    run_url_categorize(source, outdir, scan_id=_CURRENT_SCAN_ID)
 
 
 def _run_js(outdir: Path) -> None:
@@ -1517,6 +1519,82 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
                 else:
                     _DB_FAIL_COUNT = 0
                     log.info(f"DB sync takeover: {result} finding(s) upserted")
+                return
+
+            elif kind == "url_categorize":
+                # The JSON report has per-category lists; we want one row per URL
+                # with its aggregate category data. Rebuild from priority_urls +
+                # all categories.
+                items: list[dict] = []
+
+                # Build URL → entry map
+                url_map: dict[str, dict] = {}
+
+                # Priority URLs have full category + weight data
+                for p in data.get("priority_urls") or []:
+                    url = p.get("url")
+                    if not url:
+                        continue
+                    url_map[url] = {
+                        "url":             url,
+                        "categories":      p.get("categories") or [],
+                        "category_count":  len(p.get("categories") or []),
+                        "weight":          int(p.get("weight") or 0),
+                        "param_names":     p.get("param_names") or [],
+                        "high_risk_count": 0,   # computed below
+                        "is_priority":     True,
+                    }
+
+                # Also walk per-category lists to catch non-priority URLs
+                HIGH_RISK = {"sqli", "ssrf", "rce", "lfi", "ssti", "idor"}
+                for cat in data.get("categories") or []:
+                    cat_name = (cat.get("name") or "").lower()
+                    cat_urls = cat.get("urls") or []
+                    for url in cat_urls:
+                        if not url:
+                            continue
+                        entry = url_map.setdefault(url, {
+                            "url":             url,
+                            "categories":      [],
+                            "category_count":  0,
+                            "weight":          0,
+                            "param_names":     [],
+                            "high_risk_count": 0,
+                            "is_priority":     False,
+                        })
+                        if cat_name and cat_name not in entry["categories"]:
+                            entry["categories"].append(cat_name)
+                            entry["category_count"] = len(entry["categories"])
+                        # Approximate weight by category
+                        cat_weight = 3 if cat_name in HIGH_RISK else 2 if cat_name in (
+                            "redirect", "graphql", "oauth", "upload",
+                        ) else 1
+                        entry["weight"] = max(entry["weight"], 0) + cat_weight
+
+                # Compute high_risk_count and final weight
+                for url, entry in url_map.items():
+                    entry["high_risk_count"] = sum(
+                        1 for c in entry["categories"] if c in HIGH_RISK
+                    )
+                    if not entry["param_names"]:
+                        parsed = urllib.parse.urlparse(url)
+                        entry["param_names"] = list(
+                            urllib.parse.parse_qs(parsed.query).keys()
+                        )
+                    # Refresh category_count in case we added categories
+                    entry["category_count"] = len(entry["categories"])
+
+                items = list(url_map.values())
+                if not items:
+                    return
+
+                result = DB.upsert_url_categorize(scan_id, items)
+                if result is None:
+                    _DB_FAIL_COUNT += 1
+                    log.debug("DB sync url_categorize returned None")
+                else:
+                    _DB_FAIL_COUNT = 0
+                    log.info(f"DB sync categorize: {result} URL(s) upserted")
                 return
 
         except Exception as e:
