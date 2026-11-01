@@ -316,6 +316,7 @@ RECON_JSON_MAP: dict[str, tuple[str, str]] = {
     "fuzz":  ("content_fuzz.json", "content_fuzz"),
     "js":    ("js_findings.json",  "js_findings"),
     "nmap":  ("nmap_scan.json",    "nmap"),
+    "nuclei":("nuclei_findings.json", "nuclei"),
 }
 
 def resolve_stages(arg: str) -> list[str]:
@@ -835,9 +836,9 @@ def _run_nuclei(outdir: Path) -> None:
         source, outdir,
         rate_limit=r.get("rate_limit", 5),
         concurrency=r.get("concurrency", 10),
-        headers=[
-            f"{k}: {v}" for k, v in _platform_headers().items()
-        ] or None,
+        bulk_size=r.get("bulk_size", 5),
+        headers=_platform_headers() or None,
+        scan_id=_CURRENT_SCAN_ID,
     )
 
 
@@ -1155,6 +1156,40 @@ def _to_nmap_host_payload(h: dict) -> Optional[dict]:
         "first_seen":      h.get("first_seen"),
     }
 
+def _to_nuclei_finding_payload(f: dict) -> Optional[dict]:
+    """Convert a nuclei_findings.json record into the wire shape."""
+    tid = f.get("template_id") or ""
+    matched = f.get("matched_at") or ""
+    if not tid or not matched:
+        return None
+
+    return {
+        "template_id":       tid,
+        "template_name":     f.get("template_name", ""),
+        "template_path":     f.get("template_path", ""),
+        "template_author":   f.get("template_author", []),
+        "severity":          (f.get("severity") or "UNKNOWN").upper(),
+        "cvss_score":        f.get("cvss_score"),
+        "cve_ids":           f.get("cve_ids", []),
+        "cwe_ids":           f.get("cwe_ids", []),
+        "matched_at":        matched,
+        "host":              f.get("host", ""),
+        "ip":                f.get("ip", ""),
+        "port":              f.get("port"),
+        "scheme":            f.get("scheme", ""),
+        "path":              f.get("path", ""),
+        "matcher_name":      f.get("matcher_name", ""),
+        "extracted_results": f.get("extracted_results", []),
+        "curl_command":      f.get("curl_command", ""),
+        "request":           f.get("request", ""),
+        "response":          f.get("response", ""),
+        "tags":              f.get("tags", []),
+        "description":       f.get("description", ""),
+        "reference":         f.get("reference", []),
+        "metadata":          f.get("metadata", {}),
+        "auth_enabled":      bool(f.get("auth_enabled")),
+        "first_seen":        _format_dt(f.get("first_seen")),
+    }
 
 def _to_nmap_port_payload(host: dict, port: dict, host_hash: str) -> Optional[dict]:
     p = port.get("port")
@@ -1369,6 +1404,29 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
             else:
                 _DB_FAIL_COUNT = 0
                 log.info(f"DB sync {stage}: {result} {label} upserted")
+
+            elif kind == "nuclei":
+                # Nuclei uses two tables — findings + per-batch metadata
+                items = data.get("findings") or []
+                if items:
+                    payloads = [_to_nuclei_finding_payload(f) for f in items]
+                    payloads = [p for p in payloads if p]
+                    if payloads:
+                        result = DB.upsert_nuclei_findings(scan_id, payloads)
+                        if result is None:
+                            _DB_FAIL_COUNT += 1
+                            log.debug("DB sync nuclei findings returned None")
+                        else:
+                            _DB_FAIL_COUNT = 0
+                            log.info(f"DB sync nuclei: {result} finding(s) upserted")
+
+                # Batch metadata
+                batches = data.get("batches") or []
+                if batches:
+                    for batch in batches:
+                        DB.save_nuclei_batch(scan_id, batch)
+                return
+
         except Exception as e:
             _DB_FAIL_COUNT += 1
             log.debug(f"DB sync exception on {stage}: {e}")

@@ -330,6 +330,72 @@ class ArgusDB:
         r = self._call("query.nmap_ports", payload)
         return r.get("nmap_ports") if r and r.get("ok") else None
 
+    def upsert_nuclei_findings(
+        self, scan_id: int, findings: list[dict], chunk_size: int = 100,
+    ) -> Optional[int]:
+        """
+        Upsert nuclei findings in chunks.
+
+        Chunk size is small (100) because each finding can carry full
+        request/response bodies — 100 × 100KB ≈ 10MB, just under PHP's
+        default post_max_size.
+        """
+        if not findings:
+            return 0
+
+        total = 0
+        for i in range(0, len(findings), chunk_size):
+            chunk = findings[i:i + chunk_size]
+            r = self._call("nuclei_findings.upsert", {
+                "scan_id":         scan_id,
+                "nuclei_findings": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"nuclei_findings.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def save_nuclei_batch(
+        self, scan_id: int, batch: dict,
+    ) -> Optional[int]:
+        """Record a nuclei batch execution (rate limit used, targets count, etc.)."""
+        r = self._call("nuclei_batch.save", {
+            "scan_id": scan_id,
+            **batch,
+        })
+        return r.get("id") if r and r.get("ok") else None
+
+    def get_nuclei_findings(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        severity: Optional[str] = None, template_id: Optional[str] = None,
+        scheme: Optional[str] = None, min_cvss: Optional[float] = None,
+        has_cve: bool = False,
+    ) -> Optional[list]:
+        payload = {
+            "scan_uuid": scan_uuid,
+            "limit":     limit,
+            "offset":    offset,
+            "has_cve":   has_cve,
+        }
+        if severity is not None:
+            payload["severity"] = severity
+        if template_id is not None:
+            payload["template_id"] = template_id
+        if scheme is not None:
+            payload["scheme"] = scheme
+        if min_cvss is not None:
+            payload["min_cvss"] = min_cvss
+        r = self._call("query.nuclei_findings", payload)
+        return r.get("nuclei_findings") if r and r.get("ok") else None
+
+    def get_nuclei_batches(self, scan_uuid: str) -> Optional[list]:
+        r = self._call("query.nuclei_batches", {"scan_uuid": scan_uuid})
+        return r.get("nuclei_batches") if r and r.get("ok") else None
+
     def upsert_subdomains(
         self, scan_id: int, subdomains: list[dict], chunk_size: int = 500,
     ) -> Optional[int]:
