@@ -893,6 +893,41 @@ class ArgusDB:
         r = self._call("query.race_findings", payload)
         return r.get("race_findings") if r and r.get("ok") else None
 
+    def upsert_site_map_hosts(
+        self, scan_id: int, hosts: list[dict], chunk_size: int = 500,
+    ) -> Optional[int]:
+        if not hosts:
+            return 0
+        total = 0
+        for i in range(0, len(hosts), chunk_size):
+            chunk = hosts[i:i + chunk_size]
+            r = self._call("site_map_hosts.upsert", {
+                "scan_id": scan_id, "site_map_hosts": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"site_map_hosts.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_site_map_hosts(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        min_score: Optional[int] = None, takeover_only: bool = False,
+    ) -> Optional[list]:
+        payload = {
+            "scan_uuid":     scan_uuid,
+            "limit":         limit,
+            "offset":        offset,
+            "takeover_only": takeover_only,
+        }
+        if min_score is not None:
+            payload["min_score"] = min_score
+        r = self._call("query.site_map_hosts", payload)
+        return r.get("site_map_hosts") if r and r.get("ok") else None
+
     def upsert_open_redirect_findings(
         self, scan_id: int, findings: list[dict], chunk_size: int = 200,
     ) -> Optional[int]:

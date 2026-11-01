@@ -1031,7 +1031,11 @@ def _run_xxe(outdir: Path) -> None:
 def _run_mapping(outdir: Path) -> None:
     from auditing_tools.site_mapping import run_site_mapping
     source = _pick_existing(outdir, ["live_urls.txt", "live_hosts.txt"])
-    run_site_mapping(source, outdir, wildcard_file=WILDCARD_FILE)
+    run_site_mapping(
+        source, outdir,
+        wildcard_file=WILDCARD_FILE,
+        scan_id=_CURRENT_SCAN_ID,
+    )
 
 
 def _run_triage(outdir: Path) -> None:
