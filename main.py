@@ -922,12 +922,15 @@ def _run_idor(outdir: Path) -> None:
     r = _module_rate("idor")
     run_idor_audit(
         source, outdir,
+        rate_limit=r.get("rate_limit", 2),
+        concurrency=r.get("concurrency", 2),
+        headers=_platform_headers() or None,
         user_a_headers=headers_a,
         user_b_headers=headers_b,
         user_a_id=user_a.get("user_id") or None,
         user_b_id=user_b.get("user_id") or None,
         graphql_schema_file=schema_path if schema_path.exists() else None,
-        threads=r.get("concurrency", 5),
+        scan_id=_CURRENT_SCAN_ID,
     )
 
 
