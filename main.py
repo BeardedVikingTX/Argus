@@ -314,6 +314,7 @@ RECON_JSON_MAP: dict[str, tuple[str, str]] = {
     "live":  ("live_hosts.json",  "live_hosts"),
     "crawl": ("site_pages.json",  "site_pages"),
     "fuzz":  ("content_fuzz.json", "content_fuzz"),
+    "js":    ("js_findings.json",  "js_findings"),
 }
 
 def resolve_stages(arg: str) -> list[str]:
@@ -773,7 +774,13 @@ def _run_js(outdir: Path) -> None:
     from recon_tools.js_analysis import run_js_analysis
     source = _pick_existing(outdir, ["urls_js_files.txt", "live_urls.txt"])
     r = _module_rate("js")
-    run_js_analysis(source, outdir, download_threads=r.get("concurrency", 15))
+    run_js_analysis(
+        source, outdir,
+        download_threads=r.get("concurrency", 15),
+        rate_limit=r.get("rate_limit", 5),
+        headers=_platform_headers() or None,
+        scan_id=_CURRENT_SCAN_ID,
+    )
 
 
 def _run_params(outdir: Path) -> None:
@@ -1247,6 +1254,13 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
                     return
                 result = DB.upsert_content_fuzz(scan_id, items)
                 label = "endpoint(s)"
+
+            elif kind == "js_findings":
+                items = data.get("findings") or []
+                if not items:
+                    return
+                result = DB.upsert_js_findings(scan_id, items)
+                label = "JS finding(s)"
 
             else:
                 return

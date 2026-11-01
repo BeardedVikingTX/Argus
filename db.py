@@ -206,6 +206,50 @@ class ArgusDB:
         r = self._call("query.dns_records", payload)
         return r.get("dns_records") if r and r.get("ok") else None
 
+    def upsert_js_findings(
+        self, scan_id: int, findings: list[dict], chunk_size: int = 200,
+    ) -> Optional[int]:
+        """
+        Upsert JS findings in chunks.
+
+        Smaller chunk size than subdomains because each row can carry up to
+        16MB of endpoint text. 200 × 50KB ≈ 10MB per request, comfortably
+        under PHP's default post_max_size (8MB) — but with margin.
+        """
+        if not findings:
+            return 0
+
+        total = 0
+        for i in range(0, len(findings), chunk_size):
+            chunk = findings[i:i + chunk_size]
+            r = self._call("js_findings.upsert", {
+                "scan_id":     scan_id,
+                "js_findings": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"js_findings.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_js_findings(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        kind: Optional[str] = None, severity: Optional[str] = None,
+        min_confidence: Optional[int] = None,
+    ) -> Optional[list]:
+        payload = {"scan_uuid": scan_uuid, "limit": limit, "offset": offset}
+        if kind is not None:
+            payload["kind"] = kind
+        if severity is not None:
+            payload["severity"] = severity
+        if min_confidence is not None:
+            payload["min_confidence"] = min_confidence
+        r = self._call("query.js_findings", payload)
+        return r.get("js_findings") if r and r.get("ok") else None
+
     def upsert_subdomains(
         self, scan_id: int, subdomains: list[dict], chunk_size: int = 500,
     ) -> Optional[int]:
