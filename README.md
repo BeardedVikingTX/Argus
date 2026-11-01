@@ -1,10 +1,10 @@
 Argus
 🔭 The all-seeing recon framework for bug bounty hunters.
 
-https://img.shields.io/badge/python-3.10%2B-blue.svg
-https://img.shields.io/badge/License-MIT-yellow.svg
-https://img.shields.io/badge/PRs-welcome-brightgreen.svg
-https://img.shields.io/badge/maintained-yes-green.svg
+https://img.shields.io/badge/python-3.10%2B-blue.svg  
+https://img.shields.io/badge/License-MIT-yellow.svg  
+https://img.shields.io/badge/PRs-welcome-brightgreen.svg  
+https://img.shields.io/badge/maintained-yes-green.svg  
 
     Argus (Ἄργος) — the hundred-eyed giant of Greek myth. The all-seeing watchman. A modular, file-driven recon pipeline that chains subdomain enumeration, liveness detection, service scanning, URL mining, and heuristic candidate flaggers into one clean, idempotent workflow.
 
