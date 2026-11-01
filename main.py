@@ -885,7 +885,10 @@ def _run_cache(outdir: Path) -> None:
     r = _module_rate("cache")
     run_cache_audit(
         source, outdir,
-        threads=r.get("concurrency", 5),
+        rate_limit=r.get("rate_limit", 2),
+        concurrency=r.get("concurrency", 3),
+        headers=_platform_headers() or None,
+        scan_id=_CURRENT_SCAN_ID,
     )
 
 
