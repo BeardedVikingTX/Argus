@@ -382,20 +382,16 @@ git push origin feature/my-new-module
 # → open a PR against main
 ```
 
-# 👤 Author & Contact
--------------------
+## 👤 Author & Contact
 
-**BeardedVikingTX** --- builder, breaker, bug bounty hunter.
+**BeardedVikingTX** — builder, breaker, bug bounty hunter.
 
-|\
- |\
- |
-| --- | --- |
+| Platform | Link |
+|---|---|
 | 🐙 **GitHub** | [@BeardedVikingTX](https://github.com/BeardedVikingTX/Argus) |
 | 💼 **LinkedIn** | [bearded-viking-3112a8431](https://www.linkedin.com/in/bearded-viking-3112a8431/) |
 | 🏰 **MyCitadel** | [users/view.php?id=4](https://mycitadel.lol/users/view.php?id=4) |
-| ✉️ **Email** | info@beardedviking.org |
-
+| ✉️ **Email** | [info@beardedviking.org](mailto:info@beardedviking.org) |  
 Questions, ideas, war stories from the field --- reach out. If you find a bug in Argus, open an issue. If you find a bug *with* Argus, open a PR (and tell me where --- I'll credit you in the release notes).
 
 * * * * *
