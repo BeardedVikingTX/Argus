@@ -1,52 +1,208 @@
+# ═════════════════════════════════════════════════════════════════════════════
+#  Argus — .gitignore
 # ─────────────────────────────────────────────────────────────────────────────
-# SECURITY-CRITICAL — never commit these
+#  Every pattern in this file protects one of three things:
+#    1. Your local secrets (config.py, tokens, credentials)
+#    2. Your bug bounty scope (wildcard.txt, targets)
+#    3. Your recon artifacts (output/, findings, captures)
+#
+#  VERIFY BEFORE EVERY PUSH:
+#    git check-ignore -v config.py wildcard.txt output/run.log
+#  All three should print a matching line. If any does not, STOP.
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  1. LOCAL SECRETS — nothing in this section must EVER be committed
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Recon output: contains target domains, live hosts, potential findings.
-# Leaking this publicly = leaking your scope to competitors. Don't.
-output/
-!output/.gitkeep
+# Argus local config. Holds BRIDGE_KEY, OAST_KEY, EMAIL_PASS, TEST_ACCOUNTS.
+# The template (example_config.py) IS tracked — do not ignore it.
+config.py
+config.*.py
+config_local.py
+config-dev.py
+!example_config.py
 
-# Your in-scope wildcards. This is YOUR bug bounty program list.
-# Committing this tells the world exactly what you're hunting.
-wildcard.txt
-
-# Out-of-scope list — same concern as wildcard.txt
-out_of_scope.txt
-
-# Raw recon artifacts (in case you drop them at repo root by accident)
-all_subs.txt
-live_hosts.txt
-live_urls.txt
-live_hosts_ips.txt
-all_urls.txt
-interesting_urls.txt
-*_candidates.txt
-nmap_fast.*
-nmap_full.*
-httpx_responses/
-
-# Secrets, API keys, credentials
+# Generic env / secret files
 .env
 .env.*
 *.env
-secrets.yaml
-secrets.yml
-credentials.json
-config.local.*
+.envrc
+
+# Credentials and API keys (by name)
+secrets.*
+credentials.*
+*.credentials
+*_secret.txt
+*_token.txt
+tokens.txt
+cookies.txt
+cookies.json
+session.txt
+*-session.json
+*.cookie
+
+# Certificates and private keys
 *.pem
 *.key
+*.crt
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+id_ecdsa
 
-# Tool configs that may contain API keys
-.config/subfinder/
-.config/nuclei/
-.config/httpx/
-.config/amass/
-.subfinder/
-.nuclei/
-.httpx/
+# SSH / GPG state
+.ssh/
+.gnupg/
 
-# Burp / Caido / proxy project files (often contain target traffic)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  2. BUG BOUNTY SCOPE — targets are confidential
+# ─────────────────────────────────────────────────────────────────────────────
+
+# In-scope / out-of-scope domain lists
+wildcard.txt
+out_of_scope.txt
+scope.txt
+targets.txt
+scope*.txt
+targets*.txt
+
+# Platform scope exports (HackerOne, Bugcrowd CSV/JSON)
+*-scope.json
+*-programs.json
+programs.txt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  3. RECON OUTPUT — the output/ directory is the main one, but artifacts can
+#     be dropped at repo root by accident. Catch those too.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# output/ : keep the skeleton, drop the guts.
+# NOTE: must be `output/*` not `output/` — git cannot un-ignore a file inside
+# an excluded directory, so `output/` + `!output/.gitkeep` does not work.
+output/*
+!output/.gitkeep
+
+# Raw artifact fallbacks (in case they get dropped at repo root)
+all_subs.txt
+subs_resolved.txt
+subdomains.json
+live_hosts.txt
+live_hosts.json
+live_hosts_ips.txt
+live_urls.txt
+all_urls.txt
+interesting_urls.txt
+urls_with_params.txt
+urls_js_files.txt
+urls_interesting.txt
+*_candidates.txt
+*_confirmed.txt
+*_surface.txt
+*_fingerprints.txt
+gf_*.txt
+*_findings.json
+
+# Nmap raw output
+nmap_fast.*
+nmap_full.*
+nmap_deep.*
+nmap_scan.json
+nmap_*.xml
+nmap_*.nmap
+nmap_*.gnmap
+nmap_open_ports.txt
+nmap_interesting.txt
+nmap_os_guesses.txt
+
+# HTTPX raw dumps
+httpx_responses/
+
+# Explicit JSON fallbacks for the main finders (belt and suspenders)
+dns_resolve.json
+dns_resolved.txt
+dns_wildcard_filtered.txt
+dns_takeover_candidates.txt
+takeover_findings.json
+takeover_vulnerable.txt
+takeover_potential.txt
+takeover_cnames.txt
+url_harvest.json
+url_categorize.json
+url_categorize_priority.txt
+js_findings.json
+js_endpoints.txt
+js_secrets.txt
+js_sourcemaps.txt
+param_findings.json
+params_by_endpoint.txt
+graphql_findings.json
+graphql_schema.json
+content_fuzz.json
+fuzzed_directories.txt
+fuzzed_interesting.txt
+nuclei_findings.json
+nuclei_critical.txt
+nuclei_all.txt
+nuclei_raw.jsonl
+cors_findings.json
+cors_critical.txt
+smuggling_findings.json
+smuggling_candidates.txt
+smuggling_confirmed.txt
+cache_findings.json
+auth_findings.json
+idor_findings.json
+open_redirect_findings.json
+race_findings.json
+sqli_findings.json
+xss_findings.json
+ssrf_findings.json
+ssti_findings.json
+xxe_findings.json
+site_map.json
+site_map.md
+site_map_hosts.txt
+site_map_endpoints.txt
+site_map_parameters.txt
+site_map_findings.txt
+triage_report.json
+triage_priority.md
+triage_next_steps.txt
+triage_by_category.txt
+
+# Race condition attack scripts (contain target URLs)
+race_attack_plans/
+
+# Generic JSONL output (nuclei, custom stages)
+*.jsonl
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  4. DIAGNOSTIC OUTPUT
+# ─────────────────────────────────────────────────────────────────────────────
+
+# test_connection.py --json > health.json
+health.json
+health*.json
+*-debug.json
+bridge_test*.json
+
+# Local rate-limit state (only if the bridge is ever run locally)
+.ratelimit/
+
+# Network captures (from tcpdump / wireshark during testing)
+*.pcap
+*.pcapng
+*.cap
+
+# Proxy project files (often contain target traffic)
 *.burp
 *.caido
 *.har
@@ -58,7 +214,7 @@ config.local.*
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Python
+#  5. PYTHON
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Virtual environments
@@ -76,6 +232,22 @@ __pycache__/
 *.so
 .Python
 
+# Type checker caches
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+
+# Test & lint caches
+.pytest_cache/
+.ruff_cache/
+.tox/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
 # Build artifacts
 build/
 dist/
@@ -83,16 +255,8 @@ dist/
 *.egg
 wheels/
 .eggs/
-
-# Test & lint caches
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.tox/
-.coverage
-.coverage.*
-htmlcov/
-coverage.xml
+pip-wheel-metadata/
+share/python-wheels/
 
 # pip
 pip-log.txt
@@ -100,23 +264,31 @@ pip-delete-this-directory.txt
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Go (in case you ever add Go modules or build local binaries)
+#  6. GO / RUST / NODE — future-proofing
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Built binaries at repo root
+# Go
 /argus
 /argus.exe
 /*.exe
 /*.test
 bin/
-
-# Go module cache / vendor (usually not committed unless you vendor)
 vendor/
 go.sum.bak
 
+# Rust
+target/
+
+# Node (if a frontend dashboard is ever added)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Logs & temp
+#  7. LOGS & TEMP
 # ─────────────────────────────────────────────────────────────────────────────
 
 *.log
@@ -127,15 +299,17 @@ temp/
 *.tmp
 *.bak
 *.swp
+*.swn
+*.swm
 *.swo
 *~
-.DS_Store
-Thumbs.db
-desktop.ini
+.#*
+*.orig
+*.rej
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Editor / IDE
+#  8. EDITORS & IDEs
 # ─────────────────────────────────────────────────────────────────────────────
 
 .vscode/
@@ -147,10 +321,11 @@ desktop.ini
 .classpath
 .settings/
 *.iml
+.history/
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OS-specific
+#  9. OS FILES
 # ─────────────────────────────────────────────────────────────────────────────
 
 .DS_Store
@@ -161,11 +336,16 @@ desktop.ini
 .Trashes
 ehthumbs.db
 Thumbs.db
+desktop.ini
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Argus-specific: keep the skeleton but ignore the guts
+# 10. LOCAL DATABASES (if anyone runs a local mirror)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Keep the output directory structure but ignore its contents
-output/.gitkeep
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

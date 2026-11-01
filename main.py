@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """
-main.py — A R G U S  v2.0
+main.py — A R G U S  v3.0
 ═══════════════════════════════════════════════════════════════════════════════
 
 The all-seeing watchman of the digital longship.
 
-Pipeline:
+Pipeline (26 stages):
     RECON     :  subs → dns → takeover → live → nmap
     HARVEST   :  urls → categorize
-    DISCOVER  :  js → params → fuzz
-    SCAN      :  nuclei → cors
-    AUDIT     :  mapping → sqli → xss → ssrf
-    REPORT    :  triage
+    DISCOVER  :  js → params → graphql → fuzz
+    SCAN      :  nuclei → cors → smuggling → cache
+    AUDIT     :  auth → idor → redirect → race
+                 → sqli → xss → ssrf → ssti → xxe
+    REPORT    :  mapping → triage
+
+Persistence:
+    Every stage writes local JSON to output/ (always).
+    If config.py + db.py are present and the bridge is reachable,
+    the same findings are synced to the remote MySQL database
+    via bug-bounty.beardedviking.org/api.php (opt-in).
 
 Argus does not exploit. Argus surfaces. Every finding is a candidate — a
 flag on a map that says "look here, human." Manual triage is the point.
@@ -19,27 +26,59 @@ flag on a map that says "look here, human." Manual triage is the point.
 Usage:
     python3 main.py                          run all stages
     python3 main.py --stage recon            recon group only
-    python3 main.py --stage recon,live       specific stages, in order
-    python3 main.py --stage discover         discovery group only
+    python3 main.py --stage audit            all audit stages
     python3 main.py --stage quick            fast pass: recon → urls → triage
-    python3 main.py --stage all --skip audit skip audit stubs
-    python3 main.py --fail-fast              stop at first failure
+    python3 main.py --stage all --skip fuzz  full run minus the loud stages
     python3 main.py --dry-run                preview, no execution
     python3 main.py --stages                 list stage identifiers
+    python3 main.py --scan-id <uuid>         resume an existing scan
+    python3 main.py --no-db                  skip remote DB sync
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import os
 import sys
+import time
+import uuid as _uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Optional
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CONFIG — optional, graceful degradation
+# ═════════════════════════════════════════════════════════════════════════════
+
+try:
+    import config as CFG
+    CFG_LOADED = True
+except ImportError:
+    CFG = None
+    CFG_LOADED = False
+
+try:
+    from db import DB, ArgusDB
+    DB_MODULE_AVAILABLE = True
+except ImportError:
+    DB = None
+    ArgusDB = None  # type: ignore
+    DB_MODULE_AVAILABLE = False
+
+
+def _cfg(key: str, default: Any = None) -> Any:
+    """Read a config value with a fallback."""
+    if not CFG_LOADED:
+        return default
+    return getattr(CFG, key, default)
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  METADATA
 # ═════════════════════════════════════════════════════════════════════════════
 
-VERSION  = "2.0.0"
+VERSION  = "3.0.0"
 CODENAME = "Raven's Flight"
 AUTHOR   = "BeardedVikingTX"
 REPO     = "https://github.com/BeardedVikingTX/Argus"
@@ -50,7 +89,7 @@ REPO     = "https://github.com/BeardedVikingTX/Argus"
 
 BASE_DIR      = Path(__file__).parent
 OUTPUT_DIR    = BASE_DIR / "output"
-WILDCARD_FILE = BASE_DIR / "wildcard.txt"
+WILDCARD_FILE = Path(_cfg("SCOPE_FILE", BASE_DIR / "wildcard.txt"))
 LOG_FILE      = OUTPUT_DIR / "argus.log"
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -72,10 +111,6 @@ C = {
     "white":   "\033[97m",
 }
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  SIGILS — Viking / sci-fi marks
-# ═════════════════════════════════════════════════════════════════════════════
-
 S = {
     "sword":      "⚔",
     "shield":     "⛨",
@@ -89,13 +124,10 @@ S = {
     "warn":       "⚠",
     "dot_full":   "●",
     "dot_empty":  "○",
+    "db":         "⛁",
 }
 
 RUNES = "ᚠᚢᚦᚨᚱᚲᚷᚹᚺᚾᛁᛃᛇᛈᛉᛊᛏᛒᛖᛗᛚᛜᛞᛟ"
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  BANNER ART
-# ═════════════════════════════════════════════════════════════════════════════
 
 ARGUS_ART = r"""
  █████╗ ██████╗  ██████╗ ██╗   ██╗███████╗
@@ -106,9 +138,6 @@ ARGUS_ART = r"""
 ╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚══════╝
 """
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  COLOR HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
 
 def c(color: str, text: str) -> str:
     if not _USE_COLOR:
@@ -131,7 +160,7 @@ def gap():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  STAGE DEFINITIONS
+#  STAGE DEFINITIONS — all 26 stages
 # ═════════════════════════════════════════════════════════════════════════════
 
 STAGE_META = {
@@ -147,26 +176,36 @@ STAGE_META = {
     # ── Discover ────────────────────────────────────────────────────────────
     "js":         ("DISCOVER",  "JavaScript Analysis"),
     "params":     ("DISCOVER",  "Parameter Discovery"),
+    "graphql":    ("DISCOVER",  "GraphQL Audit"),
     "fuzz":       ("DISCOVER",  "Content Fuzzing"),
     # ── Scan ────────────────────────────────────────────────────────────────
     "nuclei":     ("SCAN",      "Vulnerability Scanning"),
     "cors":       ("SCAN",      "CORS Misconfiguration Check"),
+    "smuggling":  ("SCAN",      "HTTP Request Smuggling"),
+    "cache":      ("SCAN",      "Cache Poisoning & Deception"),
     # ── Audit ───────────────────────────────────────────────────────────────
-    "mapping":    ("AUDIT",     "Site Mapping"),
-    "sqli":       ("AUDIT",     "SQLi Candidate Hunter"),
-    "xss":        ("AUDIT",     "XSS Candidate Hunter"),
-    "ssrf":       ("AUDIT",     "SSRF Candidate Hunter"),
+    "auth":       ("AUDIT",     "Authentication Testing"),
+    "idor":       ("AUDIT",     "IDOR / BOLA Audit"),
+    "redirect":   ("AUDIT",     "Open Redirect Audit"),
+    "race":       ("AUDIT",     "Race Condition Surface"),
+    "sqli":       ("AUDIT",     "SQL Injection Audit"),
+    "xss":        ("AUDIT",     "XSS Audit"),
+    "ssrf":       ("AUDIT",     "SSRF Audit"),
+    "ssti":       ("AUDIT",     "SSTI Audit"),
+    "xxe":        ("AUDIT",     "XXE Audit"),
     # ── Report ──────────────────────────────────────────────────────────────
+    "mapping":    ("REPORT",    "Site Map Consolidation"),
     "triage":     ("REPORT",    "Finding Aggregation & Prioritization"),
 }
 
 STAGE_GROUPS = {
     "recon":    ["subs", "dns", "takeover", "live", "nmap"],
     "harvest":  ["urls", "categorize"],
-    "discover": ["js", "params", "fuzz"],
-    "scan":     ["nuclei", "cors"],
-    "audit":    ["mapping", "sqli", "xss", "ssrf"],
-    "report":   ["triage"],
+    "discover": ["js", "params", "graphql", "fuzz"],
+    "scan":     ["nuclei", "cors", "smuggling", "cache"],
+    "audit":    ["auth", "idor", "redirect", "race",
+                 "sqli", "xss", "ssrf", "ssti", "xxe"],
+    "report":   ["mapping", "triage"],
     "quick":    ["subs", "dns", "live", "urls", "categorize", "triage"],
     "all":      [
         # Recon
@@ -174,17 +213,17 @@ STAGE_GROUPS = {
         # Harvest
         "urls", "categorize",
         # Discover
-        "js", "params", "fuzz",
+        "js", "params", "graphql", "fuzz",
         # Scan
-        "nuclei", "cors",
-        # Audit (stubs)
-        "mapping", "sqli", "xss", "ssrf",
+        "nuclei", "cors", "smuggling", "cache",
+        # Audit
+        "auth", "idor", "redirect", "race",
+        "sqli", "xss", "ssrf", "ssti", "xxe",
         # Report
-        "triage",
+        "mapping", "triage",
     ],
 }
 
-# Which earlier stage must run first when an input file is missing
 STAGE_DEPS = {
     "dns":        "subs",
     "takeover":   "subs",
@@ -194,22 +233,85 @@ STAGE_DEPS = {
     "categorize": "urls",
     "js":         "urls",
     "params":     "urls",
+    "graphql":    "urls",
     "fuzz":       "live",
     "nuclei":     "live",
     "cors":       "live",
-    "mapping":    "live",
+    "smuggling":  "live",
+    "cache":      "urls",
+    "auth":       "live",
+    "idor":       "urls",
+    "redirect":   "urls",
+    "race":       "urls",
     "sqli":       "urls",
     "xss":        "urls",
     "ssrf":       "urls",
+    "ssti":       "urls",
+    "xxe":        "urls",
+    "mapping":    "live",
     "triage":     None,
 }
 
-# Order in which groups appear in the --stages catalog
 GROUP_ORDER = ["RECON", "HARVEST", "DISCOVER", "SCAN", "AUDIT", "REPORT"]
+
+# Stages that produce a findings JSON the DB cares about
+FINDINGS_JSON_MAP = {
+    "takeover":  "takeover_findings.json",
+    "js":        "js_findings.json",
+    "graphql":   "graphql_findings.json",
+    "nuclei":    "nuclei_findings.json",
+    "cors":      "cors_findings.json",
+    "smuggling": "smuggling_findings.json",
+    "cache":     "cache_findings.json",
+    "auth":      "auth_findings.json",
+    "idor":      "idor_findings.json",
+    "redirect":  "open_redirect_findings.json",
+    "race":      "race_findings.json",
+    "sqli":      "sqli_findings.json",
+    "xss":       "xss_findings.json",
+    "ssrf":      "ssrf_findings.json",
+    "ssti":      "ssti_findings.json",
+    "xxe":       "xxe_findings.json",
+}
+
+# Artifacts each stage typically writes — used for stage records and the final briefing
+STAGE_ARTIFACTS = {
+    "subs":       ["all_subs.txt", "subdomains.json", "subs_resolved.txt"],
+    "dns":        ["dns_resolve.json", "dns_resolved.txt",
+                   "dns_wildcard_filtered.txt", "dns_takeover_candidates.txt"],
+    "takeover":   ["takeover_findings.json", "takeover_vulnerable.txt",
+                   "takeover_potential.txt", "takeover_cnames.txt"],
+    "live":       ["live_hosts.json", "live_hosts.txt", "live_urls.txt"],
+    "nmap":       ["nmap_scan.json", "nmap_open_ports.txt", "nmap_interesting.txt"],
+    "urls":       ["url_harvest.json", "all_urls.txt", "urls_with_params.txt",
+                   "urls_js_files.txt", "urls_interesting.txt"],
+    "categorize": ["url_categorize.json", "url_categorize_priority.txt"],
+    "js":         ["js_findings.json", "js_endpoints.txt", "js_secrets.txt",
+                   "js_sourcemaps.txt"],
+    "params":     ["param_findings.json", "params_by_endpoint.txt"],
+    "graphql":    ["graphql_findings.json", "graphql_schema.json"],
+    "fuzz":       ["content_fuzz.json", "fuzzed_directories.txt",
+                   "fuzzed_interesting.txt"],
+    "nuclei":     ["nuclei_findings.json", "nuclei_critical.txt", "nuclei_all.txt"],
+    "cors":       ["cors_findings.json", "cors_critical.txt"],
+    "smuggling":  ["smuggling_findings.json", "smuggling_candidates.txt"],
+    "cache":      ["cache_findings.json", "cache_candidates.txt"],
+    "auth":       ["auth_findings.json", "auth_candidates.txt"],
+    "idor":       ["idor_findings.json", "idor_candidates.txt", "idor_confirmed.txt"],
+    "redirect":   ["open_redirect_findings.json", "open_redirect_candidates.txt"],
+    "race":       ["race_findings.json", "race_candidates.txt"],
+    "sqli":       ["sqli_findings.json", "sqli_candidates.txt", "sqli_confirmed.txt"],
+    "xss":        ["xss_findings.json", "xss_candidates.txt", "xss_confirmed.txt"],
+    "ssrf":       ["ssrf_findings.json", "ssrf_candidates.txt", "ssrf_confirmed.txt"],
+    "ssti":       ["ssti_findings.json", "ssti_candidates.txt", "ssti_confirmed.txt"],
+    "xxe":        ["xxe_findings.json", "xxe_candidates.txt", "xxe_confirmed.txt"],
+    "mapping":    ["site_map.json", "site_map.md", "site_map_hosts.txt"],
+    "triage":     ["triage_report.json", "triage_priority.md",
+                   "triage_next_steps.txt"],
+}
 
 
 def resolve_stages(arg: str) -> list[str]:
-    """Resolve a stage argument into an ordered list of stage keys."""
     if arg in STAGE_GROUPS:
         return list(STAGE_GROUPS[arg])
     if arg in STAGE_META:
@@ -226,7 +328,6 @@ def resolve_stages(arg: str) -> list[str]:
                 result.append(piece)
             else:
                 raise ValueError(f"Unknown stage or group: {piece}")
-        # Preserve order but remove duplicates
         seen: set[str] = set()
         deduped: list[str] = []
         for s in result:
@@ -254,7 +355,8 @@ def show_banner():
     gap()
 
 
-def show_briefing(wildcards, stage_list, outdir, dry_run, fail_fast):
+def show_briefing(wildcards, stage_list, outdir, dry_run, fail_fast,
+                  db_status: str, platform: str):
     gap()
     print("  " + hline("═", 71, "cyan"))
     print("  " + bold(f"{S['sword']}  RAID BRIEFING"))
@@ -271,12 +373,14 @@ def show_briefing(wildcards, stage_list, outdir, dry_run, fail_fast):
     print(f"  {cyan(S['shield'])}  Mode         : {mode_fn(mode)}")
     if fail_fast:
         print(f"  {cyan(S['shield'])}  On failure   : {yellow('FAIL-FAST')}")
+
+    print(f"  {cyan(S['shield'])}  Platform     : {bold(platform) if platform else dim('(none)')}")
+    print(f"  {cyan(S['shield'])}  Database     : {db_status}")
     print(f"  {cyan(S['shield'])}  Stage(s)     : {bold(str(len(stage_list)))} sub-stage(s)")
     print(f"  {cyan(S['shield'])}  Output       : {dim(str(outdir))}")
     print(f"  {cyan(S['shield'])}  Log          : {dim(str(LOG_FILE))}")
     gap()
 
-    # Stage preview
     preview = " → ".join(stage_list)
     if len(preview) > 66:
         preview = preview[:63] + "..."
@@ -312,15 +416,12 @@ def show_stage_result(key: str, result: str) -> None:
     gap()
 
 
-# Headline artifacts shown in the final briefing, grouped by pipeline phase
 ARTIFACT_GROUPS = {
     "RECON": [
         ("all_subs.txt",                "Subdomains"),
         ("subdomains.json",             "Subdomain attribution"),
         ("dns_wildcard_filtered.txt",   "DNS (clean)"),
-        ("dns_takeover_candidates.txt", "Takeover candidates"),
         ("takeover_vulnerable.txt",     "Takeover CONFIRMED"),
-        ("takeover_potential.txt",      "Takeover potential"),
         ("live_hosts.txt",              "Live hosts"),
         ("live_hosts.json",             "Live hosts (JSON)"),
         ("nmap_interesting.txt",        "Interesting hosts"),
@@ -336,34 +437,103 @@ ARTIFACT_GROUPS = {
     "DISCOVER": [
         ("js_secrets.txt",              "JS secrets"),
         ("js_endpoints.txt",            "JS endpoints"),
-        ("js_sourcemaps.txt",           "Source maps"),
         ("params_by_endpoint.txt",      "Parameters"),
-        ("param_findings.json",         "Params (JSON)"),
+        ("graphql_findings.json",       "GraphQL report"),
         ("fuzzed_interesting.txt",      "Interesting paths"),
-        ("fuzzed_directories.txt",      "All fuzzed paths"),
     ],
     "SCAN": [
         ("nuclei_critical.txt",         "Nuclei CRIT/HIGH"),
-        ("nuclei_all.txt",              "Nuclei all"),
-        ("nuclei_findings.json",        "Nuclei report"),
         ("cors_critical.txt",           "CORS CRIT/HIGH"),
-        ("cors_findings.json",          "CORS report"),
+        ("smuggling_confirmed.txt",     "Smuggling confirmed"),
+        ("cache_findings.json",         "Cache findings"),
     ],
     "AUDIT": [
-        ("sqli_candidates.txt",         "SQLi candidates"),
-        ("xss_candidates.txt",          "XSS candidates"),
-        ("ssrf_candidates.txt",         "SSRF candidates"),
+        ("auth_findings.json",          "Auth findings"),
+        ("idor_confirmed.txt",          "IDOR confirmed"),
+        ("open_redirect_findings.json", "Redirect findings"),
+        ("race_candidates.txt",         "Race candidates"),
+        ("sqli_confirmed.txt",          "SQLi confirmed"),
+        ("xss_confirmed.txt",           "XSS confirmed"),
+        ("ssrf_confirmed.txt",          "SSRF confirmed"),
+        ("ssti_confirmed.txt",          "SSTI confirmed"),
+        ("xxe_confirmed.txt",           "XXE confirmed"),
     ],
     "REPORT": [
+        ("site_map.md",                 "Site map (markdown)"),
         ("triage_priority.md",          "Triage markdown"),
         ("triage_report.json",          "Triage report"),
         ("triage_next_steps.txt",       "Next steps"),
-        ("triage_by_category.txt",      "By category"),
     ],
 }
 
 
-def show_final_briefing(results: dict[str, str], outdir: Path) -> None:
+# ═════════════════════════════════════════════════════════════════════════════
+#  FINDINGS AGGREGATION FOR THE FINAL BRIEFING
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _aggregate_severity(outdir: Path) -> dict[str, int]:
+    """Sum up CRITICAL/HIGH/MEDIUM/LOW/INFO across every finder JSON."""
+    counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    for stage, fname in FINDINGS_JSON_MAP.items():
+        p = outdir / fname
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text())
+        except Exception:
+            continue
+        raw = data.get("findings") or data.get("candidates") or []
+        if not isinstance(raw, list):
+            continue
+        for f in raw:
+            if not isinstance(f, dict):
+                continue
+            sev = (f.get("severity") or "INFO").upper()
+            if sev not in counts:
+                sev = "INFO"
+            counts[sev] += 1
+    return counts
+
+
+def _top_findings(outdir: Path, n: int = 5) -> list[dict]:
+    """Pull the top N findings by severity across all finder JSONs."""
+    all_findings: list[dict] = []
+    sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+
+    for stage, fname in FINDINGS_JSON_MAP.items():
+        p = outdir / fname
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text())
+        except Exception:
+            continue
+        raw = data.get("findings") or data.get("candidates") or []
+        if not isinstance(raw, list):
+            continue
+        for f in raw:
+            if not isinstance(f, dict):
+                continue
+            all_findings.append({
+                "stage":    stage,
+                "severity": (f.get("severity") or "INFO").upper(),
+                "type":     f.get("vuln_type") or f.get("technique")
+                            or f.get("template_id") or stage,
+                "target":   f.get("target") or f.get("matched_at")
+                            or f.get("url") or "",
+                "evidence": (f.get("evidence") or "")[:100],
+            })
+
+    all_findings.sort(key=lambda x: (
+        sev_rank.get(x["severity"], 5),
+        x["target"],
+    ))
+    return all_findings[:n]
+
+
+def show_final_briefing(results: dict[str, str], outdir: Path,
+                        scan_uuid: str, db_scan_id: Optional[int],
+                        db_failures: int) -> None:
     gap()
     print("  " + hline("═", 71, "cyan"))
     print("  " + bold(f"{S['sword']}  RAID COMPLETE"))
@@ -382,13 +552,52 @@ def show_final_briefing(results: dict[str, str], outdir: Path) -> None:
     if counts["failed"]:
         print(f"  {red(S['cross'])}  Failed       :  {red(str(counts['failed']))}")
 
-    # Show which stages failed
     failed_keys = [k for k, v in results.items() if v == "failed"]
     if failed_keys:
         gap()
         print(f"  {red(S['cross'])}  Failed stages: {red(', '.join(failed_keys))}")
 
-    # Artifacts, grouped by phase
+    # ── Scan identity + persistence status ──────────────────────────────────
+    gap()
+    print("  " + hline("─", 71, "dim"))
+    print(f"  {cyan(S['shield'])}  Scan UUID    : {dim(scan_uuid)}")
+    if db_scan_id:
+        print(f"  {cyan(S['db'])}  Database     : {green(f'synced (id={db_scan_id})')}")
+    elif db_failures:
+        print(f"  {cyan(S['db'])}  Database     : {yellow(f'unreachable ({db_failures} failure(s))')}")
+    elif not DB_MODULE_AVAILABLE:
+        print(f"  {cyan(S['db'])}  Database     : {dim('disabled (db.py not found)')}")
+    elif not _cfg("BRIDGE_ENABLED", False):
+        print(f"  {cyan(S['db'])}  Database     : {dim('disabled (BRIDGE_ENABLED=False)')}")
+    else:
+        print(f"  {cyan(S['db'])}  Database     : {yellow('not synced')}")
+
+    # ── Findings aggregate ──────────────────────────────────────────────────
+    sev = _aggregate_severity(outdir)
+    total = sum(sev.values())
+    if total:
+        gap()
+        print(f"  {cyan(S['shield'])}  Findings     : {bold(str(total))} across all stages")
+        print(f"      {red('CRITICAL')} {sev['CRITICAL']:>4}   "
+              f"{yellow('HIGH')} {sev['HIGH']:>4}   "
+              f"{cyan('MEDIUM')} {sev['MEDIUM']:>4}   "
+              f"{dim('LOW')} {sev['LOW']:>4}   "
+              f"{dim('INFO')} {sev['INFO']:>4}")
+
+        top = _top_findings(outdir, 5)
+        if top:
+            gap()
+            print(f"  {magenta(S['rune_odin'])}  Top findings:")
+            for f in top:
+                sev_color = {
+                    "CRITICAL": "red", "HIGH": "yellow",
+                    "MEDIUM": "cyan", "LOW": "dim", "INFO": "dim",
+                }.get(f["severity"], "dim")
+                print(f"    {c(sev_color, f'[{f["severity"]:<8}]')} "
+                      f"{f['stage']:<10} {f['type']:<24} "
+                      f"{dim(f['target'][:40])}")
+
+    # ── Artifacts, grouped by phase ─────────────────────────────────────────
     gap()
     print("  " + hline("─", 71, "dim"))
     print(f"  {cyan(S['shield'])}  Artifacts in {dim(str(outdir))}:")
@@ -399,7 +608,7 @@ def show_final_briefing(results: dict[str, str], outdir: Path) -> None:
         files = ARTIFACT_GROUPS.get(group, [])
         present = [
             (fname, label) for fname, label in files
-            if (outdir / fname).exists()
+            if (outdir / fname).exists() and (outdir / fname).stat().st_size > 0
         ]
         if not present:
             continue
@@ -409,22 +618,19 @@ def show_final_briefing(results: dict[str, str], outdir: Path) -> None:
         for fname, label in present:
             p = outdir / fname
             size = p.stat().st_size
-            try:
-                line_count = sum(1 for _ in p.open("r", errors="ignore"))
-                unit = "lines"
-            except OSError:
-                line_count = 0
-                unit = "lines"
-            # For .json files, show size only (line counts are misleading)
-            if fname.endswith(".json") or fname.endswith(".md"):
+            if fname.endswith((".json", ".md")):
                 print(
                     f"      {green(S['dot_full'])} {label:<24} "
                     f"{dim(fname):<34} {dim(f'{size:>9,} bytes')}"
                 )
             else:
+                try:
+                    line_count = sum(1 for _ in p.open("r", errors="ignore"))
+                except OSError:
+                    line_count = 0
                 print(
                     f"      {green(S['dot_full'])} {label:<24} "
-                    f"{dim(fname):<34} {dim(f'{line_count:>6} {unit}'):<14} "
+                    f"{dim(fname):<34} {dim(f'{line_count:>6} lines'):<14} "
                     f"{dim(f'{size:>9,} bytes')}"
                 )
         gap()
@@ -433,7 +639,7 @@ def show_final_briefing(results: dict[str, str], outdir: Path) -> None:
         print(f"      {dim(S['dot_empty'])} {dim('(no artifacts produced)')}")
         gap()
 
-    # Final recommendation
+    # ── Next step ───────────────────────────────────────────────────────────
     triage_md = outdir / "triage_priority.md"
     if triage_md.exists() and triage_md.stat().st_size > 0:
         print("  " + hline("─", 71, "dim"))
@@ -448,20 +654,44 @@ def show_final_briefing(results: dict[str, str], outdir: Path) -> None:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  INPUT RESOLUTION HELPERS
+#  INPUT / CONFIG HELPERS
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _pick_existing(outdir: Path, candidates: list[str]) -> Path:
-    """
-    Return the first candidate file that exists and is non-empty.
-    Raises FileNotFoundError with the full list if none match.
-    """
     for name in candidates:
         p = outdir / name
         if p.exists() and p.stat().st_size > 0:
             return p
     tried = ", ".join(candidates)
     raise FileNotFoundError(f"no input file found (tried: {tried})")
+
+
+def _platform_headers() -> dict[str, str]:
+    """Return the merged platform headers, or an empty dict."""
+    hdrs = _cfg("ACTIVE_HEADERS", {})
+    return dict(hdrs) if hdrs else {}
+
+
+def _module_rate(stage: str) -> dict[str, Any]:
+    """Return the per-module rate limit overrides."""
+    overrides = _cfg("MODULE_RATE_LIMITS", {})
+    return overrides.get(stage, {}) if overrides else {}
+
+
+def _oob_domain() -> Optional[str]:
+    """Return the OOB domain if configured, else None."""
+    mode = _cfg("OAST_MODE", "disabled")
+    if mode == "disabled":
+        return None
+    return _cfg("OAST_DOMAIN") or None
+
+
+def _oob_interactsh() -> bool:
+    return _cfg("OAST_MODE", "disabled") == "interactsh"
+
+
+def _test_account(slot: str) -> dict:
+    return (_cfg("TEST_ACCOUNTS", {}) or {}).get(slot, {})
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -476,27 +706,32 @@ def _run_subs(outdir: Path) -> None:
 def _run_dns(outdir: Path) -> None:
     from recon_tools.dns_resolve import resolve_dns
     source = _pick_existing(outdir, ["all_subs.txt"])
-    resolve_dns(source, outdir, wildcard_file=WILDCARD_FILE)
+    r = _module_rate("dns")
+    resolve_dns(
+        source, outdir, wildcard_file=WILDCARD_FILE,
+        threads=r.get("concurrency", 10),
+        rate_limit=r.get("rate_limit", 20),
+    )
 
 
 def _run_takeover(outdir: Path) -> None:
     from recon_tools.takeover_check import run_takeover_check
-    # Prefer wildcard-filtered, then dns-resolved, then raw subdomains
     source = _pick_existing(
-        outdir,
-        ["dns_wildcard_filtered.txt", "dns_resolved.txt", "all_subs.txt"],
+        outdir, ["dns_wildcard_filtered.txt", "dns_resolved.txt", "all_subs.txt"],
     )
-    run_takeover_check(source, outdir)
+    r = _module_rate("takeover")
+    run_takeover_check(source, outdir, http_threads=r.get("concurrency", 15))
 
 
 def _run_live(outdir: Path) -> None:
     from recon_tools.sub_discover import discover_live
-    # Prefer wildcard-filtered over raw subdomains
-    source = _pick_existing(
-        outdir,
-        ["dns_wildcard_filtered.txt", "all_subs.txt"],
+    source = _pick_existing(outdir, ["dns_wildcard_filtered.txt", "all_subs.txt"])
+    r = _module_rate("live")
+    discover_live(
+        source, outdir,
+        threads=r.get("concurrency", 50),
+        rate_limit=r.get("rate_limit", 150),
     )
-    discover_live(source, outdir)
 
 
 def _run_nmap(outdir: Path) -> None:
@@ -519,16 +754,38 @@ def _run_categorize(outdir: Path) -> None:
 
 def _run_js(outdir: Path) -> None:
     from recon_tools.js_analysis import run_js_analysis
-    # Prefer the JS file list from url_harvester, fall back to live hosts
     source = _pick_existing(outdir, ["urls_js_files.txt", "live_urls.txt"])
-    run_js_analysis(source, outdir)
+    r = _module_rate("js")
+    run_js_analysis(source, outdir, download_threads=r.get("concurrency", 15))
 
 
 def _run_params(outdir: Path) -> None:
     from recon_tools.param_discovery import run_param_discovery
-    # Prefer the parameterised URL list (already filtered + deduped)
     source = _pick_existing(outdir, ["urls_with_params.txt", "live_urls.txt"])
-    run_param_discovery(source, outdir, wildcard_file=WILDCARD_FILE)
+    r = _module_rate("params")
+    run_param_discovery(
+        source, outdir,
+        wildcard_file=WILDCARD_FILE,
+        rate_limit=r.get("rate_limit", 3),
+        headers=_platform_headers() or None,
+    )
+
+
+def _run_graphql(outdir: Path) -> None:
+    from auditing_tools.graphql_finder import run_graphql_audit
+    source = _pick_existing(outdir, ["urls_with_params.txt", "all_urls.txt", "live_urls.txt"])
+    # If the user has manually registered two test accounts, use them
+    user_a = _test_account("user_a")
+    user_b = _test_account("user_b")
+    schema_path = outdir / "graphql_schema.json"
+    r = _module_rate("graphql")
+    run_graphql_audit(
+        source, outdir,
+        user_a_cookie=user_a.get("cookie") or None,
+        user_b_cookie=user_b.get("cookie") or None,
+        user_b_id=user_b.get("user_id") or None,
+        threads=r.get("concurrency", 5),
+    )
 
 
 def _run_fuzz(outdir: Path) -> None:
@@ -540,52 +797,148 @@ def _run_fuzz(outdir: Path) -> None:
 def _run_nuclei(outdir: Path) -> None:
     from recon_tools.nuclei_scan import run_nuclei_scan
     source = _pick_existing(outdir, ["live_urls.txt"])
-    run_nuclei_scan(source, outdir)
+    r = _module_rate("nuclei")
+    run_nuclei_scan(
+        source, outdir,
+        rate_limit=r.get("rate_limit", 5),
+        concurrency=r.get("concurrency", 10),
+        headers=[
+            f"{k}: {v}" for k, v in _platform_headers().items()
+        ] or None,
+    )
 
 
 def _run_cors(outdir: Path) -> None:
     from recon_tools.cors_check import run_cors_check
     source = _pick_existing(outdir, ["live_urls.txt"])
-    run_cors_check(source, outdir)
+    r = _module_rate("cors")
+    run_cors_check(
+        source, outdir,
+        threads=r.get("concurrency", 10),
+    )
 
 
-# ── Auditing tools (still stubs — will report as 'missing') ─────────────────
+def _run_smuggling(outdir: Path) -> None:
+    from auditing_tools.smuggling_finder import run_smuggling_audit
+    source = _pick_existing(outdir, ["live_urls.txt"])
+    run_smuggling_audit(source, outdir)
 
-def _run_mapping(outdir: Path) -> None:
-    from auditing_tools.site_mapping import run_site_mapping
-    source = _pick_existing(outdir, ["live_urls.txt", "live_hosts.txt"])
-    run_site_mapping(source, outdir)
+
+def _run_cache(outdir: Path) -> None:
+    from auditing_tools.cache_poisoning_finder import run_cache_audit
+    source = _pick_existing(outdir, ["urls_with_params.txt", "live_urls.txt"])
+    r = _module_rate("cache")
+    run_cache_audit(
+        source, outdir,
+        threads=r.get("concurrency", 5),
+    )
+
+
+def _run_auth(outdir: Path) -> None:
+    from auditing_tools.auth_tester import run_auth_tester
+    source = _pick_existing(outdir, ["urls_with_params.txt", "live_urls.txt"])
+    run_auth_tester(source, outdir)
+
+
+def _run_idor(outdir: Path) -> None:
+    from auditing_tools.idor_finder import run_idor_audit
+    source = _pick_existing(outdir, ["urls_with_params.txt", "all_urls.txt", "live_urls.txt"])
+    user_a = _test_account("user_a")
+    user_b = _test_account("user_b")
+    headers_a = {"Cookie": user_a["cookie"]} if user_a.get("cookie") else None
+    headers_b = {"Cookie": user_b["cookie"]} if user_b.get("cookie") else None
+    schema_path = outdir / "graphql_schema.json"
+    r = _module_rate("idor")
+    run_idor_audit(
+        source, outdir,
+        user_a_headers=headers_a,
+        user_b_headers=headers_b,
+        user_a_id=user_a.get("user_id") or None,
+        user_b_id=user_b.get("user_id") or None,
+        graphql_schema_file=schema_path if schema_path.exists() else None,
+        threads=r.get("concurrency", 5),
+    )
+
+
+def _run_redirect(outdir: Path) -> None:
+    from auditing_tools.open_redirect_finder import run_open_redirect_audit
+    source = _pick_existing(
+        outdir, ["gf_redirect.txt", "urls_with_params.txt", "live_urls.txt"],
+    )
+    run_open_redirect_audit(
+        source, outdir,
+        headers=_platform_headers() or None,
+    )
+
+
+def _run_race(outdir: Path) -> None:
+    from auditing_tools.race_condition import run_race_audit
+    source = _pick_existing(outdir, ["urls_with_params.txt", "all_urls.txt", "live_urls.txt"])
+    run_race_audit(
+        source, outdir,
+        headers=_platform_headers() or None,
+    )
 
 
 def _run_sqli(outdir: Path) -> None:
     from auditing_tools.sqli_finder import run_sqli_scan
-    # Prefer categorized, then parameterised, then all URLs
     source = _pick_existing(
-        outdir,
-        ["gf_sqli.txt", "urls_with_params.txt", "all_urls.txt"],
+        outdir, ["gf_sqli.txt", "urls_with_params.txt", "all_urls.txt"],
     )
-    run_sqli_scan(source, outdir)
+    run_sqli_scan(source, outdir, headers=_platform_headers() or None)
 
 
 def _run_xss(outdir: Path) -> None:
     from auditing_tools.xss_finder import run_xss_scan
     source = _pick_existing(
-        outdir,
-        ["gf_xss.txt", "urls_with_params.txt", "all_urls.txt"],
+        outdir, ["gf_xss.txt", "urls_with_params.txt", "all_urls.txt"],
     )
-    run_xss_scan(source, outdir)
+    run_xss_scan(
+        source, outdir,
+        headers=_platform_headers() or None,
+        oob_domain=_oob_domain(),
+    )
 
 
 def _run_ssrf(outdir: Path) -> None:
     from auditing_tools.ssrf_finder import run_ssrf_scan
     source = _pick_existing(
-        outdir,
-        ["gf_ssrf.txt", "urls_with_params.txt", "all_urls.txt"],
+        outdir, ["gf_ssrf.txt", "urls_with_params.txt", "all_urls.txt"],
     )
-    run_ssrf_scan(source, outdir)
+    run_ssrf_scan(
+        source, outdir,
+        oob_domain=_oob_domain(),
+        use_interactsh=_oob_interactsh(),
+        headers=_platform_headers() or None,
+    )
 
 
-# ── Final report ────────────────────────────────────────────────────────────
+def _run_ssti(outdir: Path) -> None:
+    from auditing_tools.ssti_finder import run_ssti_scan
+    source = _pick_existing(
+        outdir, ["gf_ssti.txt", "urls_with_params.txt", "all_urls.txt"],
+    )
+    run_ssti_scan(source, outdir, headers=_platform_headers() or None)
+
+
+def _run_xxe(outdir: Path) -> None:
+    from auditing_tools.xxe_finder import run_xxe_scan
+    source = _pick_existing(
+        outdir, ["urls_with_params.txt", "all_urls.txt", "live_urls.txt"],
+    )
+    run_xxe_scan(
+        source, outdir,
+        oob_domain=_oob_domain(),
+        use_interactsh=_oob_interactsh(),
+        headers=_platform_headers() or None,
+    )
+
+
+def _run_mapping(outdir: Path) -> None:
+    from auditing_tools.site_mapping import run_site_mapping
+    source = _pick_existing(outdir, ["live_urls.txt", "live_hosts.txt"])
+    run_site_mapping(source, outdir, wildcard_file=WILDCARD_FILE)
+
 
 def _run_triage(outdir: Path) -> None:
     from recon_tools.vuln_triage import run_vuln_triage
@@ -602,22 +955,27 @@ RUNNERS = {
     "categorize": _run_categorize,
     "js":         _run_js,
     "params":     _run_params,
+    "graphql":    _run_graphql,
     "fuzz":       _run_fuzz,
     "nuclei":     _run_nuclei,
     "cors":       _run_cors,
-    "mapping":    _run_mapping,
+    "smuggling":  _run_smuggling,
+    "cache":      _run_cache,
+    "auth":       _run_auth,
+    "idor":       _run_idor,
+    "redirect":   _run_redirect,
+    "race":       _run_race,
     "sqli":       _run_sqli,
     "xss":        _run_xss,
     "ssrf":       _run_ssrf,
+    "ssti":       _run_ssti,
+    "xxe":        _run_xxe,
+    "mapping":    _run_mapping,
     "triage":     _run_triage,
 }
 
 
 def run_one(key: str, outdir: Path, dry_run: bool) -> str:
-    """
-    Execute a single stage. Returns one of:
-      'ok' | 'skipped' | 'missing' | 'failed'
-    """
     if dry_run:
         print(f"  {dim(S['arrow_r'])}  {dim('would run')}  {dim(STAGE_META[key][1])}")
         return "skipped"
@@ -625,21 +983,186 @@ def run_one(key: str, outdir: Path, dry_run: bool) -> str:
     try:
         RUNNERS[key](outdir)
         return "ok"
-
     except ImportError as e:
         print(f"  {yellow(S['warn'])}  {yellow('module not yet implemented:')} {dim(str(e))}")
         return "missing"
-
     except FileNotFoundError as e:
         dep = STAGE_DEPS.get(key)
         hint = f"  (run `{dep}` first)" if dep else ""
         print(f"  {yellow(S['warn'])}  {yellow('missing input:')} {dim(str(e))}{dim(hint)}")
         return "failed"
-
+    except KeyboardInterrupt:
+        raise
     except Exception as e:
         print(f"  {red(S['cross'])}  {red(str(e))}")
         logging.exception(f"Stage '{key}' failed")
         return "failed"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  DATABASE SYNC
+# ═════════════════════════════════════════════════════════════════════════════
+
+_DB_FAIL_COUNT = 0
+_DB_MAX_FAILURES = 3
+
+
+def _normalize_findings(stage: str, data: dict) -> list[dict]:
+    """Extract and normalize findings from a module's JSON output."""
+    raw = data.get("findings")
+    if raw is None:
+        raw = data.get("candidates")
+    if not isinstance(raw, list):
+        return []
+
+    out: list[dict] = []
+    for f in raw:
+        if not isinstance(f, dict):
+            continue
+        vuln_type = (
+            f.get("vuln_type") or f.get("technique")
+            or f.get("template_id") or f.get("xss_type")
+            or f.get("race_class") or f.get("variant")
+            or f.get("probe") or f.get("kind")
+            or stage
+        )
+        target = (
+            f.get("target") or f.get("matched_at")
+            or f.get("url") or f.get("host") or ""
+        )
+        severity = (f.get("severity") or "INFO").upper()
+        if severity not in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
+            severity = "INFO"
+
+        try:
+            confidence = int(f.get("confidence", 50))
+        except (TypeError, ValueError):
+            confidence = 50
+        confidence = max(0, min(100, confidence))
+
+        details = {
+            k: v for k, v in f.items() if k not in (
+                "vuln_type", "technique", "template_id", "xss_type",
+                "race_class", "variant", "probe", "kind", "subtype",
+                "context", "severity", "confidence", "target",
+                "matched_at", "url", "host", "param", "parameter",
+                "payload", "evidence", "request_curl",
+                "oob_token", "oob_confirmed",
+            )
+        }
+
+        out.append({
+            "vuln_type":     str(vuln_type)[:128],
+            "vuln_subtype":  str(f.get("subtype") or f.get("context") or "")[:128],
+            "severity":      severity,
+            "confidence":    confidence,
+            "source_module": stage,
+            "target":        str(target)[:2048],
+            "parameter":     str(f.get("param") or f.get("parameter") or "")[:255],
+            "payload":       str(f.get("payload") or ""),
+            "evidence":      str(f.get("evidence") or ""),
+            "request_curl":  str(f.get("request_curl") or ""),
+            "oob_token":     str(f.get("oob_token") or "")[:128],
+            "oob_confirmed": bool(f.get("oob_confirmed", False)),
+            "details":       details,
+        })
+
+    return out
+
+
+def _collect_oob_tokens(outdir: Path) -> list[str]:
+    """Scan finder JSONs for OOB tokens."""
+    tokens: set[str] = set()
+    for fname in ("ssrf_findings.json", "xss_findings.json", "xxe_findings.json"):
+        p = outdir / fname
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text())
+        except Exception:
+            continue
+        raw = data.get("findings") or []
+        if not isinstance(raw, list):
+            continue
+        for f in raw:
+            if isinstance(f, dict):
+                tok = f.get("oob_token")
+                if tok:
+                    tokens.add(str(tok))
+    return list(tokens)
+
+
+def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> None:
+    """
+    Push findings for this stage to the bridge.
+    Fail-safe: never raises, disables DB after N consecutive failures.
+    """
+    global _DB_FAIL_COUNT
+
+    if not scan_id:
+        return
+    if not DB_MODULE_AVAILABLE or DB is None:
+        return
+    if _DB_FAIL_COUNT >= _DB_MAX_FAILURES:
+        return
+
+    fname = FINDINGS_JSON_MAP.get(stage)
+    if not fname:
+        return
+
+    p = outdir / fname
+    if not p.exists() or p.stat().st_size == 0:
+        return
+
+    try:
+        data = json.loads(p.read_text())
+    except Exception as e:
+        logging.getLogger("argus").debug(f"DB sync: could not parse {fname}: {e}")
+        return
+
+    findings = _normalize_findings(stage, data)
+    if not findings:
+        return
+
+    try:
+        result = DB.upsert_findings(scan_id, findings)
+        if result is None:
+            _DB_FAIL_COUNT += 1
+            logging.getLogger("argus").debug(
+                f"DB sync for {stage} returned None ({_DB_FAIL_COUNT}/{_DB_MAX_FAILURES})"
+            )
+        else:
+            # Reset failure count on success
+            _DB_FAIL_COUNT = 0
+            logging.getLogger("argus").info(
+                f"DB sync {stage}: {result} finding(s) upserted"
+            )
+    except Exception as e:
+        _DB_FAIL_COUNT += 1
+        logging.getLogger("argus").debug(f"DB sync exception on {stage}: {e}")
+
+
+def _sync_oob(scan_id: Optional[int], outdir: Path) -> None:
+    """Push OOB tokens and hits to the bridge."""
+    if not scan_id:
+        return
+    if not DB_MODULE_AVAILABLE or DB is None:
+        return
+    if _DB_FAIL_COUNT >= _DB_MAX_FAILURES:
+        return
+
+    tokens = _collect_oob_tokens(outdir)
+    if not tokens:
+        return
+
+    try:
+        result = DB.sync_oob(scan_id, tokens)
+        if result is not None:
+            logging.getLogger("argus").info(
+                f"DB OOB sync: {result} hit(s) upserted"
+            )
+    except Exception as e:
+        logging.getLogger("argus").debug(f"OOB sync failed: {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -648,19 +1171,22 @@ def run_one(key: str, outdir: Path, dry_run: bool) -> str:
 
 def setup_logging(verbose: bool) -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
-    level = logging.DEBUG if verbose else logging.INFO
+    level = logging.DEBUG if verbose else _cfg("LOG_LEVEL", "INFO")
+    if isinstance(level, str):
+        level = getattr(logging, level.upper(), logging.INFO)
 
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
     for h in list(root.handlers):
         root.removeHandler(h)
 
-    fh = logging.FileHandler(LOG_FILE, mode="a")
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    ))
-    root.addHandler(fh)
+    if _cfg("LOG_TO_FILE", True):
+        fh = logging.FileHandler(LOG_FILE, mode="a")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        ))
+        root.addHandler(fh)
 
     ch = logging.StreamHandler(sys.stdout)
     ch.setLevel(level)
@@ -675,74 +1201,67 @@ def setup_logging(verbose: bool) -> None:
 def build_parser() -> argparse.ArgumentParser:
     epilog_text = f"""
 {dim('Examples:')}
-  {cyan('python3 main.py')}                              run all stages
+  {cyan('python3 main.py')}                              run all 26 stages
   {cyan('python3 main.py --stage recon')}                reconnaissance group
-  {cyan('python3 main.py --stage harvest')}              URL collection only
-  {cyan('python3 main.py --stage discover')}             js + params + fuzz
-  {cyan('python3 main.py --stage scan')}                 nuclei + cors
+  {cyan('python3 main.py --stage harvest')}              URL collection
+  {cyan('python3 main.py --stage discover')}             js + params + graphql + fuzz
+  {cyan('python3 main.py --stage scan')}                 nuclei + cors + smuggling + cache
+  {cyan('python3 main.py --stage audit')}                all 9 audit stages
   {cyan('python3 main.py --stage quick')}                fast pass: recon → urls → triage
-  {cyan('python3 main.py --stage subs,nmap')}            specific stages
-  {cyan('python3 main.py --stage all --skip audit')}     skip the audit stubs
+  {cyan('python3 main.py --stage sqli,xss,ssrf')}        specific stages
+  {cyan('python3 main.py --stage all --skip fuzz')}      skip the loud stages
   {cyan('python3 main.py --stage all --fail-fast')}      stop at first failure
-  {cyan('python3 main.py --dry-run')}                    preview — no commands executed
+  {cyan('python3 main.py --dry-run')}                    preview only
   {cyan('python3 main.py --stages')}                     list stage identifiers
+  {cyan('python3 main.py --scan-id <uuid>')}             resume / append to a scan
+  {cyan('python3 main.py --no-db')}                      force-disable DB sync
 
 {dim('Stage groups:')}
   {dim('recon')}      subs → dns → takeover → live → nmap
   {dim('harvest')}    urls → categorize
-  {dim('discover')}   js → params → fuzz
-  {dim('scan')}       nuclei → cors
-  {dim('audit')}      mapping → sqli → xss → ssrf  (stubs)
-  {dim('report')}     triage
-  {dim('quick')}      fast reconnaissance pass
+  {dim('discover')}   js → params → graphql → fuzz
+  {dim('scan')}       nuclei → cors → smuggling → cache
+  {dim('audit')}      auth → idor → redirect → race → sqli → xss → ssrf → ssti → xxe
+  {dim('report')}     mapping → triage
+  {dim('quick')}      subs → dns → live → urls → categorize → triage
+
+{dim('Persistence:')}
+  Local artifacts always go to {dim('output/')}. DB sync requires
+  {dim('config.py')} + {dim('db.py')} and {dim('BRIDGE_ENABLED=True')}.
 
 {dim('Exit codes:')}
   {dim('0  success')}    {dim('1  stage failure')}    {dim('2  environment error')}    {dim('130  interrupted')}
-
-{dim('Reminder:')} run {cyan('python3 tools.py --check')} first to verify dependencies.
 """
     parser = argparse.ArgumentParser(
         prog="argus",
         description=(
             "Argus — the all-seeing watchman of the digital longship. "
-            "A modular bug bounty reconnaissance framework."
+            "A modular bug bounty reconnaissance and audit framework."
         ),
         epilog=epilog_text,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--stage", default="all", metavar="NAME",
-        help="group name, stage name, or comma-separated list   (default: all)",
-    )
-    parser.add_argument(
-        "--skip", metavar="STAGES",
-        help="comma-separated stages to skip (e.g. 'audit' or 'sqli,xss,ssrf')",
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true",
-        help="preview stages without executing anything",
-    )
-    parser.add_argument(
-        "--fail-fast", action="store_true",
-        help="stop at the first failing stage",
-    )
-    parser.add_argument(
-        "--stages", action="store_true",
-        help="list available stage identifiers and exit",
-    )
-    parser.add_argument(
-        "--verbose", "-v", action="store_true",
-        help="enable debug logging to stdout",
-    )
-    parser.add_argument(
-        "--no-color", action="store_true",
-        help="disable ANSI color output",
-    )
-    parser.add_argument(
-        "--version", action="version",
-        version=f"Argus v{VERSION} ({CODENAME})",
-        help="show version and exit",
-    )
+    parser.add_argument("--stage", default="all", metavar="NAME",
+                        help="group name, stage name, or comma-separated list (default: all)")
+    parser.add_argument("--skip", metavar="STAGES",
+                        help="comma-separated stages to skip")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="preview stages without executing anything")
+    parser.add_argument("--fail-fast", action="store_true",
+                        help="stop at the first failing stage")
+    parser.add_argument("--stages", action="store_true",
+                        help="list available stage identifiers and exit")
+    parser.add_argument("--scan-id", metavar="UUID",
+                        help="resume / append findings to an existing scan UUID")
+    parser.add_argument("--no-db", action="store_true",
+                        help="force-disable remote DB sync for this run")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="enable debug logging to stdout")
+    parser.add_argument("--no-color", action="store_true",
+                        help="disable ANSI color output")
+    parser.add_argument("--version", action="version",
+                        version=f"Argus v{VERSION} ({CODENAME})",
+                        help="show version and exit")
     return parser
 
 
@@ -757,7 +1276,6 @@ def print_stages() -> None:
     print("  " + hline("═", 71, "cyan"))
     gap()
 
-    # Group by category
     categories: dict[str, list[tuple[str, str]]] = {}
     for key, (cat, title) in STAGE_META.items():
         categories.setdefault(cat, []).append((key, title))
@@ -768,20 +1286,33 @@ def print_stages() -> None:
             continue
         print(f"  {magenta(cat)}")
         for key, title in entries:
-            # Depends-on hint
             dep = STAGE_DEPS.get(key)
             dep_str = f"  {dim(f'(needs {dep})')}" if dep else ""
             print(f"    {cyan(key):<12} {title}{dep_str}")
         gap()
 
     print(f"  {magenta('GROUPS')}")
-    for group_name in ("recon", "harvest", "discover", "scan", "audit", "report", "quick", "all"):
+    for group_name in ("recon", "harvest", "discover", "scan",
+                       "audit", "report", "quick", "all"):
         stages = STAGE_GROUPS[group_name]
         if len(stages) <= 5:
             preview = " → ".join(stages)
         else:
-            preview = " → ".join(stages[:4]) + " → ..."
+            preview = " → ".join(stages[:4]) + f" → ... (+{len(stages) - 4})"
         print(f"    {cyan(group_name):<12} {dim(preview)}")
+    gap()
+
+    print(f"  {magenta('INTEGRATIONS')}")
+    cfg_state = green("loaded") if CFG_LOADED else yellow("not found")
+    db_state = (
+        green(f"available ({_cfg('BRIDGE_URL', '')})")
+        if DB_MODULE_AVAILABLE and _cfg("BRIDGE_ENABLED", False)
+        else dim("disabled")
+    )
+    print(f"    config.py    {cfg_state}")
+    print(f"    db.py        {db_state}")
+    print(f"    platform     {bold(_cfg('ACTIVE_PLATFORM', '(none)'))}")
+    print(f"    oob domain   {dim(_cfg('OAST_DOMAIN', '(not set)'))}")
     gap()
 
     print("  " + hline("═", 71, "cyan"))
@@ -803,8 +1334,6 @@ def load_wildcards() -> list[str]:
 
 
 def validate_environment(stages: list[str]) -> tuple[bool, str]:
-    """Return (ok, error_message)."""
-    # wildcard.txt is only required if the `subs` stage is in play
     if "subs" in stages:
         if not WILDCARD_FILE.exists():
             return False, (
@@ -812,10 +1341,7 @@ def validate_environment(stages: list[str]) -> tuple[bool, str]:
                 "create it with one root domain per line."
             )
         if not load_wildcards():
-            return False, (
-                "wildcard.txt is empty — add at least one root domain."
-            )
-
+            return False, "wildcard.txt is empty — add at least one root domain."
     OUTPUT_DIR.mkdir(exist_ok=True)
     return True, ""
 
@@ -830,7 +1356,6 @@ def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     parser = build_parser()
 
-    # Intercept help / no-args so we can show the banner first
     if not argv or "--help" in argv or "-h" in argv:
         show_banner()
         parser.print_help()
@@ -839,20 +1364,18 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    # Color control must happen before any styled output
     if args.no_color or not sys.stdout.isatty():
         _USE_COLOR = False
 
-    # --stages catalog mode
     if args.stages:
         show_banner()
         print_stages()
         return 0
 
-    # Setup file logging before any stage runs
     setup_logging(args.verbose)
+    log = logging.getLogger("argus")
 
-    # Resolve stage list
+    # ── Resolve stage list ──────────────────────────────────────────────────
     try:
         stages = resolve_stages(args.stage)
     except ValueError as e:
@@ -861,7 +1384,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {dim('Run')} {cyan('python3 main.py --stages')} {dim('to see valid identifiers.')}\n")
         return 2
 
-    # Apply --skip
     if args.skip:
         try:
             skip_list = resolve_stages(args.skip)
@@ -873,13 +1395,13 @@ def main(argv: list[str] | None = None) -> int:
         removed = [s for s in stages if s in skip_set]
         stages = [s for s in stages if s not in skip_set]
         if removed:
-            logging.getLogger("argus").info(f"Skipping: {', '.join(removed)}")
+            log.info(f"Skipping: {', '.join(removed)}")
         if not stages:
             show_banner()
             print(f"\n  {red(S['cross'])}  All stages were skipped — nothing to run.\n")
             return 2
 
-    # Environment checks
+    # ── Environment ─────────────────────────────────────────────────────────
     ok, err = validate_environment(stages)
     if not ok:
         show_banner()
@@ -888,23 +1410,95 @@ def main(argv: list[str] | None = None) -> int:
 
     wildcards = load_wildcards()
 
-    # Begin
-    show_banner()
-    show_briefing(wildcards, stages, OUTPUT_DIR, args.dry_run, args.fail_fast)
+    # ── Database availability decision ──────────────────────────────────────
+    db_available = (
+        DB_MODULE_AVAILABLE
+        and DB is not None
+        and DB.available
+        and _cfg("BRIDGE_ENABLED", False)
+        and not args.no_db
+    )
 
-    # Execute
+    # Determine final DB status string for the briefing
+    if args.no_db:
+        db_status = dim("disabled (--no-db)")
+    elif not DB_MODULE_AVAILABLE:
+        db_status = dim("disabled (db.py not found)")
+    elif not _cfg("BRIDGE_ENABLED", False):
+        db_status = dim("disabled (BRIDGE_ENABLED=False)")
+    elif not DB.available:
+        db_status = yellow("unavailable (bridge client not initialised)")
+    else:
+        db_status = green(f"connected to {_cfg('BRIDGE_URL', '(unknown)')}")
+
+    # ── Scan identity ───────────────────────────────────────────────────────
+    scan_uuid = args.scan_id or str(_uuid.uuid4())
+
+    show_banner()
+    show_briefing(
+        wildcards, stages, OUTPUT_DIR,
+        args.dry_run, args.fail_fast,
+        db_status=db_status,
+        platform=_cfg("ACTIVE_PLATFORM", ""),
+    )
+
+    # ── Register scan in the DB ─────────────────────────────────────────────
+    db_scan_id: Optional[int] = None
+    if db_available and not args.dry_run:
+        try:
+            db_scan_id = DB.create_scan(
+                scan_uuid=scan_uuid,
+                wildcards=wildcards,
+                platform=_cfg("ACTIVE_PLATFORM", ""),
+                pipeline=stages,
+            )
+            if db_scan_id:
+                log.info(f"  Scan registered (db id={db_scan_id})")
+            else:
+                log.warning("  DB create_scan returned None — continuing locally")
+        except Exception as e:
+            log.warning(f"  DB create_scan failed: {e} — continuing locally")
+
+    # ── Execute ─────────────────────────────────────────────────────────────
     results: dict[str, str] = {}
     total = len(stages)
     interrupted = False
+    scan_start = time.monotonic()
 
     try:
         for idx, key in enumerate(stages, start=1):
             show_stage_header(idx, total, key)
+
+            stage_start = time.monotonic()
             result = run_one(key, OUTPUT_DIR, args.dry_run)
+            stage_duration_ms = int((time.monotonic() - stage_start) * 1000)
+
             results[key] = result
             show_stage_result(key, result)
 
-            # Fail-fast handling
+            # Save stage record + sync artifacts to DB
+            if db_scan_id and not args.dry_run:
+                try:
+                    artifacts = [
+                        str(OUTPUT_DIR / f)
+                        for f in STAGE_ARTIFACTS.get(key, [])
+                        if (OUTPUT_DIR / f).exists()
+                    ]
+                    DB.save_stage(
+                        scan_id=db_scan_id,
+                        stage=key,
+                        status=result,
+                        duration_ms=stage_duration_ms,
+                        artifacts=artifacts,
+                        stats={},
+                    )
+                except Exception as e:
+                    log.debug(f"  DB save_stage failed for {key}: {e}")
+
+                if result == "ok":
+                    _sync_stage_artifacts(db_scan_id, key, OUTPUT_DIR)
+
+            # Fail-fast
             if args.fail_fast and result == "failed":
                 gap()
                 print("  " + hline("─", 71, "red"))
@@ -921,8 +1515,30 @@ def main(argv: list[str] | None = None) -> int:
               f"{dim('Returning to port with what we have.')}")
         print("  " + hline("─", 71, "yellow"))
 
-    # Final panel
-    show_final_briefing(results, OUTPUT_DIR)
+    # ── Sync OOB + finish scan ──────────────────────────────────────────────
+    scan_elapsed = time.monotonic() - scan_start
+    if db_scan_id and not args.dry_run:
+        try:
+            _sync_oob(db_scan_id, OUTPUT_DIR)
+        except Exception as e:
+            log.debug(f"  DB oob sync failed: {e}")
+
+        try:
+            DB.finish_scan(scan_uuid, stats={
+                "stages":   results,
+                "elapsed":  round(scan_elapsed, 2),
+                "interrupted": interrupted,
+            })
+        except Exception as e:
+            log.debug(f"  DB finish_scan failed: {e}")
+
+    # ── Final panel ─────────────────────────────────────────────────────────
+    show_final_briefing(
+        results, OUTPUT_DIR,
+        scan_uuid=scan_uuid,
+        db_scan_id=db_scan_id,
+        db_failures=_DB_FAIL_COUNT,
+    )
 
     if interrupted:
         return 130
