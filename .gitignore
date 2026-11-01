@@ -1,0 +1,171 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SECURITY-CRITICAL — never commit these
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Recon output: contains target domains, live hosts, potential findings.
+# Leaking this publicly = leaking your scope to competitors. Don't.
+output/
+!output/.gitkeep
+
+# Your in-scope wildcards. This is YOUR bug bounty program list.
+# Committing this tells the world exactly what you're hunting.
+wildcard.txt
+
+# Out-of-scope list — same concern as wildcard.txt
+out_of_scope.txt
+
+# Raw recon artifacts (in case you drop them at repo root by accident)
+all_subs.txt
+live_hosts.txt
+live_urls.txt
+live_hosts_ips.txt
+all_urls.txt
+interesting_urls.txt
+*_candidates.txt
+nmap_fast.*
+nmap_full.*
+httpx_responses/
+
+# Secrets, API keys, credentials
+.env
+.env.*
+*.env
+secrets.yaml
+secrets.yml
+credentials.json
+config.local.*
+*.pem
+*.key
+
+# Tool configs that may contain API keys
+.config/subfinder/
+.config/nuclei/
+.config/httpx/
+.config/amass/
+.subfinder/
+.nuclei/
+.httpx/
+
+# Burp / Caido / proxy project files (often contain target traffic)
+*.burp
+*.caido
+*.har
+
+# Shell history that might reveal targets or tokens
+.bash_history
+.zsh_history
+.history
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+virtualenv/
+.python-version
+
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+wheels/
+.eggs/
+
+# Test & lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# pip
+pip-log.txt
+pip-delete-this-directory.txt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Go (in case you ever add Go modules or build local binaries)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Built binaries at repo root
+/argus
+/argus.exe
+/*.exe
+/*.test
+bin/
+
+# Go module cache / vendor (usually not committed unless you vendor)
+vendor/
+go.sum.bak
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logs & temp
+# ─────────────────────────────────────────────────────────────────────────────
+
+*.log
+*.log.*
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Editor / IDE
+# ─────────────────────────────────────────────────────────────────────────────
+
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.code-workspace
+.project
+.classpath
+.settings/
+*.iml
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OS-specific
+# ─────────────────────────────────────────────────────────────────────────────
+
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Argus-specific: keep the skeleton but ignore the guts
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Keep the output directory structure but ignore its contents
+output/.gitkeep
