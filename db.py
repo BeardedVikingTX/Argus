@@ -299,6 +299,44 @@ class ArgusDB:
         r = self._call("query.content_fuzz", payload)
         return r.get("content_fuzz") if r and r.get("ok") else None
 
+    def upsert_cors_findings(
+        self, scan_id: int, findings: list[dict], chunk_size: int = 300,
+    ) -> Optional[int]:
+        """Upsert CORS findings in chunks."""
+        if not findings:
+            return 0
+
+        total = 0
+        for i in range(0, len(findings), chunk_size):
+            chunk = findings[i:i + chunk_size]
+            r = self._call("cors_findings.upsert", {
+                "scan_id":       scan_id,
+                "cors_findings": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"cors_findings.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_cors_findings(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        min_score: Optional[int] = None, severity: Optional[str] = None,
+        acac: Optional[bool] = None,
+    ) -> Optional[list]:
+        payload = {"scan_uuid": scan_uuid, "limit": limit, "offset": offset}
+        if min_score is not None:
+            payload["min_score"] = min_score
+        if severity is not None:
+            payload["severity"] = severity
+        if acac is not None:
+            payload["acac"] = acac
+        r = self._call("query.cors_findings", payload)
+        return r.get("cors_findings") if r and r.get("ok") else None
+
     def get_site_pages(
         self, scan_uuid: str, limit: int = 100, offset: int = 0,
         page_kind: Optional[str] = None, is_auth: Optional[bool] = None,

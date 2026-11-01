@@ -828,6 +828,9 @@ def _run_cors(outdir: Path) -> None:
     run_cors_check(
         source, outdir,
         threads=r.get("concurrency", 10),
+        rate_limit=r.get("rate_limit", 100),
+        headers=_platform_headers() or None,
+        scan_id=_CURRENT_SCAN_ID,
     )
 
 
@@ -1015,7 +1018,7 @@ def run_one(key: str, outdir: Path, dry_run: bool) -> str:
 # ═════════════════════════════════════════════════════════════════════════════
 #  DATABASE SYNC
 # ═════════════════════════════════════════════════════════════════════════════
-
+_CURRENT_SCAN_ID: Optional[int] = None
 _DB_FAIL_COUNT = 0
 _DB_MAX_FAILURES = 3
 
@@ -1591,9 +1594,22 @@ def main(argv: list[str] | None = None) -> int:
         platform=_cfg("ACTIVE_PLATFORM", ""),
     )
 
-    # ── Register scan in the DB ─────────────────────────────────────────────
+    # ── Register scan in DB ────────────────────────────────────────────────
+    # Notes:
+    #   • create_scan is idempotent — if scan_uuid already exists in the DB,
+    #     the bridge returns the existing row's id instead of inserting a
+    #     duplicate. So resuming with the same UUID "just works."
+    #   • When --scan-id is passed, we log "resumed" (user intent).
+    #   • When --scan-id is not passed, a fresh UUID was generated above and
+    #     we log "registered" (new scan).
+    #   • --dry-run and --no-db skip registration entirely.
     db_scan_id: Optional[int] = None
-    if db_available and not args.dry_run:
+
+    if args.dry_run:
+        log.debug("  Dry-run: skipping DB scan registration")
+    elif not db_available:
+        log.debug("  DB disabled: skipping scan registration")
+    else:
         try:
             db_scan_id = DB.create_scan(
                 scan_uuid=scan_uuid,
@@ -1602,11 +1618,29 @@ def main(argv: list[str] | None = None) -> int:
                 pipeline=stages,
             )
             if db_scan_id:
-                log.info(f"  Scan registered (db id={db_scan_id})")
+                intent = "resumed" if args.scan_id else "registered"
+                log.info(
+                    f"  Scan {intent} (db id={db_scan_id}, "
+                    f"uuid={scan_uuid[:8]}…)"
+                )
             else:
-                log.warning("  DB create_scan returned None — continuing locally")
+                log.warning(
+                    "  DB create_scan returned no id — "
+                    "continuing locally (self-sync will be skipped)"
+                )
         except Exception as e:
-            log.warning(f"  DB create_scan failed: {e} — continuing locally")
+            log.warning(
+                f"  DB create_scan failed: {e} — "
+                "continuing locally (self-sync will be skipped)"
+            )
+
+    # Expose scan_id to self-syncing modules (cors_check, content_fuzz, etc.)
+    # They check this global and self-sync only when it's non-None.
+    global _CURRENT_SCAN_ID
+    _CURRENT_SCAN_ID = db_scan_id
+
+    if db_scan_id:
+        log.debug(f"  _CURRENT_SCAN_ID = {db_scan_id} (available to self-syncing stages)")
 
     # ── Execute ─────────────────────────────────────────────────────────────
     results: dict[str, str] = {}
