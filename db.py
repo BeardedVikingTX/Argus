@@ -537,6 +537,54 @@ class ArgusDB:
         r = self._call("query.url_categorize", payload)
         return r.get("url_categorize") if r and r.get("ok") else None
 
+    def upsert_urls(
+        self, scan_id: int, urls: list[dict], chunk_size: int = 300,
+    ) -> Optional[int]:
+        """
+        Upsert harvested URLs in chunks.
+
+        URLs can number in the tens of thousands per scan. 300/request keeps
+        each payload under 500KB while minimizing round-trips.
+        """
+        if not urls:
+            return 0
+
+        total = 0
+        for i in range(0, len(urls), chunk_size):
+            chunk = urls[i:i + chunk_size]
+            r = self._call("urls.upsert", {"scan_id": scan_id, "urls": chunk})
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"urls.upsert chunk failed ({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_urls(
+        self, scan_uuid: str, limit: int = 1000, offset: int = 0,
+        interesting_only: bool = False, form_only: bool = False,
+        params_only: bool = False, js_only: bool = False,
+        alive_only: bool = False, source: Optional[str] = None,
+        host: Optional[str] = None,
+    ) -> Optional[list]:
+        payload = {
+            "scan_uuid":       scan_uuid,
+            "limit":           limit,
+            "offset":          offset,
+            "interesting_only": interesting_only,
+            "form_only":       form_only,
+            "params_only":     params_only,
+            "js_only":         js_only,
+            "alive_only":      alive_only,
+        }
+        if source is not None:
+            payload["source"] = source
+        if host is not None:
+            payload["host"] = host
+        r = self._call("query.urls", payload)
+        return r.get("urls") if r and r.get("ok") else None
+
     def upsert_subdomains(
         self, scan_id: int, subdomains: list[dict], chunk_size: int = 500,
     ) -> Optional[int]:

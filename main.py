@@ -780,7 +780,14 @@ def _run_nmap(outdir: Path) -> None:
 def _run_urls(outdir: Path) -> None:
     from recon_tools.url_harvester import run_url_harvest
     source = _pick_existing(outdir, ["live_urls.txt"])
-    run_url_harvest(source, outdir, wildcard_file=WILDCARD_FILE)
+    r = _module_rate("urls")
+    run_url_harvest(
+        source, outdir, wildcard_file=WILDCARD_FILE,
+        katana_rate_limit=r.get("rate_limit", 50),
+        katana_concurrency=r.get("concurrency", 10),
+        headers=_platform_headers() or None,
+        scan_id=_CURRENT_SCAN_ID,
+    )
 
 
 def _run_categorize(outdir: Path) -> None:
@@ -1167,6 +1174,44 @@ def _to_nmap_host_payload(h: dict) -> Optional[dict]:
         "first_seen":      h.get("first_seen"),
     }
 
+def _to_url_payload(u: dict) -> Optional[dict]:
+    """Convert a url_harvest.json record into the wire shape."""
+    url = u.get("url") or ""
+    if not url:
+        return None
+    parsed = urllib.parse.urlparse(url)
+    return {
+        "url":                url,
+        "host":               parsed.hostname or "",
+        "path":               parsed.path or "/",
+        "query_string":       parsed.query or "",
+        "sources":            u.get("sources") or [],
+        "source_count":       int(u.get("source_count") or 1),
+        "methods":            u.get("methods") or [],
+        "tags":               u.get("tags") or [],
+        "attributes":         u.get("attributes") or [],
+        "form_actions":       u.get("form_actions") or [],
+        "is_form":            bool(u.get("is_form")),
+        "has_params":         bool(u.get("has_params")),
+        "is_js":              bool(u.get("is_js")),
+        "is_interesting":     bool(u.get("is_interesting")),
+        "interesting_reasons": u.get("interesting_reasons") or [],
+        "status_code":        u.get("status"),
+        "content_type":       u.get("content_type", ""),
+        "content_length":     u.get("content_length"),
+        "title":              u.get("title", ""),
+        "webserver":          u.get("webserver", ""),
+        "technologies":       u.get("technologies") or [],
+        "final_url":          u.get("final_url", ""),
+        "redirect_chain":     u.get("redirect_chain") or [],
+        "response_time":      u.get("response_time", ""),
+        "resolved_ip":        u.get("resolved_ip", ""),
+        "cname":              u.get("cname", ""),
+        "alive":              bool(u.get("alive")),
+        "auth_enabled":       bool(u.get("auth_enabled")),
+        "first_seen":         _format_dt(u.get("first_seen")),
+    }
+
 def _to_takeover_payload(f: dict) -> Optional[dict]:
     """Convert a takeover_findings.json record into the wire shape."""
     subdomain = f.get("subdomain") or ""
@@ -1519,6 +1564,23 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
                 else:
                     _DB_FAIL_COUNT = 0
                     log.info(f"DB sync takeover: {result} finding(s) upserted")
+                return
+
+            elif kind == "urls":
+                items = data.get("urls") or []
+                if not items:
+                    return
+                payloads = [_to_url_payload(u) for u in items]
+                payloads = [p for p in payloads if p]
+                if not payloads:
+                    return
+                result = DB.upsert_urls(scan_id, payloads)
+                if result is None:
+                    _DB_FAIL_COUNT += 1
+                    log.debug("DB sync urls returned None")
+                else:
+                    _DB_FAIL_COUNT = 0
+                    log.info(f"DB sync urls: {result} URL(s) upserted")
                 return
 
             elif kind == "url_categorize":
