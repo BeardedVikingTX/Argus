@@ -35,7 +35,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-import time
+import tempfile
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,12 +45,12 @@ from typing import Optional
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 IS_ROOT = os.geteuid() == 0
 HOME = Path.home()
-GO_BIN_DIR = HOME / "go" / "bin"
 GO_INSTALL_DIR = Path("/usr/local/go")
+CARGO_BIN_DIR = HOME / ".cargo" / "bin"
 SECLISTS_PATHS = [Path("/usr/share/seclists"), Path("/opt/seclists")]
 LOG_DIR = Path(__file__).parent / "output"
 
@@ -77,8 +77,8 @@ class Tool:
     """One installable dependency."""
     name: str
     category: str                     # base | recon | scan | audit | util | resource
-    method: str                       # apt | go | git | special
-    package: str                      # apt pkg, go module path, or git URL
+    method: str                       # apt | go | git | cargo | deb | special
+    package: str                      # apt pkg, go module path, git URL, crate name, or deb URL
     binary: Optional[str] = None      # binary name if different from `name`
     sudo: bool = False                # requires sudo for install
     check_cmd: Optional[str] = None   # shell command to verify installation
@@ -102,8 +102,13 @@ BASE_PACKAGES = [
     Tool("dnsutils",       "base", "apt", "dnsutils",       sudo=True,  check_cmd="dig -v", description="DNS utilities (dig)"),
     Tool("whois",          "base", "apt", "whois",          sudo=True,  description="WHOIS lookups"),
     Tool("net-tools",      "base", "apt", "net-tools",      sudo=True,  check_cmd="netstat -V", description="Network utilities (netstat)"),
-    Tool("python3-requests","base","apt", "python3-requests", sudo=True, check_cmd="python3 -c 'import requests'", description="Python HTTP library"),
-    Tool("python3-venv",   "base", "apt", "python3-venv",   sudo=True,  description="Python venv support"),
+    # PEP 668-safe Python libs: use the system apt package, not pip
+    Tool("python3-requests","base","apt", "python3-requests", sudo=True,
+         check_cmd="/usr/bin/python3 -c 'import requests'",
+         description="Python HTTP library (PEP 668-safe via apt)"),
+    Tool("python3-venv",   "base", "apt", "python3-venv",   sudo=True,
+         check_cmd="/usr/bin/python3 -c 'import venv'",
+         description="Python venv support"),
 ]
 
 # ── Scanning / auditing tools (installed via apt where packaged) ─────────────
@@ -129,14 +134,34 @@ GO_TOOLS = [
 
     # Fuzzing
     Tool("ffuf",        "recon", "go", "github.com/ffuf/ffuf/v2@latest",           check_cmd="ffuf -V", description="Fast web fuzzer"),
-    Tool("feroxbuster", "recon", "go", "github.com/epi052/feroxbuster@latest",     check_cmd="feroxbuster --version", description="Recursive content discovery"),
-
-    # Auditing
-    Tool("dalfox",      "audit", "go", "github.com/hahwul/dalfox/v2@latest",       check_cmd="dalfox -version", description="XSS scanner"),
 
     # OSINT / URL discovery
     Tool("amass",       "recon", "go", "github.com/owasp-amass/amass/v4/...@master", check_cmd="amass -version", description="OSINT subdomain enum"),
     Tool("gau",         "recon", "go", "github.com/lc/gau/v2/cmd/gau@latest",       check_cmd="gau -version", description="GetAllUrls fetcher"),
+]
+
+# ── Tools that do NOT fit go/apt/cargo cleanly ───────────────────────────────
+# feroxbuster: Rust tool, install via official .deb release
+# dalfox: v3 is Rust rewrite, install via cargo
+SPECIAL_TOOLS = [
+    Tool(
+        "feroxbuster",
+        category="recon",
+        method="deb",
+        package="https://github.com/epi052/feroxbuster/releases/latest/download/feroxbuster_amd64.deb.zip",
+        sudo=True,
+        check_cmd="feroxbuster --version",
+        description="Recursive content discovery (Rust, prebuilt .deb)",
+    ),
+    Tool(
+        "dalfox",
+        category="audit",
+        method="cargo",
+        package="dalfox",
+        sudo=False,
+        check_cmd="dalfox --version",
+        description="XSS scanner (Rust v3, via cargo)",
+    ),
 ]
 
 # ── Wordlist resources ───────────────────────────────────────────────────────
@@ -153,7 +178,7 @@ RESOURCE_TOOLS = [
 ]
 
 # Combined lookup
-ALL_TOOLS = BASE_PACKAGES + APT_SECURITY_TOOLS + GO_TOOLS + RESOURCE_TOOLS
+ALL_TOOLS = BASE_PACKAGES + APT_SECURITY_TOOLS + GO_TOOLS + SPECIAL_TOOLS + RESOURCE_TOOLS
 TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
 
 
@@ -251,58 +276,55 @@ def cmd_available(binary: str) -> bool:
 
 
 def run_check(check_cmd: str, timeout: int = 10) -> bool:
-    """Run a check_cmd shell string (list-split, no shell). Returns True if exit 0."""
+    """
+    Run a check command. Uses /bin/sh -c when shell operators are present,
+    so `test -d /a || test -d /b` actually works.
+    """
     if not check_cmd:
         return False
-    try:
-        cmd = shlex.split(check_cmd)
-    except ValueError:
-        return False
-    # For python module checks that use -c, we must not split the quoted part
-    if " -c " in check_cmd:
-        cmd = ["python3", "-c", check_cmd.split(" -c ", 1)[1].strip("'\"")]
+
+    # If the command contains shell metacharacters, run through sh
+    shell_metachars = set("|&;()<>")
+    if any(ch in check_cmd for ch in shell_metachars):
+        cmd = ["/bin/sh", "-c", check_cmd]
+    else:
+        try:
+            cmd = shlex.split(check_cmd)
+        except ValueError:
+            return False
+
     ok, _, _ = run(cmd, timeout=timeout, quiet=True)
     return ok
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Privilege & environment setup
+# Go environment resolution (fixes the hardcoded ~/go/bin bug)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def detect_debian() -> bool:
-    """Confirm we're on a Debian-derived distro."""
-    os_release = Path("/etc/os-release")
-    if not os_release.exists():
-        return False
-    content = os_release.read_text()
-    markers = ("debian", "ubuntu", "kali", "parrot", "pop", "mint", "raspbian")
-    id_line = next((l for l in content.splitlines() if l.startswith("ID=")), "")
-    like_line = next((l for l in content.splitlines() if l.startswith("ID_LIKE=")), "")
-    combined = (id_line + " " + like_line).lower()
-    return any(m in combined for m in markers)
+def go_bin_dir() -> Path:
+    """
+    Resolve the actual directory `go install` writes binaries to.
+    Order: GOBIN → GOPATH[0]/bin → ~/go/bin (go's own default).
+    """
+    ok, out, _ = run(["go", "env", "GOBIN"], quiet=True)
+    if ok and out.strip():
+        return Path(out.strip())
 
+    ok, out, _ = run(["go", "env", "GOPATH"], quiet=True)
+    if ok and out.strip():
+        # GOPATH can be colon-separated; binaries go in the first entry's bin/
+        return Path(out.strip().split(":")[0]) / "bin"
 
-def cache_sudo() -> bool:
-    """Ensure sudo credentials are cached for the session."""
-    if IS_ROOT:
-        return True
-    # Already passwordless?
-    ok, _, _ = run(["sudo", "-n", "true"], quiet=True)
-    if ok:
-        log.debug("sudo: passwordless (cached)")
-        return True
-    # Prompt once
-    log.info(f"  {_c('yellow', '!')} Caching sudo credentials (you may be prompted)...")
-    try:
-        rc = subprocess.run(["sudo", "-v"]).returncode
-        return rc == 0
-    except FileNotFoundError:
-        return False
+    return HOME / "go" / "bin"
 
 
 def ensure_paths() -> None:
-    """Prepend Go binary directories to PATH for this process."""
-    additions = [str(GO_BIN_DIR), "/usr/local/go/bin"]
+    """Prepend Go, Cargo, and system Go bin directories to PATH for this process."""
+    additions = [
+        str(go_bin_dir()),
+        str(GO_INSTALL_DIR / "bin"),
+        str(CARGO_BIN_DIR),
+    ]
     current = os.environ.get("PATH", "")
     for p in additions:
         if p not in current.split(":"):
@@ -314,9 +336,15 @@ def get_go_version() -> Optional[str]:
     ok, out, _ = run(["go", "version"], quiet=True)
     if not ok:
         return None
-    # "go version go1.22.1 linux/amd64"
     parts = out.split()
     return parts[2] if len(parts) >= 3 else out.strip()
+
+
+def get_cargo_version() -> Optional[str]:
+    ok, out, _ = run(["cargo", "--version"], quiet=True)
+    if not ok:
+        return None
+    return out.strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -335,7 +363,7 @@ def latest_go_version() -> Optional[str]:
         for release in data:
             if not release.get("stable", False):
                 continue
-            return release["version"]  # e.g. "go1.22.1"
+            return release["version"]
     except Exception as e:
         log.debug(f"latest_go_version failed: {e}")
     return None
@@ -363,7 +391,6 @@ def install_go() -> bool:
         return False
 
     log.info(f"  {_c('cyan', '↑')} Extracting to /usr/local/...")
-    # Remove any previous installation
     if GO_INSTALL_DIR.exists():
         run(["rm", "-rf", str(GO_INSTALL_DIR)], sudo=True, quiet=True)
     ok, _, err = run(
@@ -399,8 +426,7 @@ def install_apt(tool: Tool) -> bool:
 
 
 def install_go_tool(tool: Tool) -> bool:
-    """Install via `go install`."""
-    # Ensure go is on PATH
+    """Install via `go install`, then verify against the real go bin dir."""
     ensure_paths()
     if not cmd_available("go"):
         log.error(f"  {_c('red', '✗')} go compiler missing — cannot install {tool.name}")
@@ -414,24 +440,20 @@ def install_go_tool(tool: Tool) -> bool:
         log.debug(f"go install {tool.package} stderr: {err}")
         return False
 
-    # Verify binary landed in $GOPATH/bin
-    binary_path = GO_BIN_DIR / tool.resolved_binary
-    if binary_path.exists():
+    # Verify in the resolved go bin directory, not a hardcoded ~/go/bin
+    if (go_bin_dir() / tool.resolved_binary).exists():
         return True
-    # Some tools have a different binary name — check via which
     return cmd_available(tool.resolved_binary)
 
 
-def install_git(tool: Tool) -> bool:
-    """Clone a repo into /opt/<name>."""
-    dest = Path("/opt") / tool.name
+def install_git(tool: Tool, dest: Optional[Path] = None) -> bool:
+    """Clone a repo into /opt/<name> (or a supplied destination)."""
+    dest = dest or (Path("/opt") / tool.name)
     if dest.exists():
         return True
-    parent_sudo = not IS_ROOT
-    # /opt requires sudo
     ok, _, err = run(
         ["git", "clone", "--depth", "1", tool.package, str(dest)],
-        sudo=parent_sudo, timeout=900, quiet=True,
+        sudo=not IS_ROOT, timeout=900, quiet=True,
     )
     if not ok:
         log.debug(f"git clone {tool.package} stderr: {err}")
@@ -456,22 +478,89 @@ def install_seclists(tool: Tool) -> bool:
     )
 
 
+def install_feroxbuster(tool: Tool) -> bool:
+    """
+    Install feroxbuster from the official .deb release.
+    feroxbuster is a Rust tool; there is no `go install` path for it.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        deb_zip = tmpdir / "feroxbuster.deb.zip"
+
+        log.info(f"  {_c('cyan', '↑')} downloading feroxbuster .deb...")
+        ok, _, err = run(
+            ["curl", "-fsSL", "-o", str(deb_zip), tool.package],
+            timeout=180, quiet=True,
+        )
+        if not ok:
+            log.debug(f"feroxbuster download stderr: {err}")
+            return False
+
+        ok, _, err = run(["unzip", "-o", str(deb_zip), "-d", tmp], quiet=True)
+        if not ok:
+            log.debug(f"feroxbuster unzip stderr: {err}")
+            return False
+
+        deb = next(tmpdir.glob("feroxbuster_*_amd64.deb"), None)
+        if not deb:
+            log.debug("feroxbuster .deb not found after extraction")
+            return False
+
+        ok, _, err = run(
+            ["apt-get", "install", "-y", "-q", str(deb)],
+            sudo=True, timeout=300, quiet=True,
+        )
+        if not ok:
+            log.debug(f"feroxbuster dpkg install stderr: {err}")
+        return ok
+
+
+def install_dalfox_cargo(tool: Tool) -> bool:
+    """
+    Install dalfox via cargo. Dalfox v3 is a complete Rust rewrite;
+    `go install` no longer works for current releases.
+    """
+    ensure_paths()
+    if not cmd_available("cargo"):
+        log.info(f"  {_c('cyan', '↑')} cargo not found — installing rust toolchain via apt...")
+        ok, _, err = run(
+            ["apt-get", "install", "-y", "-q", "cargo", "rustc"],
+            sudo=True, timeout=600, quiet=True,
+        )
+        if not ok:
+            log.error(f"  {_c('red', '✗')} could not install cargo: {err}")
+            return False
+        ensure_paths()
+
+    log.info(f"  {_c('cyan', '↑')} cargo install {tool.package} (this may take a few minutes)...")
+    ok, _, err = run(
+        ["cargo", "install", tool.package],
+        timeout=1200, quiet=True,
+    )
+    if not ok:
+        log.debug(f"cargo install {tool.package} stderr: {err}")
+        return False
+
+    # cargo installs to ~/.cargo/bin by default
+    return (CARGO_BIN_DIR / tool.resolved_binary).exists() or cmd_available(tool.resolved_binary)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Install driver
 # ─────────────────────────────────────────────────────────────────────────────
 
 def is_installed(tool: Tool) -> bool:
     """Check whether a tool is already installed."""
-    # 1. Explicit check command
+    # 1. Explicit check command (handles shell operators correctly)
     if tool.check_cmd:
         return run_check(tool.check_cmd)
 
     # 2. Binary lookup
-    if tool.method in ("apt", "go"):
+    if tool.method in ("apt", "go", "cargo", "deb"):
         return cmd_available(tool.resolved_binary)
 
     # 3. Directory existence (git / special)
-    if tool.method == "git":
+    if tool.method in ("git", "special") and tool.name != "seclists":
         return (Path("/opt") / tool.name).exists()
 
     return False
@@ -496,6 +585,10 @@ def install_tool(tool: Tool, dry_run: bool, assume_yes: bool) -> str:
         ok = install_go_tool(tool)
     elif tool.method == "git":
         ok = install_git(tool)
+    elif tool.method == "deb":
+        ok = install_feroxbuster(tool)
+    elif tool.method == "cargo":
+        ok = install_dalfox_cargo(tool)
     elif tool.method == "special" and tool.name == "seclists":
         ok = install_seclists(tool)
     else:
@@ -513,6 +606,7 @@ def install_tool(tool: Tool, dry_run: bool, assume_yes: bool) -> str:
             log.warning(f"  {_c('yellow', '!')} {tool.name:<14} post-install hook failed: {hook}")
 
     # Verify
+    ensure_paths()
     if not is_installed(tool):
         log.error(f"  {_c('red', '✗')} {tool.name:<14} install returned OK but verification failed")
         return "failed"
@@ -586,7 +680,7 @@ def main() -> int:
 
     log.info(f"  {_c('green', '✓')} Python {platform.python_version()}")
 
-    # Ensure PATH includes Go bin dirs from the start
+    # Resolve Go/Cargo paths now so verification is accurate
     ensure_paths()
 
     # ── Tool selection ──────────────────────────────────────────────────────
@@ -675,16 +769,13 @@ def main() -> int:
 
     non_base = [t for t in selected if t.category != "base"]
     for t in non_base:
-        # Skip Go tools if Go install failed
         if t.method == "go" and not cmd_available("go"):
             log.warning(f"  {_c('yellow', '!')} {t.name:<14} skipped (go missing)")
             stats["skipped"] += 1
             continue
-        # Count base results too
         result = install_tool(t, args.dry_run, args.yes)
         stats[result] += 1
 
-    # Also count base results
     for t in base:
         if is_installed(t):
             stats["present"] += 1
@@ -700,10 +791,11 @@ def main() -> int:
 
     # ── PATH persistence hint ──────────────────────────────────────────────
     if not args.dry_run and stats["installed"] > 0:
-        go_path_line = f'export PATH="{GO_BIN_DIR}:/usr/local/go/bin:$PATH"'
+        go_path = go_bin_dir()
+        path_line = f'export PATH="{go_path}:{GO_INSTALL_DIR / "bin"}:{CARGO_BIN_DIR}:$PATH"'
         log.info("")
-        log.info(f"  {_c('yellow', '!')} Persist Go binaries to your shell PATH:")
-        log.info(f"    {_c('dim', 'echo ' + repr(go_path_line) + ' >> ~/.bashrc')}")
+        log.info(f"  {_c('yellow', '!')} Persist tool binaries to your shell PATH:")
+        log.info(f"    {_c('dim', 'echo ' + repr(path_line) + ' >> ~/.bashrc')}")
         log.info(f"    {_c('dim', 'source ~/.bashrc')}")
         log.info(f"  {_c('dim', '(Current session already includes these paths.)')}")
 
@@ -713,6 +805,39 @@ def main() -> int:
     log.info(_c("cyan", "═" * 62))
 
     return 0 if stats["failed"] == 0 else 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Debian / sudo helpers (moved here so main() can call them)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_debian() -> bool:
+    """Confirm we're on a Debian-derived distro."""
+    os_release = Path("/etc/os-release")
+    if not os_release.exists():
+        return False
+    content = os_release.read_text()
+    markers = ("debian", "ubuntu", "kali", "parrot", "pop", "mint", "raspbian")
+    id_line = next((l for l in content.splitlines() if l.startswith("ID=")), "")
+    like_line = next((l for l in content.splitlines() if l.startswith("ID_LIKE=")), "")
+    combined = (id_line + " " + like_line).lower()
+    return any(m in combined for m in markers)
+
+
+def cache_sudo() -> bool:
+    """Ensure sudo credentials are cached for the session."""
+    if IS_ROOT:
+        return True
+    ok, _, _ = run(["sudo", "-n", "true"], quiet=True)
+    if ok:
+        log.debug("sudo: passwordless (cached)")
+        return True
+    log.info(f"  {_c('yellow', '!')} Caching sudo credentials (you may be prompted)...")
+    try:
+        rc = subprocess.run(["sudo", "-v"]).returncode
+        return rc == 0
+    except FileNotFoundError:
+        return False
 
 
 if __name__ == "__main__":
