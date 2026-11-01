@@ -250,6 +250,86 @@ class ArgusDB:
         r = self._call("query.js_findings", payload)
         return r.get("js_findings") if r and r.get("ok") else None
 
+    def upsert_nmap_hosts(
+        self, scan_id: int, hosts: list[dict], chunk_size: int = 100,
+    ) -> Optional[dict]:
+        """
+        Upsert nmap hosts. Returns {'count': N, 'host_ids': {hash: id}} or None.
+        """
+        if not hosts:
+            return {"count": 0, "host_ids": {}}
+
+        total = 0
+        all_host_ids: dict[str, int] = {}
+        for i in range(0, len(hosts), chunk_size):
+            chunk = hosts[i:i + chunk_size]
+            r = self._call("nmap_hosts.upsert", {
+                "scan_id":    scan_id,
+                "nmap_hosts": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+                all_host_ids.update(r.get("host_ids", {}))
+            else:
+                log.warning(
+                    f"nmap_hosts.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return {"count": total, "host_ids": all_host_ids}
+
+    def upsert_nmap_ports(
+        self, scan_id: int, ports: list[dict], chunk_size: int = 500,
+    ) -> Optional[int]:
+        """Upsert nmap ports in chunks."""
+        if not ports:
+            return 0
+
+        total = 0
+        for i in range(0, len(ports), chunk_size):
+            chunk = ports[i:i + chunk_size]
+            r = self._call("nmap_ports.upsert", {
+                "scan_id":    scan_id,
+                "nmap_ports": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"nmap_ports.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_nmap_hosts(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        interesting: bool = False, min_score: Optional[int] = None,
+    ) -> Optional[list]:
+        payload = {
+            "scan_uuid": scan_uuid,
+            "limit": limit,
+            "offset": offset,
+            "interesting": interesting,
+        }
+        if min_score is not None:
+            payload["min_score"] = min_score
+        r = self._call("query.nmap_hosts", payload)
+        return r.get("nmap_hosts") if r and r.get("ok") else None
+
+    def get_nmap_ports(
+        self, scan_uuid: str, limit: int = 1000, offset: int = 0,
+        port: Optional[int] = None, service: Optional[str] = None,
+        flag: Optional[str] = None,
+    ) -> Optional[list]:
+        payload = {"scan_uuid": scan_uuid, "limit": limit, "offset": offset}
+        if port is not None:
+            payload["port"] = port
+        if service is not None:
+            payload["service"] = service
+        if flag is not None:
+            payload["flag"] = flag
+        r = self._call("query.nmap_ports", payload)
+        return r.get("nmap_ports") if r and r.get("ok") else None
+
     def upsert_subdomains(
         self, scan_id: int, subdomains: list[dict], chunk_size: int = 500,
     ) -> Optional[int]:

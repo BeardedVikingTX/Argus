@@ -315,6 +315,7 @@ RECON_JSON_MAP: dict[str, tuple[str, str]] = {
     "crawl": ("site_pages.json",  "site_pages"),
     "fuzz":  ("content_fuzz.json", "content_fuzz"),
     "js":    ("js_findings.json",  "js_findings"),
+    "nmap":  ("nmap_scan.json",    "nmap"),
 }
 
 def resolve_stages(arg: str) -> list[str]:
@@ -755,7 +756,15 @@ def _run_live(outdir: Path) -> None:
 def _run_nmap(outdir: Path) -> None:
     from recon_tools.nmap import run_nmap_scan
     source = _pick_existing(outdir, ["live_urls.txt", "live_hosts.txt"])
-    run_nmap_scan(source, outdir)
+    r = _module_rate("nmap")
+    # nmap has its own timing — rate_limit maps to --max-rate
+    # concurrency is ignored (single-process)
+    max_rate = r.get("rate_limit", 0) or None
+    run_nmap_scan(
+        source, outdir,
+        deep_max_rate=max_rate,
+        scan_id=_CURRENT_SCAN_ID,
+    )
 
 
 def _run_urls(outdir: Path) -> None:
@@ -1127,6 +1136,51 @@ def _first_or_none(value: Any) -> Optional[str]:
     return str(value)
 
 
+def _to_nmap_host_payload(h: dict) -> Optional[dict]:
+    ip = h.get("ip", "")
+    if not ip:
+        return None
+    return {
+        "ip":              ip,
+        "hostname":        h.get("hostname", "") or None,
+        "status":          h.get("status", "up"),
+        "os_matches":      h.get("os_matches") or [],
+        "host_scripts":    h.get("host_scripts") or [],
+        "traceroute":      h.get("traceroute") or [],
+        "phase":           h.get("phase"),
+        "score":           int(h.get("score", 0)),
+        "interesting":     bool(h.get("interesting")),
+        "reasons":         h.get("reasons") or [],
+        "open_port_count": len(h.get("ports", [])),
+        "first_seen":      h.get("first_seen"),
+    }
+
+
+def _to_nmap_port_payload(host: dict, port: dict, host_hash: str) -> Optional[dict]:
+    p = port.get("port")
+    if p is None:
+        return None
+    port_num = int(p)
+    return {
+        "host_hash":        host_hash,
+        "port":             port_num,
+        "protocol":         port.get("protocol", "tcp"),
+        "state":            port.get("state", "open"),
+        "reason":           port.get("reason"),
+        "service":          port.get("service"),
+        "product":          port.get("product"),
+        "version":          port.get("version"),
+        "extrainfo":        port.get("extrainfo"),
+        "cpe":              port.get("cpe") or [],
+        "scripts":          port.get("scripts") or [],
+        "is_web":           port.get("is_web", False),
+        "is_database":      port.get("is_database", False),
+        "is_admin":         port.get("is_admin", False),
+        "is_dangerous":     port.get("is_dangerous", False),
+        "is_remote_access": port.get("is_remote_access", False),
+        "first_seen":       host.get("first_seen"),
+    }
+
 def _to_live_host_payload(rec: dict) -> Optional[dict]:
     """
     Convert a live_hosts.json record into the shape live_hosts.upsert expects.
@@ -1261,6 +1315,47 @@ def _sync_stage_artifacts(scan_id: Optional[int], stage: str, outdir: Path) -> N
                     return
                 result = DB.upsert_js_findings(scan_id, items)
                 label = "JS finding(s)"
+
+            elif kind == "nmap":
+                # nmap uses two tables — hosts first, then ports (which need host_ids)
+                hosts_data = data.get("hosts") or []
+                if not hosts_data:
+                    return
+
+                # ── Step 1: upsert hosts
+                host_payloads = [_to_nmap_host_payload(h) for h in hosts_data]
+                host_payloads = [h for h in host_payloads if h and h.get("ip")]
+                if not host_payloads:
+                    return
+
+                host_result = DB.upsert_nmap_hosts(scan_id, host_payloads)
+                if host_result is None:
+                    _DB_FAIL_COUNT += 1
+                    log.debug(f"DB sync nmap hosts returned None")
+                    return
+                _DB_FAIL_COUNT = 0
+                host_ids = host_result.get("host_ids", {})
+                log.info(f"DB sync nmap: {host_result['count']} host(s) upserted")
+
+                # ── Step 2: upsert ports
+                port_payloads: list[dict] = []
+                for h in hosts_data:
+                    ip = h.get("ip", "")
+                    host_hash = hashlib.sha256(ip.encode()).hexdigest()
+                    if host_hash not in host_ids:
+                        continue
+                    for p in h.get("ports", []):
+                        pp = _to_nmap_port_payload(h, p, host_hash)
+                        if pp:
+                            port_payloads.append(pp)
+
+                if port_payloads:
+                    port_count = DB.upsert_nmap_ports(scan_id, port_payloads)
+                    if port_count is not None:
+                        log.info(f"DB sync nmap: {port_count} port(s) upserted")
+                    else:
+                        log.debug("DB sync nmap ports returned None")
+                return
 
             else:
                 return
