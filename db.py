@@ -1085,6 +1085,52 @@ class ArgusDB:
         r = self._call("query.ssti_findings", payload)
         return r.get("ssti_findings") if r and r.get("ok") else None
 
+    def upsert_xxe_findings(
+        self, scan_id: int, findings: list[dict], chunk_size: int = 200,
+    ) -> Optional[int]:
+        """
+        Upsert XXE findings in chunks.
+
+        Chunk size 200: each row carries payload (up to 8KB in-band),
+        evidence, evil.dtd template, and details blob. 200 × ~10KB payload
+        ≈ 2MB, comfortably under PHP's post_max_size (8MB).
+        """
+        if not findings:
+            return 0
+        total = 0
+        for i in range(0, len(findings), chunk_size):
+            chunk = findings[i:i + chunk_size]
+            r = self._call("xxe_findings.upsert", {
+                "scan_id": scan_id, "xxe_findings": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"xxe_findings.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_xxe_findings(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        severity: Optional[str] = None, technique: Optional[str] = None,
+        host: Optional[str] = None, confirmed_only: bool = False,
+        oob_only: bool = False,
+    ) -> Optional[list]:
+        payload = {
+            "scan_uuid":      scan_uuid,
+            "limit":          limit,
+            "offset":         offset,
+            "confirmed_only": confirmed_only,
+            "oob_only":       oob_only,
+        }
+        if severity is not None:  payload["severity"] = severity
+        if technique is not None: payload["technique"] = technique
+        if host is not None:      payload["host"] = host
+        r = self._call("query.xxe_findings", payload)
+        return r.get("xxe_findings") if r and r.get("ok") else None
+
     def upsert_xss_findings(
         self, scan_id: int, findings: list[dict], chunk_size: int = 100,
     ) -> Optional[int]:

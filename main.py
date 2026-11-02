@@ -1055,13 +1055,22 @@ def _run_ssti(outdir: Path) -> None:
 def _run_xxe(outdir: Path) -> None:
     from auditing_tools.xxe_finder import run_xxe_scan
     source = _pick_existing(
-        outdir, ["urls_with_params.txt", "all_urls.txt", "live_urls.txt"],
+        outdir, ["gf_xxe.txt", "urls_with_params.txt", "all_urls.txt"],
     )
+    r = _module_rate("xxe")
     run_xxe_scan(
         source, outdir,
         oob_domain=_oob_domain(),
         use_interactsh=_oob_interactsh(),
         headers=_platform_headers() or None,
+        rate_limit=r.get("rate_limit", 3),
+        concurrency=r.get("concurrency", 3),
+        timeout=r.get("timeout", 12),
+        max_surfaces=r.get("max_surfaces", 200),
+        test_error_based=r.get("error_based", True),
+        test_oob=r.get("oob", True),
+        test_bypass=r.get("bypass", True),
+        scan_id=_CURRENT_SCAN_ID,
     )
 
 
