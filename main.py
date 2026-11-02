@@ -999,10 +999,19 @@ def _run_xss(outdir: Path) -> None:
     source = _pick_existing(
         outdir, ["gf_xss.txt", "urls_with_params.txt", "all_urls.txt"],
     )
+    r = _module_rate("xss")
     run_xss_scan(
         source, outdir,
         headers=_platform_headers() or None,
         oob_domain=_oob_domain(),
+        test_stored=r.get("test_stored", True),
+        test_dom=r.get("test_dom", True),
+        test_headers=r.get("test_headers", False),
+        rate_limit=r.get("rate_limit", 3),
+        concurrency=r.get("concurrency", 3),
+        timeout=r.get("timeout", 12),
+        max_surfaces=r.get("max_surfaces", 400),
+        scan_id=_CURRENT_SCAN_ID,
     )
 
 
