@@ -951,6 +951,9 @@ def _run_idor(outdir: Path) -> None:
         user_a_id=user_a.get("user_id") or None,
         user_b_id=user_b.get("user_id") or None,
         graphql_schema_file=schema_path if schema_path.exists() else None,
+        test_bypasses=r.get("test_bypasses", True),
+        enumerate=r.get("enumerate", False),        # ← opt-in enumeration
+        max_ids_per_surface=r.get("max_ids", 3),
         scan_id=_CURRENT_SCAN_ID,
     )
 
@@ -1008,11 +1011,16 @@ def _run_ssrf(outdir: Path) -> None:
     source = _pick_existing(
         outdir, ["gf_ssrf.txt", "urls_with_params.txt", "all_urls.txt"],
     )
+    r = _module_rate("ssrf")
     run_ssrf_scan(
         source, outdir,
         oob_domain=_oob_domain(),
         use_interactsh=_oob_interactsh(),
         headers=_platform_headers() or None,
+        rate_limit=r.get("rate_limit", 3),
+        concurrency=r.get("concurrency", 3),
+        timeout=r.get("timeout", 12),
+        scan_id=_CURRENT_SCAN_ID,
     )
 
 

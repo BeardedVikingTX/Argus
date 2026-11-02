@@ -893,6 +893,48 @@ class ArgusDB:
         r = self._call("query.race_findings", payload)
         return r.get("race_findings") if r and r.get("ok") else None
 
+    def upsert_idor_findings(
+        self, scan_id: int, findings: list[dict], chunk_size: int = 100,
+    ) -> Optional[int]:
+        if not findings:
+            return 0
+        total = 0
+        for i in range(0, len(findings), chunk_size):
+            chunk = findings[i:i + chunk_size]
+            r = self._call("idor_findings.upsert", {
+                "scan_id": scan_id, "idor_findings": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"idor_findings.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_idor_findings(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        severity: Optional[str] = None, hypothesis: Optional[str] = None,
+        technique: Optional[str] = None, host: Optional[str] = None,
+        confirmed_only: bool = False, exclude_shared: bool = False,
+        min_confidence: Optional[int] = None,
+    ) -> Optional[list]:
+        payload = {
+            "scan_uuid":      scan_uuid,
+            "limit":          limit,
+            "offset":         offset,
+            "confirmed_only": confirmed_only,
+            "exclude_shared": exclude_shared,
+        }
+        if severity is not None:    payload["severity"] = severity
+        if hypothesis is not None:  payload["hypothesis"] = hypothesis
+        if technique is not None:   payload["technique"] = technique
+        if host is not None:        payload["host"] = host
+        if min_confidence is not None: payload["min_confidence"] = min_confidence
+        r = self._call("query.idor_findings", payload)
+        return r.get("idor_findings") if r and r.get("ok") else None
+
     def upsert_site_map_hosts(
         self, scan_id: int, hosts: list[dict], chunk_size: int = 500,
     ) -> Optional[int]:
@@ -964,6 +1006,45 @@ class ArgusDB:
         if host is not None:     payload["host"] = host
         r = self._call("query.smuggling_findings", payload)
         return r.get("smuggling_findings") if r and r.get("ok") else None
+
+    def upsert_ssrf_findings(
+        self, scan_id: int, findings: list[dict], chunk_size: int = 200,
+    ) -> Optional[int]:
+        if not findings:
+            return 0
+        total = 0
+        for i in range(0, len(findings), chunk_size):
+            chunk = findings[i:i + chunk_size]
+            r = self._call("ssrf_findings.upsert", {
+                "scan_id": scan_id, "ssrf_findings": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"ssrf_findings.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_ssrf_findings(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        severity: Optional[str] = None, technique: Optional[str] = None,
+        host: Optional[str] = None, confirmed_only: bool = False,
+        oob_only: bool = False,
+    ) -> Optional[list]:
+        payload = {
+            "scan_uuid":      scan_uuid,
+            "limit":          limit,
+            "offset":         offset,
+            "confirmed_only": confirmed_only,
+            "oob_only":       oob_only,
+        }
+        if severity is not None:  payload["severity"] = severity
+        if technique is not None: payload["technique"] = technique
+        if host is not None:      payload["host"] = host
+        r = self._call("query.ssrf_findings", payload)
+        return r.get("ssrf_findings") if r and r.get("ok") else None
 
     def upsert_open_redirect_findings(
         self, scan_id: int, findings: list[dict], chunk_size: int = 200,

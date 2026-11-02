@@ -62,6 +62,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 log = logging.getLogger("argus.idor_finder")
 
+def _db_now() -> str:
+    """MySQL-compatible UTC datetime (no T, no timezone, no fractional)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  CONFIG
 # ═════════════════════════════════════════════════════════════════════════════
