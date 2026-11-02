@@ -1029,7 +1029,18 @@ def _run_ssti(outdir: Path) -> None:
     source = _pick_existing(
         outdir, ["gf_ssti.txt", "urls_with_params.txt", "all_urls.txt"],
     )
-    run_ssti_scan(source, outdir, headers=_platform_headers() or None)
+    r = _module_rate("ssti")
+    run_ssti_scan(
+        source, outdir,
+        headers=_platform_headers() or None,
+        rate_limit=r.get("rate_limit", 3),
+        concurrency=r.get("concurrency", 3),
+        timeout=r.get("timeout", 12),
+        test_blind_enabled=r.get("blind", True),
+        test_escalation_enabled=r.get("escalation", True),
+        max_surfaces=r.get("max_surfaces", 300),
+        scan_id=_CURRENT_SCAN_ID,
+    )
 
 
 def _run_xxe(outdir: Path) -> None:

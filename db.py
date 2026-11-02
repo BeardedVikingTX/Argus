@@ -1046,6 +1046,45 @@ class ArgusDB:
         r = self._call("query.ssrf_findings", payload)
         return r.get("ssrf_findings") if r and r.get("ok") else None
 
+    def upsert_ssti_findings(
+        self, scan_id: int, findings: list[dict], chunk_size: int = 200,
+    ) -> Optional[int]:
+        if not findings:
+            return 0
+        total = 0
+        for i in range(0, len(findings), chunk_size):
+            chunk = findings[i:i + chunk_size]
+            r = self._call("ssti_findings.upsert", {
+                "scan_id": scan_id, "ssti_findings": chunk,
+            })
+            if r and r.get("ok"):
+                total += r.get("count", 0)
+            else:
+                log.warning(
+                    f"ssti_findings.upsert chunk failed "
+                    f"({len(chunk)} entries, offset {i})"
+                )
+        return total
+
+    def get_ssti_findings(
+        self, scan_uuid: str, limit: int = 100, offset: int = 0,
+        severity: Optional[str] = None, technique: Optional[str] = None,
+        engine: Optional[str] = None, host: Optional[str] = None,
+        confirmed_only: bool = False,
+    ) -> Optional[list]:
+        payload = {
+            "scan_uuid":      scan_uuid,
+            "limit":          limit,
+            "offset":         offset,
+            "confirmed_only": confirmed_only,
+        }
+        if severity is not None:  payload["severity"] = severity
+        if technique is not None: payload["technique"] = technique
+        if engine is not None:    payload["engine"] = engine
+        if host is not None:      payload["host"] = host
+        r = self._call("query.ssti_findings", payload)
+        return r.get("ssti_findings") if r and r.get("ok") else None
+
     def upsert_open_redirect_findings(
         self, scan_id: int, findings: list[dict], chunk_size: int = 200,
     ) -> Optional[int]:
