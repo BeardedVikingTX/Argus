@@ -91,7 +91,14 @@ REPO     = "https://github.com/BeardedVikingTX/Argus"
 
 BASE_DIR      = Path(__file__).parent
 OUTPUT_DIR    = BASE_DIR / "output"
-WILDCARD_FILE = Path(_cfg("SCOPE_FILE", BASE_DIR / "wildcard.txt"))
+BASE_DIR = Path(__file__).parent
+
+_sf_raw = _cfg("SCOPE_FILE", None)
+if _sf_raw:
+    _sf = Path(str(_sf_raw)).expanduser()
+    WILDCARD_FILE = _sf if _sf.is_absolute() else (BASE_DIR / _sf)
+else:
+    WILDCARD_FILE = BASE_DIR / "wildcard.txt"
 LOG_FILE      = OUTPUT_DIR / "argus.log"
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -807,10 +814,10 @@ def _run_categorize(outdir: Path) -> None:
     run_url_categorize(source, outdir, scan_id=_CURRENT_SCAN_ID)
 
 
-def _run_crawl(outdir: Path) -> None:                # ← paste here
+def _run_crawl(outdir: Path) -> None:
     from auditing_tools.site_crawler import run_site_crawl
     source = _pick_existing(outdir, ["live_urls.txt"])
-    run_site_crawl(source, outdir)
+    run_site_crawl(source, outdir, scan_id=_CURRENT_SCAN_ID)
 
 
 def _run_js(outdir: Path) -> None:
@@ -2135,7 +2142,15 @@ def print_stages() -> None:
 #  ENVIRONMENT VALIDATION
 # ═════════════════════════════════════════════════════════════════════════════
 
+# Stages that pass WILDCARD_FILE down to their module — must have a
+# wildcard.txt present and non-empty before they start.
+STAGES_NEEDING_WILDCARD = frozenset({"subs", "dns", "urls", "params", "mapping"})
+# ═════════════════════════════════════════════════════════════════════════════
+#  ENVIRONMENT VALIDATION
+# ═════════════════════════════════════════════════════════════════════════════
+
 def load_wildcards() -> list[str]:
+    """Scope roots from wildcard.txt (comments/blank lines stripped)."""
     if not WILDCARD_FILE.exists():
         return []
     return [
@@ -2145,18 +2160,53 @@ def load_wildcards() -> list[str]:
     ]
 
 
+def _primary_domain() -> Optional[str]:
+    """First scope root from wildcard.txt, or None."""
+    roots = load_wildcards()
+    return roots[0] if roots else None
+
+
+def _wildcard_path() -> Optional[Path]:
+    """Return WILDCARD_FILE only if it exists and has at least one entry."""
+    if WILDCARD_FILE.exists() and load_wildcards():
+        return WILDCARD_FILE
+    return None
+
+
 def validate_environment(stages: list[str]) -> tuple[bool, str]:
-    if "subs" in stages:
+    needed = sorted(set(stages) & STAGES_NEEDING_WILDCARD)
+    if needed:
         if not WILDCARD_FILE.exists():
             return False, (
-                f"wildcard.txt not found at {WILDCARD_FILE} — "
-                "create it with one root domain per line."
+                f"wildcard.txt not found at {WILDCARD_FILE}\n"
+                f"  Required by: {', '.join(needed)}\n"
+                f"  Create it with one root domain per line."
             )
         if not load_wildcards():
-            return False, "wildcard.txt is empty — add at least one root domain."
+            return False, (
+                f"wildcard.txt is empty at {WILDCARD_FILE}\n"
+                f"  Required by: {', '.join(needed)}\n"
+                f"  Add at least one root domain."
+            )
     OUTPUT_DIR.mkdir(exist_ok=True)
     return True, ""
 
+def _primary_domain() -> Optional[str]:
+    """First scope root from wildcard.txt, or None."""
+    roots = load_wildcards()
+    return roots[0] if roots else None
+
+
+def _wildcard_path() -> Optional[Path]:
+    """Return WILDCARD_FILE if it exists and has at least one entry, else None.
+
+    Modules that treat wildcard_file=None as 'skip scope filtering' can be
+    passed this safely — keeps a `--stage mapping` rerun working even after
+    wildcard.txt has been removed.
+    """
+    if WILDCARD_FILE.exists() and load_wildcards():
+        return WILDCARD_FILE
+    return None
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  MAIN
@@ -2168,7 +2218,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     parser = build_parser()
 
-    if not argv or "--help" in argv or "-h" in argv:
+    if argv and ("--help" in argv or "-h" in argv):
         show_banner()
         parser.print_help()
         print()
@@ -2438,51 +2488,89 @@ def _silence_broken_pipe() -> None:
         # AttributeError if sys.stdout has been replaced with None
         pass
 
+def _emit_interrupt_notice() -> None:
+    """
+    Print the graceful-shutdown message, surviving a broken stdout.
+
+    The colorful one-liner goes to stdout first (so it lands in scrollback
+    alongside the rest of the run), then falls back to plain-text on
+    stderr if stdout is unusable. If both fail we silently proceed — the
+    exit code (130) still tells the story.
+    """
+    try:
+        sys.stdout.flush()
+        print(
+            f"\n{yellow('Interrupted.')} "
+            f"{dim('Returning to port with what we have.')}"
+        )
+        sys.stdout.flush()
+        return
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+
+    try:
+        sys.stderr.write(
+            "\nInterrupted. Returning to port with what we have.\n"
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _emit_crash_report(exc: BaseException) -> None:
+    """
+    Log the crash to argus.log (if logging is up) and dump a traceback
+    to stderr. Both steps are individually best-effort: a failure to log
+    must not suppress the traceback, and a failure to print the traceback
+    must not mask the exit code.
+    """
+    try:
+        logging.getLogger("argus").error(
+            f"Unhandled exception in main(): {exc}"
+        )
+    except Exception:
+        # setup_logging never ran, or logging itself is broken —
+        # the stderr traceback below is the record of what happened.
+        pass
+
+    import traceback
+    try:
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
-    _install_signal_handlers()
     try:
+        _install_signal_handlers()
         sys.exit(main())
+
     except SystemExit:
-        # main() and argparse already chose an exit code (0, 1, 2, 130) —
-        # pass it through without alteration.
+        # main() / argparse already chose an exit code (0, 1, 2, 130).
+        # Pass it through untouched so `set -o pipefail` and CI harnesses
+        # see the intended status.
         raise
+
     except KeyboardInterrupt:
-        # Reached only when the interrupt lands *before* main()'s inner
-        # try-block — during startup (banner, argparse, env validation,
-        # DB scan registration) or as SIGTERM before the handler routes
-        # it. main() itself catches the interrupt that arrives mid-stage.
-        try:
-            sys.stdout.flush()
-            # yellow() / dim() respect _USE_COLOR; the original line used
-            # the raw C['yellow'] escape and leaked ANSI under --no-color.
-            print(
-                f"\n{yellow('Interrupted.')} "
-                f"{dim('Returning to port with what we have.')}"
-            )
-        except Exception:
-            # flush() can raise on a broken pipe — swallow it so the
-            # exit code is still 130 and not an unhandled BrokenPipe.
-            pass
+        # Reached only when the interrupt lands *outside* main()'s inner
+        # try-block — during the startup banner, argparse, environment
+        # validation, or DB scan registration — or as SIGTERM after
+        # _install_signal_handlers() routed it here. Mid-stage interrupts
+        # are caught inside main() and produce the "Raid interrupted by
+        # Jarl" panel plus the final briefing.
+        _emit_interrupt_notice()
         sys.exit(130)
+
     except BrokenPipeError:
-        # Consumer of stdout closed early (| head, | less, | grep -m1).
-        # Exit 141 = 128 + SIGPIPE, the Unix convention that lets
-        # `set -o pipefail` see the signal correctly.
+        # Downstream consumer (| head, | less, | grep -m1) closed stdout.
+        # 141 = 128 + SIGPIPE — the Unix convention that lets pipefail
+        # distinguish a piped shutdown from a real failure.
         _silence_broken_pipe()
         sys.exit(141)
+
     except Exception as exc:
         # A genuine bug in the tool — not a user-facing error. Log a
         # one-liner so it lands in argus.log, and print the full traceback
         # to stderr (the Unix convention for every CLI tool).
-        try:
-            logging.getLogger("argus").error(
-                f"Unhandled exception in main(): {exc}"
-            )
-        except Exception:
-            # If logging itself is broken (setup_logging never ran),
-            # nothing else to do — the traceback on stderr is enough.
-            pass
-        import traceback
-        traceback.print_exc()
+        _emit_crash_report(exc)
         sys.exit(3)     # distinct from stage failure (1) and env error (2)
