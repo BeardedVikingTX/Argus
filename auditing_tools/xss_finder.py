@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 auditing_tools/xss_finder.py — Cross-Site Scripting Auditor (v4.0)
 ═══════════════════════════════════════════════════════════════════════════════
 

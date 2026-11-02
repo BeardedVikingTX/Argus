@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 main.py — A R G U S  v3.0
 ═══════════════════════════════════════════════════════════════════════════════
 
@@ -772,7 +772,7 @@ def _run_takeover(outdir: Path) -> None:
 
 
 def _run_live(outdir: Path) -> None:
-    from recon_tools.sub_discover import discover_live
+    from recon_tools.sub_discovery import discover_live
     source = _pick_existing(outdir, ["dns_wildcard_filtered.txt", "all_subs.txt"])
     r = _module_rate("live")
     discover_live(
@@ -815,7 +815,7 @@ def _run_categorize(outdir: Path) -> None:
 
 
 def _run_crawl(outdir: Path) -> None:
-    from auditing_tools.site_crawler import run_site_crawl
+    from recon_tools.site_crawler import run_site_crawl
     source = _pick_existing(outdir, ["live_urls.txt"])
     run_site_crawl(source, outdir, scan_id=_CURRENT_SCAN_ID)
 
@@ -1135,7 +1135,7 @@ def run_one(key: str, outdir: Path, dry_run: bool) -> str:
     try:
         RUNNERS[key](outdir)
         return "ok"
-    except ImportError as e:
+    except (ImportError, NotImplementedError) as e:
         print(f"  {yellow(S['warn'])}  {yellow('module not yet implemented:')} {dim(str(e))}")
         return "missing"
     except FileNotFoundError as e:

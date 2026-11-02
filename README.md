@@ -413,3 +413,6 @@ no liability for misuse.
 ⭐ If this saved you a duplicated report, star the repo.
 
 </div>
+
+# SELF NOTE
+Add in the ability to extract, decompress and analys APK files for discovery of API Keys, Tokens, Endpoints, etc. We will create the ability to handle APK Auditing & Testing as well.
