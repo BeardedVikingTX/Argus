@@ -67,8 +67,8 @@ from typing import Any, Callable, Optional
 #  ᛖ  METADATA
 # ══════════════════════════════════════════════════════════════════════════
 
-__version__ = "3.1.0"
-__codename__ = "SMIDR REBORN"
+__version__ = "3.2.0"
+__codename__ = "SMIDR RECON"
 VERSION = __version__
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -552,12 +552,16 @@ def cargo_bin_dir() -> Path:
 
 
 def ensure_paths() -> None:
-    """Prepend Go/Cargo bin dirs to PATH for this process if applicable."""
-    additions = []
+    """Prepend Go/Cargo/local-bin dirs to PATH for this process if applicable."""
+    additions: list[str] = []
     if cmd_available("go"):
         additions.append(str(go_bin_dir()))
     if cmd_available("cargo"):
         additions.append(str(cargo_bin_dir()))
+    # ~/.local/bin — user-space install target (findomain fallback, future tools)
+    local_bin = Path.home() / ".local" / "bin"
+    if local_bin.exists():
+        additions.append(str(local_bin))
     current = os.environ.get("PATH", "")
     for p in additions:
         if p and p not in current.split(os.pathsep):
@@ -640,6 +644,14 @@ SECURITY_TOOLS = [
         "windows": ("cargo", "feroxbuster"), "termux": ("pkg", "feroxbuster"),
         "nethunter": ("pkg", "feroxbuster")},
         check_cmd="feroxbuster --version", description="Recursive content discovery"),
+    Tool("findomain", "recon", methods={
+        "linux":     ("special", "findomain_binary"),
+        "macos":     ("special", "findomain_binary"),
+        "windows":   ("special", "findomain_binary"),
+        "termux":    ("cargo", "findomain"),   # no ARM binary in releases
+        "nethunter": ("cargo", "findomain")},
+        check_cmd="findomain --version",
+        description="Rust-based passive subdomain discovery"),
     Tool("dalfox", "audit", methods={
         "linux": ("cargo", "dalfox"), "macos": ("brew", "dalfox"),
         "windows": ("go", "github.com/hahwul/dalfox/v2@latest"),
@@ -928,12 +940,174 @@ def handle_seclists_windows(tool: Tool) -> bool:
                       str(dest)], timeout=900, quiet=True)
     return ok
 
+# ══════════════════════════════════════════════════════════════════════════
+#  findomain  ·  GitHub release binary installer
+# ══════════════════════════════════════════════════════════════════════════
+
+_FINDOMAIN_BASE = "https://github.com/findomain/findomain/releases/latest/download"
+
+def _findomain_url() -> Optional[tuple[str, str]]:
+    """
+    Return (url, binary_name_in_zip) for the current platform, or None
+    if there is no pre-built binary available.
+    """
+    machine = PLATFORM.arch.lower()
+
+    if PLATFORM.kind == PlatformKind.MACOS:
+        return (f"{_FINDOMAIN_BASE}/findomain-macos.zip", "findomain")
+
+    if PLATFORM.kind == PlatformKind.WINDOWS:
+        return (f"{_FINDOMAIN_BASE}/findomain-win.zip", "findomain.exe")
+
+    if PLATFORM.kind == PlatformKind.LINUX:
+        if machine in ("x86_64", "amd64"):
+            return (f"{_FINDOMAIN_BASE}/findomain-linux.zip", "findomain")
+        if machine in ("aarch64", "arm64"):
+            return (f"{_FINDOMAIN_BASE}/findomain-linux-arm64.zip", "findomain")
+        if machine.startswith("arm"):
+            return (f"{_FINDOMAIN_BASE}/findomain-linux-arm.zip", "findomain")
+        if machine in ("i386", "i686"):
+            return (f"{_FINDOMAIN_BASE}/findomain-linux-i386.zip", "findomain")
+
+    return None
+
+
+def handle_findomain(tool: Tool) -> bool:
+    """
+    Install findomain from the official GitHub release binary.
+
+    Strategy:
+      1. Download the platform-appropriate .zip
+      2. Extract, find the binary
+      3. Install to /usr/local/bin (sudo) → ~/.local/bin (user) → cargo (compile)
+    """
+    import zipfile
+
+    spec = _findomain_url()
+    if spec is None:
+        log.warn(f"  no findomain binary for {PLATFORM.kind}/{PLATFORM.arch} — falling back to cargo")
+        return _fallback_cargo_findomain(tool)
+
+    url, binary_name = spec
+    log.info(f"  downloading findomain binary ({PLATFORM.kind}/{PLATFORM.arch})...")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmppath = Path(tmp)
+        zip_path = tmppath / "findomain.zip"
+
+        # 1. Download
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": f"argus-tools/{VERSION}",
+            })
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                zip_path.write_bytes(resp.read())
+        except urllib.error.HTTPError as e:
+            log.warn(f"  findomain download HTTP {e.code} — falling back to cargo")
+            return _fallback_cargo_findomain(tool)
+        except Exception as e:
+            log.warn(f"  findomain download failed: {type(e).__name__}: {e}")
+            return _fallback_cargo_findomain(tool)
+
+        # 2. Extract
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(tmppath)
+        except Exception as e:
+            log.warn(f"  findomain extraction failed: {e}")
+            return False
+
+        # 3. Locate binary (may be nested in a folder inside the zip)
+        candidates = list(tmppath.rglob(binary_name))
+        # Exclude the downloaded zip itself
+        candidates = [c for c in candidates if c.is_file() and c != zip_path]
+        if not candidates:
+            log.warn(f"  findomain binary '{binary_name}' not found in archive")
+            return False
+        source = candidates[0]
+        log.debug(f"  extracted binary: {source} ({source.stat().st_size} bytes)")
+
+        # 4. Install
+        if PLATFORM.kind == PlatformKind.WINDOWS:
+            target = Path.home() / "tools" / binary_name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.copy2(source, target)
+                _add_to_path_windows(str(target.parent))
+                return True
+            except Exception as e:
+                log.warn(f"  findomain copy failed: {e}")
+                return False
+
+        # Unix: try /usr/local/bin first (with sudo), then ~/.local/bin
+        installed = False
+        for target_dir in (Path("/usr/local/bin"),
+                           Path.home() / ".local" / "bin"):
+            target = target_dir / "findomain"
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                pass
+
+            # Try direct copy first (fast, no sudo if user owns the dir)
+            try:
+                shutil.copy2(source, target)
+                target.chmod(0o755)
+                installed = True
+                log.debug(f"  installed to {target}")
+                break
+            except (PermissionError, OSError):
+                pass
+
+            # Try sudo copy
+            if PLATFORM.has_sudo:
+                ok, _, err = run(
+                    ["install", "-m", "0755", str(source), str(target)],
+                    sudo=True, quiet=True,
+                )
+                if ok:
+                    installed = True
+                    log.debug(f"  installed to {target} (via sudo)")
+                    break
+                else:
+                    log.debug(f"  sudo install to {target} failed: {err[:200]}")
+
+        if not installed:
+            log.warn("  findomain install to /usr/local/bin and ~/.local/bin both failed")
+            return False
+
+        # Refresh PATH and verify
+        ensure_paths()
+        return cmd_available("findomain")
+
+
+def _fallback_cargo_findomain(tool: Tool) -> bool:
+    """Compile findomain from source via cargo. Slow but reliable."""
+    if not cmd_available("cargo"):
+        if not _install_rust():
+            log.warn("  findomain fallback: no cargo available")
+            return False
+    if LIGHTWEIGHT_MODE and not _confirm_heavy_compile(tool.name):
+        return False
+    log.info("  cargo install findomain (compiling, may take 5-10 min)...")
+    ok, _, err = run(["cargo", "install", "findomain"], timeout=1800, quiet=True)
+    if not ok:
+        log.warn(f"  cargo install findomain failed: {err.strip()[:250]}")
+        return False
+    ensure_paths()
+    return cmd_available("findomain")
+
+
+def _add_to_path_windows(directory: str) -> None:
+    """Print the setx hint to persist a directory to PATH on Windows."""
+    log.info(f"  add to PATH: {_c('dim')}setx PATH \"{directory};%PATH%\"{_c('reset')}")
 
 SPECIAL_HANDLERS: dict[str, Callable[[Tool], bool]] = {
-    "seclists_debian": handle_seclists_debian,
-    "seclists_brew": handle_seclists_brew,
-    "seclists_termux": handle_seclists_termux,
+    "seclists_debian":  handle_seclists_debian,
+    "seclists_brew":    handle_seclists_brew,
+    "seclists_termux":  handle_seclists_termux,
     "seclists_windows": handle_seclists_windows,
+    "findomain_binary": handle_findomain,         # ← NEW
 }
 
 
