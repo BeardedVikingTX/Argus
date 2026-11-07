@@ -284,6 +284,52 @@ AGGREGATION_JSON_MAP = {
     "nuclei":   "nuclei_findings.json",
 }
 
+# ── Post-v4/v5 outputs ─────────────────────────────────────────────────────
+# Every audit module now also writes:
+#   • <name>_confirmed.json  — HIGH / CRITICAL only
+#   • <name>_chains.json     — structured chain records
+#   • <name>_evidence/       — per-finding raw response bodies
+
+CONFIRMED_JSON_MAP: dict[str, str] = {
+    "auth":      "auth_confirmed.json",
+    "cache":     "cache_confirmed.json",
+    "idor":      "idor_confirmed.json",
+    "redirect":  "open_redirect_confirmed.json",
+    "race":      "race_confirmed.json",
+    "smuggling": "smuggling_confirmed.json",
+    "sqli":      "sqli_confirmed.json",
+    "xss":       "xss_confirmed.json",
+    "ssrf":      "ssrf_confirmed.json",
+    "ssti":      "ssti_confirmed.json",
+    "xxe":       "xxe_confirmed.json",
+}
+
+CHAINS_JSON_MAP: dict[str, str] = {
+    "auth":      "auth_chains.json",
+    "cache":     "cache_chains.json",
+    "idor":      "idor_chains.json",
+    "redirect":  "open_redirect_chains.json",
+    "race":      "race_chains.json",
+    "smuggling": "smuggling_chains.json",
+    "sqli":      "sqli_chains.json",
+    "xss":       "xss_chains.json",
+    "ssrf":      "ssrf_chains.json",
+    "ssti":      "ssti_chains.json",
+    "xxe":       "xxe_chains.json",
+}
+
+EVIDENCE_DIR_MAP: dict[str, str] = {
+    "idor":      "idor_evidence",
+    "redirect":  "open_redirect_evidence",
+    "race":      "race_evidence",
+    "smuggling": "smuggling_evidence",
+    "sqli":      "sqli_evidence",
+    "xss":       "xss_evidence",
+    "ssrf":      "ssrf_evidence",
+    "ssti":      "ssti_evidence",
+    "xxe":       "xxe_evidence",
+}
+
 # Artifacts each stage typically writes — used for stage records and the final briefing
 STAGE_ARTIFACTS = {
     "subs":       ["all_subs.txt", "subdomains.json", "subs_resolved.txt"],
@@ -298,23 +344,38 @@ STAGE_ARTIFACTS = {
     "categorize": ["url_categorize.json", "url_categorize_priority.txt"],
     "js":         ["js_findings.json", "js_endpoints.txt", "js_secrets.txt",
                    "js_sourcemaps.txt"],
-    "params":     ["param_findings.json", "params_by_endpoint.txt"],
+    "params":     ["param_findings.json", "params_by_endpoint.txt",
+                   "urls_sqli_priority.txt", "param_sqli_hits.json"],
     "graphql":    ["graphql_findings.json", "graphql_schema.json"],
     "fuzz":       ["content_fuzz.json", "fuzzed_directories.txt",
                    "fuzzed_interesting.txt"],
     "nuclei":     ["nuclei_findings.json", "nuclei_critical.txt", "nuclei_all.txt"],
     "cors":       ["cors_findings.json", "cors_critical.txt"],
-    "smuggling":  ["smuggling_findings.json", "smuggling_candidates.txt"],
-    "cache":      ["cache_findings.json", "cache_candidates.txt"],
-    "auth":       ["auth_findings.json", "auth_candidates.txt"],
-    "idor":       ["idor_findings.json", "idor_candidates.txt", "idor_confirmed.txt"],
-    "redirect":   ["open_redirect_findings.json", "open_redirect_candidates.txt"],
-    "race":       ["race_findings.json", "race_candidates.txt"],
-    "sqli":       ["sqli_findings.json", "sqli_candidates.txt", "sqli_confirmed.txt"],
-    "xss":        ["xss_findings.json", "xss_candidates.txt", "xss_confirmed.txt"],
-    "ssrf":       ["ssrf_findings.json", "ssrf_candidates.txt", "ssrf_confirmed.txt"],
-    "ssti":       ["ssti_findings.json", "ssti_candidates.txt", "ssti_confirmed.txt"],
-    "xxe":        ["xxe_findings.json", "xxe_candidates.txt", "xxe_confirmed.txt"],
+    "smuggling":  ["smuggling_findings.json", "smuggling_candidates.txt",
+                   "smuggling_confirmed.json", "smuggling_chains.json",
+                   "smuggling_confirmed.txt", "smuggling_h2.txt"],
+    "cache":      ["cache_findings.json", "cache_candidates.txt",
+                   "cache_confirmed.json", "cache_chains.json"],
+    "auth":       ["auth_findings.json", "auth_candidates.txt",
+                   "auth_confirmed.json", "auth_chains.json"],
+    "idor":       ["idor_findings.json", "idor_candidates.txt", "idor_confirmed.txt",
+                   "idor_confirmed.json", "idor_chains.json"],
+    "redirect":   ["open_redirect_findings.json", "open_redirect_candidates.txt",
+                   "open_redirect_confirmed.json", "open_redirect_chains.json",
+                   "open_redirect_oauth.txt"],
+    "race":       ["race_findings.json", "race_candidates.txt",
+                   "race_confirmed.json", "race_chains.json",
+                   "race_probe_results.txt"],
+    "sqli":       ["sqli_findings.json", "sqli_candidates.txt", "sqli_confirmed.txt",
+                   "sqli_confirmed.json", "sqli_chains.json"],
+    "xss":        ["xss_findings.json", "xss_candidates.txt", "xss_confirmed.txt",
+                   "xss_confirmed.json", "xss_chains.json", "xss_blind.txt"],
+    "ssrf":       ["ssrf_findings.json", "ssrf_candidates.txt", "ssrf_confirmed.txt",
+                   "ssrf_confirmed.json", "ssrf_chains.json", "ssrf_oob.txt"],
+    "ssti":       ["ssti_findings.json", "ssti_candidates.txt", "ssti_confirmed.txt",
+                   "ssti_confirmed.json", "ssti_chains.json"],
+    "xxe":        ["xxe_findings.json", "xxe_candidates.txt", "xxe_confirmed.txt",
+                   "xxe_confirmed.json", "xxe_chains.json", "xxe_oob.txt"],
     "mapping":    ["site_map.json", "site_map.md", "site_map_hosts.txt"],
     "triage":     ["triage_report.json", "triage_priority.md",
                    "triage_next_steps.txt"],
@@ -560,6 +621,94 @@ def _top_findings(outdir: Path, n: int = 5) -> list[dict]:
     ))
     return all_findings[:n]
 
+def _aggregate_chains(outdir: Path) -> list[dict]:
+    """Read all *_chains.json and return consolidated chain records."""
+    all_chains: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for stage, fname in CHAINS_JSON_MAP.items():
+        p = outdir / fname
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text())
+        except Exception:
+            continue
+        for c in data.get("chains") or []:
+            if not isinstance(c, dict):
+                continue
+            cid = c.get("chain_id") or f"{stage}-unknown"
+            if cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            all_chains.append({
+                "stage":    stage,
+                "chain_id": cid,
+                "name":     c.get("name", cid),
+                "severity": (c.get("severity") or "MEDIUM").upper(),
+                "steps":    c.get("steps") or [],
+                "evidence": (c.get("evidence") or "")[:200],
+            })
+
+    sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+    all_chains.sort(key=lambda c: (
+        sev_rank.get(c["severity"], 5), c["stage"], c["chain_id"],
+    ))
+    return all_chains
+
+
+def _aggregate_confirmed(outdir: Path) -> dict[str, int]:
+    """Return {stage: confirmed_count} from every *_confirmed.json."""
+    result: dict[str, int] = {}
+    for stage, fname in CONFIRMED_JSON_MAP.items():
+        p = outdir / fname
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text())
+        except Exception:
+            continue
+        totals = data.get("totals") or {}
+        count = int(totals.get("confirmed", 0))
+        if count == 0:
+            count = len(data.get("findings") or [])
+        if count > 0:
+            result[stage] = count
+    return result
+
+
+def _top_confirmed_findings(outdir: Path, n: int = 10) -> list[dict]:
+    """Top confirmed findings from *_confirmed.json (HIGH+ only)."""
+    all_findings: list[dict] = []
+    sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+
+    for stage, fname in CONFIRMED_JSON_MAP.items():
+        p = outdir / fname
+        if not p.exists():
+            continue
+        try:
+            data = json.loads(p.read_text())
+        except Exception:
+            continue
+        for f in (data.get("findings") or []):
+            if not isinstance(f, dict):
+                continue
+            all_findings.append({
+                "stage":    stage,
+                "severity": (f.get("severity") or "INFO").upper(),
+                "type":     f.get("vuln_type") or f.get("technique")
+                            or f.get("xss_type") or f.get("race_class")
+                            or f.get("variant") or stage,
+                "target":   f.get("target") or f.get("matched_at")
+                            or f.get("url") or "",
+                "chains":   f.get("chain_ids") or [],
+                "evidence": (f.get("evidence") or "")[:100],
+            })
+
+    all_findings.sort(key=lambda x: (
+        sev_rank.get(x["severity"], 5), x["target"],
+    ))
+    return all_findings[:n]
 
 def show_final_briefing(results: dict[str, str], outdir: Path,
                         scan_uuid: str, db_scan_id: Optional[int],
@@ -629,6 +778,28 @@ def show_final_briefing(results: dict[str, str], outdir: Path,
                 print(f"    {c(sev_color, f'[{f["severity"]:<8}]')} "
                       f"{f['stage']:<10} {f['type']:<24} "
                       f"{dim(f['target'][:40])}")
+
+    # ── Confirmed findings summary (HIGH+ only, per *_confirmed.json) ──────
+    confirmed = _aggregate_confirmed(outdir)
+    if confirmed:
+        total_confirmed = sum(confirmed.values())
+        gap()
+        print(f"  {cyan(S['shield'])}  Confirmed    : {bold(str(total_confirmed))} HIGH+ finding(s)")
+        for stage, count in sorted(confirmed.items(), key=lambda kv: -kv[1]):
+            print(f"      {green(S['dot_full'])} {stage:<10} {count:>4}")
+
+    # ── Chain aggregation (impact-driven) ──────────────────────────────────
+    chains = _aggregate_chains(outdir)
+    if chains:
+        gap()
+        print(f"  {magenta(S['rune_odin'])}  Exploit chains:")
+        sev_color = {"CRITICAL": "red", "HIGH": "yellow",
+                     "MEDIUM": "cyan", "LOW": "dim", "INFO": "dim"}
+        for c in chains[:12]:
+            col = sev_color.get(c["severity"], "dim")
+            print(f"    {c(col, f'[{c["severity"]:<8}]')} "
+                  f"{c['stage']:<10} {c['chain_id']:<28} "
+                  f"{dim(c['name'][:50])}")
 
     # ── Artifacts, grouped by phase ─────────────────────────────────────────
     gap()
@@ -912,20 +1083,6 @@ def _run_smuggling(outdir: Path) -> None:
         scan_id=_CURRENT_SCAN_ID,
     )
 
-
-def _run_cache(outdir: Path) -> None:
-    from auditing_tools.cache_poisoning_finder import run_cache_audit
-    source = _pick_existing(outdir, ["urls_with_params.txt", "live_urls.txt"])
-    r = _module_rate("cache")
-    run_cache_audit(
-        source, outdir,
-        rate_limit=r.get("rate_limit", 2),
-        concurrency=r.get("concurrency", 3),
-        headers=_platform_headers() or None,
-        scan_id=_CURRENT_SCAN_ID,
-    )
-
-
 def _run_auth(outdir: Path) -> None:
     from auditing_tools.auth_tester import run_auth_tester
     source = _pick_existing(outdir, ["urls_with_params.txt", "live_urls.txt"])
@@ -941,12 +1098,13 @@ def _run_auth(outdir: Path) -> None:
 
 def _run_idor(outdir: Path) -> None:
     from auditing_tools.idor_finder import run_idor_audit
-    source = _pick_existing(outdir, ["urls_with_params.txt", "all_urls.txt", "live_urls.txt"])
+    source = _pick_existing(
+        outdir, ["urls_with_params.txt", "all_urls.txt", "live_urls.txt"],
+    )
     user_a = _test_account("user_a")
     user_b = _test_account("user_b")
     headers_a = {"Cookie": user_a["cookie"]} if user_a.get("cookie") else None
     headers_b = {"Cookie": user_b["cookie"]} if user_b.get("cookie") else None
-    schema_path = outdir / "graphql_schema.json"
     r = _module_rate("idor")
     run_idor_audit(
         source, outdir,
@@ -957,11 +1115,12 @@ def _run_idor(outdir: Path) -> None:
         user_b_headers=headers_b,
         user_a_id=user_a.get("user_id") or None,
         user_b_id=user_b.get("user_id") or None,
-        graphql_schema_file=schema_path if schema_path.exists() else None,
         test_bypasses=r.get("test_bypasses", True),
-        enumerate=r.get("enumerate", False),        # ← opt-in enumeration
+        aggressive=r.get("aggressive", False),      # ← was `enumerate=` (invalid)
         max_ids_per_surface=r.get("max_ids", 3),
+        proxies=r.get("proxies"),
         scan_id=_CURRENT_SCAN_ID,
+        # graphql_schema_file was removed — v3.0 auto-detects from outdir/graphql_schema.json
     )
 
 
@@ -976,30 +1135,65 @@ def _run_redirect(outdir: Path) -> None:
         headers=_platform_headers() or None,
         rate_limit=r.get("rate_limit", 3),
         concurrency=r.get("concurrency", 4),
+        aggressive=r.get("aggressive", False),
+        proxies=r.get("proxies"),
         scan_id=_CURRENT_SCAN_ID,
     )
 
 
 def _run_race(outdir: Path) -> None:
     from auditing_tools.race_condition import run_race_audit
-    source = _pick_existing(outdir, ["urls_with_params.txt", "all_urls.txt", "live_urls.txt"])
+    source = _pick_existing(
+        outdir, ["urls_with_params.txt", "all_urls.txt", "live_urls.txt"],
+    )
     r = _module_rate("race")
     run_race_audit(
         source, outdir,
         headers=_platform_headers() or None,
         rate_limit=r.get("rate_limit", 3),
         concurrency=r.get("concurrency", 10),
+        aggressive=r.get("aggressive", False),
+        proxies=r.get("proxies"),
         scan_id=_CURRENT_SCAN_ID,
     )
 
 
 def _run_sqli(outdir: Path) -> None:
-    from auditing_tools.sqli_finder import run_sqli_scan
+    from auditing_tools.sqli_finder import run_sqli_audit
     source = _pick_existing(
-        outdir, ["gf_sqli.txt", "urls_with_params.txt", "all_urls.txt"],
+        outdir,
+        ["urls_sqli_priority.txt", "gf_sqli.txt",
+         "urls_with_params.txt", "all_urls.txt"],
     )
-    run_sqli_scan(source, outdir, headers=_platform_headers() or None)
+    r = _module_rate("sqli")
+    run_sqli_audit(
+        source, outdir,
+        # headers=_platform_headers() or None,     ← ← ← COMMENTED OUT
+        rate_limit=r.get("rate_limit", 3),
+        timeout=r.get("timeout", 20),
+        enable_sqlmap_chain=r.get("sqlmap_chain", True),
+        sqlmap_level=r.get("sqlmap_level", 2),
+        sqlmap_risk=r.get("sqlmap_risk", 1),
+        tamper_names=r.get("tampers"),
+        proxies=r.get("proxies"),
+        scan_id=_CURRENT_SCAN_ID,
+    )
 
+def _run_cache(outdir: Path) -> None:
+    from auditing_tools.cache_poisoning_finder import run_cache_audit
+    source = _pick_existing(
+        outdir, ["urls_with_params.txt", "live_urls.txt"],
+    )
+    r = _module_rate("cache")
+    run_cache_audit(
+        source, outdir,
+        rate_limit=r.get("rate_limit", 2),
+        concurrency=r.get("concurrency", 3),
+        headers=_platform_headers() or None,
+        aggressive=r.get("aggressive", False),
+        proxies=r.get("proxies"),
+        scan_id=_CURRENT_SCAN_ID,
+    )
 
 def _run_xss(outdir: Path) -> None:
     from auditing_tools.xss_finder import run_xss_scan
@@ -1018,6 +1212,9 @@ def _run_xss(outdir: Path) -> None:
         concurrency=r.get("concurrency", 3),
         timeout=r.get("timeout", 12),
         max_surfaces=r.get("max_surfaces", 400),
+        aggressive=r.get("aggressive", False),
+        proxies=r.get("proxies"),
+        oob_poll_wait=r.get("oob_poll_wait", 0),   # ← v5.0: inline poll
         scan_id=_CURRENT_SCAN_ID,
     )
 
@@ -1036,6 +1233,8 @@ def _run_ssrf(outdir: Path) -> None:
         rate_limit=r.get("rate_limit", 3),
         concurrency=r.get("concurrency", 3),
         timeout=r.get("timeout", 12),
+        aggressive=r.get("aggressive", False),
+        proxies=r.get("proxies"),
         scan_id=_CURRENT_SCAN_ID,
     )
 
@@ -1055,6 +1254,8 @@ def _run_ssti(outdir: Path) -> None:
         test_blind_enabled=r.get("blind", True),
         test_escalation_enabled=r.get("escalation", True),
         max_surfaces=r.get("max_surfaces", 300),
+        aggressive=r.get("aggressive", False),
+        proxies=r.get("proxies"),
         scan_id=_CURRENT_SCAN_ID,
     )
 
@@ -1077,6 +1278,8 @@ def _run_xxe(outdir: Path) -> None:
         test_error_based=r.get("error_based", True),
         test_oob=r.get("oob", True),
         test_bypass=r.get("bypass", True),
+        aggressive=r.get("aggressive", False),
+        proxies=r.get("proxies"),
         scan_id=_CURRENT_SCAN_ID,
     )
 

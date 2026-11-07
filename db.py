@@ -36,7 +36,7 @@ log = logging.getLogger("argus.db")
 # Load config defensively
 try:
     import config as _cfg
-    BRIDGE_ENABLED = getattr(_cfg, "BRIDGE_ENABLED", False)
+    BRIDGE_ENABLED = getattr(_cfg, "BRIDGE_ENABLED", True)
     BRIDGE_URL     = getattr(_cfg, "BRIDGE_URL", "")
     BRIDGE_KEY     = getattr(_cfg, "BRIDGE_KEY", "")
     BRIDGE_TIMEOUT = getattr(_cfg, "BRIDGE_TIMEOUT", 30)

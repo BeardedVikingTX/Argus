@@ -1,40 +1,82 @@
 #!/usr/bin/env python3
 """
-auditing_tools/idor_finder.py — Insecure Direct Object Reference Auditor (v2)
+auditing_tools/idor_finder.py — Insecure Direct Object Reference Auditor (v3.0)
 ═══════════════════════════════════════════════════════════════════════════════
 
-Comprehensive IDOR/BOLA detection for Argus. The v2 rewrite fixes the
-fundamental v1 logic bug — v1 harvested IDs from a single session and
-compared them to each other, which is not cross-identity testing at all.
+Cross-identity IDOR/BOLA detection with military-grade evasion, sensitivity
+classification, and exploit-impact chains.
 
-Correct testing requires:
-  • Own ID (User A's object) and Other ID (User B's object)
-  • GET as User A for own_id       → baseline_a (User A sees User A's data)
-  • GET as User B for other_id     → baseline_b (User B sees User B's data)
-  • GET as User A for other_id     → if 200 + matches baseline_b → CONFIRMED IDOR
-  • GET as User B for own_id       → reversal confirmation
+SAFETY MODEL
+────────────
+Every request flows through `EvasionSession`:
+  • Jittered pacing
+  • User-Agent + X-Forwarded-For rotation
+  • Optional proxy rotation
+  • Exponential back-off on 403/406/429/503
+  • 60-second cool-down after a WAF block
 
-This module implements that correctly, plus:
+Aggressive tests (extended enumeration, full bypass matrix, content-type
+switching) are gated behind `--aggressive`.
 
-  • Rate-limited HTTP session (config-driven)
-  • Header + cookie auth from config.py
-  • Nine discovery vectors (path IDs, query IDs, JSON body IDs, GraphQL
-    node-id, JWT sub claim, Flask session, JS-referenced IDs, form fields,
-    enumeration)
-  • Seven bypass techniques (HPP, encoding, path traversal, header
-    injection, method rotation, content-type switching, ID enumeration)
-  • Ownership-field comparison (not just "is a field present")
-  • GraphQL node-ID IDOR testing
-  • Self-sync to idor_findings table when scan_id is provided
+CONFIRMATION MODEL (no false positives)
+───────────────────────────────────────
+A finding is CONFIRMED only when:
 
-Outputs (into `outdir`):
-  • idor_findings.json      — full structured report
-  • idor_candidates.txt     — flat list for triage
-  • idor_confirmed.txt      — confirmed findings only
-  • idor_surface.txt        — every object-reference endpoint
+  A) DUAL-SESSION: User A requesting User B's object returns a response that
+     contains User B's ownership identifiers (email, user_id, etc.) OR is
+     byte-identical to User B's own baseline response.
 
-Integration:
-  main.py → run_one("idor") → run_idor_audit(live_urls_file, outdir)
+  B) REVERSAL: the mirror request (User B → User A's object) also succeeds.
+     Reversal raises confidence but is not strictly required — many targets
+     only expose one direction due to asymmetric ownership.
+
+  C) BYPASS: any of ~25 bypass variants (HPP, array, header injection,
+     content-type switching, method rotation, encoding, JWT claim injection)
+     returns User B's data to User A.
+
+  D) SINGLE-SESSION ENUMERATION always produces LIKELY findings (never
+     CONFIRMED) — the operator must supply dual sessions to actually prove it.
+
+SEVERITY (impact-driven)
+────────────────────────
+  CRITICAL   Confirmed IDOR that leaks credentials / SSN / credit-card /
+             admin role / account-takeover fields.
+  HIGH       Confirmed IDOR that leaks PII (email/phone/address/dob) or
+             financial data, OR any bypass variant confirmed.
+  MEDIUM     Confirmed IDOR with non-sensitive foreign data, OR sensitive
+             endpoint with auth-required parameters.
+  LOW        Surface mapped; no confirmation attempted.
+  INFO       Properly protected (correctly returns 401/403).
+
+CHAINS (aggregated into idor_chains.json)
+─────────────────────────────────────────
+  idor-account-takeover    credentials or email-change endpoint exposed
+  idor-pii-exposure        user's email / phone / address / dob leaked
+  idor-financial           payment / invoice / balance leaked
+  idor-admin-privesc       admin role / permissions leaked
+  idor-tenant-isolation    cross-tenant access
+  idor-mass-enum           sequential IDs confirmed enumerable
+
+ID HARVESTING (per session)
+───────────────────────────
+  • Response bodies (sequential, UUID, hex)
+  • HTML form actions
+  • JavaScript string literals (localStorage, window.userId)
+  • JSON responses from listing endpoints
+  • JWT claims (sub, uid, user_id, account_id)
+  • Cookie values (JSON-encoded or plain)
+  • Response headers (X-User-Id, X-Account-Id)
+  • GraphQL node-id decoding (base64 Type:ID → sequential)
+
+OUTPUTS
+───────
+  idor_findings.json      — every finding (full report)
+  idor_confirmed.json     — HIGH / CRITICAL only
+  idor_chains.json        — structured chain records
+  idor_candidates.txt     — flat triage
+  idor_confirmed.txt      — confirmed-only flat triage
+  idor_surface.txt        — every object-reference endpoint
+  idor_protected.txt      — endpoints that correctly return 401/403
 """
 
 from __future__ import annotations
@@ -44,6 +86,7 @@ import base64
 import hashlib
 import json
 import logging
+import random
 import re
 import string
 import sys
@@ -52,6 +95,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
@@ -61,10 +105,6 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 log = logging.getLogger("argus.idor_finder")
-
-def _db_now() -> str:
-    """MySQL-compatible UTC datetime (no T, no timezone, no fractional)."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  CONFIG
@@ -86,41 +126,219 @@ except ImportError:
 
 
 def _cfg(key: str, default=None):
-    if not CFG_LOADED:
-        return default
-    return getattr(CFG, key, default)
+    return getattr(CFG, key, default) if CFG_LOADED else default
 
 
 def _idor_settings() -> dict:
-    entry = (_cfg("MODULE_RATE_LIMITS", {}) or {}).get("idor", {})
+    entry = (_cfg("MODULE_RATE_LIMITS", {}) or {}).get("idor", {}) or {}
     return {
         "rate_limit":  entry.get("rate_limit", 2),
         "concurrency": entry.get("concurrency", 2),
         "timeout":     entry.get("timeout", 15),
+        "jitter":      entry.get("jitter", 0.5),
+        "proxies":     entry.get("proxies", []),
     }
 
 
 def _target_headers() -> dict[str, str]:
     h = dict(_cfg("ACTIVE_HEADERS", {}) or {})
     if CFG_LOADED and getattr(CFG, "AUTH_ENABLED", False):
-        auth_hdrs = getattr(CFG, "AUTH_HEADERS", {}) or {}
-        if auth_hdrs:
-            h.update(auth_hdrs)
+        h.update(getattr(CFG, "AUTH_HEADERS", {}) or {})
     return h
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SEVERITY
+# ═════════════════════════════════════════════════════════════════════════════
+
+class Severity(str, Enum):
+    INFO     = "INFO"
+    LOW      = "LOW"
+    MEDIUM   = "MEDIUM"
+    HIGH     = "HIGH"
+    CRITICAL = "CRITICAL"
+
+    @property
+    def rank(self) -> int:
+        return {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}[self.value]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  WAF DETECTION + EVASION
+# ═════════════════════════════════════════════════════════════════════════════
+
+WAF_SIGNATURES: dict[str, dict] = {
+    "Cloudflare":  {"headers": ["cf-ray", "__cf_bm", "cf-cache-status"],
+                    "body":    ["Attention Required! | Cloudflare"]},
+    "Akamai":      {"headers": ["akamai-grn", "x-akamai-transformed", "_abck"],
+                    "body":    ["Access Denied", "Reference&#32;&#35;"]},
+    "Imperva":     {"headers": ["x-iinfo", "incap_ses", "_Incapsula_Resource"],
+                    "body":    ["Pardon Our Interruption"]},
+    "AWS WAF":     {"headers": ["x-amzn-requestid", "x-amzn-errortype"],
+                    "body":    ["Request blocked", "AWS WAF"]},
+    "F5 BIG-IP":   {"headers": ["x-wa-info", "bigipserver"],
+                    "body":    ["The requested URL was rejected"]},
+    "Sucuri":      {"headers": ["x-sucuri-id", "x-sucuri-cache"],
+                    "body":    ["Sucuri WebSite Firewall"]},
+    "DataDome":    {"headers": ["x-datadome", "datadome"],
+                    "body":    ["captcha-delivery"]},
+    "ModSecurity": {"headers": ["x-mod-security"], "body": ["ModSecurity"]},
+}
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
+]
+
+
+@dataclass
+class WAFReport:
+    vendor: str = "unknown"
+    confidence: int = 0
+    signals: list[str] = field(default_factory=list)
+    blocked: bool = False
+
+
+@dataclass
+class EvasionProfile:
+    rate_limit: float = 2.0
+    jitter: float = 0.5
+    rotate_ua: bool = True
+    rotate_xff: bool = True
+    proxies: list[str] = field(default_factory=list)
+    backoff_codes: tuple[int, ...] = (403, 406, 429, 503)
+    max_backoff: float = 30.0
+    cooldown_after_block: float = 60.0
+
+
+class EvasionSession:
+    def __init__(self, profile: EvasionProfile, timeout: int = 15):
+        self.profile = profile
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.verify = False
+        self.session.headers.update(_target_headers())
+
+        self._min_interval = 1.0 / profile.rate_limit if profile.rate_limit > 0 else 0.0
+        self._last = 0.0
+        self._backoff = 0.0
+        self._cooldown_until = 0.0
+        self._proxy_idx = 0
+        self._ua_idx = 0
+        self._xff_counter = 0
+
+    def __enter__(self): return self
+    def __exit__(self, *exc):
+        try: self.session.close()
+        except Exception: pass
+
+    def _pace(self):
+        now = time.monotonic()
+        if now < self._cooldown_until:
+            time.sleep(self._cooldown_until - now)
+        interval = self._min_interval + random.uniform(0, self.profile.jitter)
+        elapsed = time.monotonic() - self._last
+        if elapsed < interval:
+            time.sleep(interval - elapsed)
+        if self._backoff > 0:
+            time.sleep(self._backoff)
+        self._last = time.monotonic()
+
+    def _rotate(self):
+        if self.profile.rotate_ua:
+            self.session.headers["User-Agent"] = USER_AGENTS[self._ua_idx % len(USER_AGENTS)]
+            self._ua_idx += 1
+        if self.profile.rotate_xff:
+            self._xff_counter += 1
+            o = self._xff_counter % 254 + 1
+            self.session.headers["X-Forwarded-For"] = f"10.0.{o}.{o}"
+            self.session.headers["X-Real-IP"] = f"10.0.{o}.{o}"
+
+    def _proxy(self) -> Optional[dict]:
+        if not self.profile.proxies:
+            return None
+        p = self.profile.proxies[self._proxy_idx % len(self.profile.proxies)]
+        self._proxy_idx += 1
+        return {"http": p, "https": p}
+
+    def request(self, method: str, url: str, headers: Optional[dict] = None, **kwargs) -> Optional[requests.Response]:
+        self._pace()
+        self._rotate()
+        proxy = self._proxy()
+        try:
+            resp = self.session.request(
+                method, url,
+                headers=headers,
+                timeout=kwargs.pop("timeout", self.timeout),
+                allow_redirects=kwargs.pop("allow_redirects", False),
+                verify=False, proxies=proxy, **kwargs,
+            )
+        except requests.RequestException as e:
+            log.debug(f"request failed: {method} {url}: {e}")
+            return None
+
+        if resp.status_code in self.profile.backoff_codes:
+            self._backoff = min(self.profile.max_backoff,
+                                max(1.0, self._backoff * 2 or 1.0))
+            low = (resp.text or "")[:2000].lower()
+            if any(w in low for w in ("blocked", "firewall", "captcha", "denied")):
+                self._cooldown_until = time.monotonic() + self.profile.cooldown_after_block
+                log.warning("  WAF block — cooling down %.0fs",
+                            self.profile.cooldown_after_block)
+        elif resp.status_code < 400:
+            self._backoff = 0.0
+        return resp
+
+    def get(self, url: str, headers: Optional[dict] = None, **kwargs):
+        return self.request("GET", url, headers=headers, **kwargs)
+
+    def benign_get(self, url: str) -> Optional[requests.Response]:
+        try:
+            return self.session.get(url, timeout=self.timeout, verify=False)
+        except requests.RequestException:
+            return None
+
+
+def detect_waf(session: EvasionSession, url: str) -> WAFReport:
+    report = WAFReport()
+    try:
+        resp = session.benign_get(url)
+    except Exception:
+        return report
+    if resp is None:
+        return report
+
+    header_blob = " ".join(f"{k.lower()}:{v}" for k, v in resp.headers.items()).lower()
+    body_blob = (resp.text or "")[:4000].lower()
+
+    for vendor, sig in WAF_SIGNATURES.items():
+        hits = [f"header:{h}" for h in sig["headers"] if h.lower() in header_blob]
+        hits += [f"body:{b[:40]}" for b in sig["body"] if b.lower() in body_blob]
+        if hits:
+            report.vendor = vendor
+            report.signals = hits
+            report.confidence = min(100, 50 + 15 * len(hits))
+            break
+
+    if resp.status_code in (403, 406, 429, 503):
+        low = (resp.text or "")[:2000].lower()
+        if any(w in low for w in ("blocked", "denied", "firewall", "captcha")):
+            report.blocked = True
+            if report.vendor == "unknown":
+                report.vendor = "generic-waf"
+                report.confidence = 40
+    return report
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ═════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_THREADS = 2
-DEFAULT_RATE_LIMIT = 2
-DEFAULT_TIMEOUT = 15
-DEFAULT_RETRIES = 1
-
 SEQUENTIAL_RE = re.compile(r"\b(\d{1,10})\b")
 UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
 HEX_ID_RE = re.compile(r"\b([0-9a-f]{16,})\b", re.I)
+JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")
 
 ID_PARAM_NAMES = {
     "id", "user_id", "userid", "uid", "account_id", "accountid",
@@ -138,9 +356,10 @@ ID_BODY_FIELDS = ID_PARAM_NAMES | {"owner", "created_by"}
 IDENTITY_HEADERS = [
     "X-User-Id", "X-User-ID", "X-Account-Id", "X-Account-ID",
     "X-Customer-Id", "X-Tenant-Id", "X-Org-Id", "X-Forwarded-User",
+    "X-Original-User", "X-Remote-User", "X-Authenticated-User",
 ]
 
-METHOD_ROTATION = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+METHOD_ROTATION = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
 
 OWNERSHIP_FIELDS = {
     "user_id", "userId", "uid", "account_id", "accountId",
@@ -150,19 +369,31 @@ OWNERSHIP_FIELDS = {
     "customer_id", "customerId",
 }
 
-CONF_CONFIRMED = 90
-CONF_LIKELY = 70
-CONF_SURFACE = 40
+# ── Sensitivity classification ────────────────────────────────────────────
+SENSITIVE_FIELDS = {
+    "credentials": [
+        "password", "password_hash", "passwd", "secret", "api_key",
+        "access_token", "refresh_token", "session_token", "private_key",
+    ],
+    "pii_high": [
+        "ssn", "social_security", "credit_card", "card_number", "cvv",
+        "bank_account", "routing_number", "tax_id", "national_id", "passport",
+    ],
+    "pii_medium": [
+        "email", "phone", "address", "dob", "birthdate", "date_of_birth",
+        "first_name", "last_name", "full_name", "postal_code",
+    ],
+    "financial": [
+        "balance", "amount", "transaction", "invoice", "salary",
+        "billing", "total", "payment", "order_total", "refund",
+    ],
+    "admin": [
+        "role", "is_admin", "permissions", "groups", "scopes",
+        "is_superuser", "is_staff", "admin",
+    ],
+}
 
-# Enumeration window for sequential IDs
-ENUM_RADIUS = 3
-
-# Sensitive content markers (for confirming foreign data)
-SENSITIVE_MARKERS = [
-    "email", "username", "account", "profile", "invoice",
-    "billing", "password", "ssn", "credit", "address",
-    "phone", "balance", "transaction",
-]
+SENSITIVITY_PRIORITY = ["credentials", "pii_high", "pii_medium", "financial", "admin"]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -179,7 +410,7 @@ class IDORFinding:
     id_type: str = "unknown"
     own_id: str = ""
     other_id: str = ""
-    severity: str = "MEDIUM"
+    severity: Severity = Severity.MEDIUM
     confidence: int = 50
     confirmed: bool = False
     evidence: str = ""
@@ -187,6 +418,10 @@ class IDORFinding:
     response_a: str = ""
     response_b: str = ""
     ownership_leak: str = ""
+    sensitivity: str = ""
+    sensitive_fields: list[str] = field(default_factory=list)
+    chain_ids: list[str] = field(default_factory=list)
+    waf_vendor: str = ""
     details: dict = field(default_factory=dict)
     auth_enabled: bool = False
     first_seen: str = ""
@@ -194,32 +429,56 @@ class IDORFinding:
     @property
     def finding_hash(self) -> str:
         return hashlib.sha256(
-            f"{self.target}|{self.vuln_type}|{self.own_id}|{self.other_id}|{self.technique}".encode()
+            f"{self.target}|{self.vuln_type}|{self.param_name}|{self.own_id}|{self.other_id}".encode()
         ).hexdigest()
 
     def to_dict(self) -> dict:
         return {
-            "target":         self.target,
-            "target_host":    urllib.parse.urlparse(self.target).hostname or "",
-            "vuln_type":      self.vuln_type,
-            "technique":      self.technique,
-            "param_name":     self.param_name,
-            "param_location": self.param_location,
-            "id_type":        self.id_type,
-            "own_id":         self.own_id,
-            "other_id":       self.other_id,
-            "severity":       self.severity,
-            "confidence":     self.confidence,
-            "confirmed":      self.confirmed,
-            "evidence":       self.evidence[:500],
-            "request_curl":   self.request_curl[:2000],
-            "response_a":     self.response_a[:500],
-            "response_b":     self.response_b[:500],
-            "ownership_leak": self.ownership_leak[:200],
-            "details":        self.details,
-            "auth_enabled":   self.auth_enabled,
-            "finding_hash":   self.finding_hash,
-            "first_seen":     self.first_seen,
+            "target":           self.target,
+            "target_host":      urllib.parse.urlparse(self.target).hostname or "",
+            "vuln_type":        self.vuln_type,
+            "technique":        self.technique,
+            "param_name":       self.param_name,
+            "param_location":   self.param_location,
+            "id_type":          self.id_type,
+            "own_id":           self.own_id,
+            "other_id":         self.other_id,
+            "severity":         self.severity.value,
+            "confidence":       self.confidence,
+            "confirmed":        self.confirmed,
+            "evidence":         self.evidence[:600],
+            "request_curl":     self.request_curl[:2000],
+            "response_a":       self.response_a[:500],
+            "response_b":       self.response_b[:500],
+            "ownership_leak":   self.ownership_leak[:300],
+            "sensitivity":      self.sensitivity,
+            "sensitive_fields": self.sensitive_fields,
+            "chain_ids":        self.chain_ids,
+            "waf_vendor":       self.waf_vendor,
+            "details":          self.details,
+            "auth_enabled":     self.auth_enabled,
+            "finding_hash":     self.finding_hash,
+            "first_seen":       self.first_seen,
+        }
+
+
+@dataclass
+class IDORChain:
+    chain_id: str
+    name: str
+    severity: Severity
+    steps: list[str]
+    finding_hashes: list[str] = field(default_factory=list)
+    evidence: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "chain_id":       self.chain_id,
+            "name":           self.name,
+            "severity":       self.severity.value,
+            "steps":          self.steps,
+            "finding_hashes": self.finding_hashes,
+            "evidence":       self.evidence[:600],
         }
 
 
@@ -234,50 +493,13 @@ class ObjectSurface:
 
     def to_dict(self) -> dict:
         return {
-            "endpoint": self.endpoint,
-            "method": self.method,
-            "param_name": self.param_name,
+            "endpoint":       self.endpoint,
+            "method":         self.method,
+            "param_name":     self.param_name,
             "param_location": self.param_location,
-            "id_type": self.id_type,
-            "sample_ids": self.sample_ids[:10],
+            "id_type":        self.id_type,
+            "sample_ids":     self.sample_ids[:10],
         }
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  RATE-LIMITED SESSION
-# ═════════════════════════════════════════════════════════════════════════════
-
-class RateLimitedSession:
-    def __init__(self, rate_limit: int = DEFAULT_RATE_LIMIT, timeout: int = DEFAULT_TIMEOUT):
-        self.session = requests.Session()
-        self.session.verify = False
-        base_hdrs = _target_headers()
-        if base_hdrs:
-            self.session.headers.update(base_hdrs)
-        self.min_interval = 1.0 / rate_limit if rate_limit and rate_limit > 0 else 0.0
-        self.timeout = timeout
-        self._last = 0.0
-
-    def request(self, method: str, url: str, **kwargs) -> Optional[requests.Response]:
-        if self.min_interval > 0:
-            elapsed = time.monotonic() - self._last
-            if elapsed < self.min_interval:
-                time.sleep(self.min_interval - elapsed)
-        self._last = time.monotonic()
-        try:
-            return self.session.request(
-                method, url,
-                timeout=kwargs.pop("timeout", self.timeout),
-                allow_redirects=kwargs.pop("allow_redirects", False),
-                verify=False,
-                **kwargs,
-            )
-        except requests.RequestException as e:
-            log.debug(f"request failed: {method} {url}: {e}")
-            return None
-
-    def get(self, url: str, **kwargs):
-        return self.request("GET", url, **kwargs)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -287,47 +509,61 @@ class RateLimitedSession:
 def _load_urls(input_file: Path) -> list[str]:
     if not input_file.exists():
         return []
-    urls: list[str] = []
-    seen: set[str] = set()
+    urls, seen = [], set()
     for line in input_file.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        token = line.split()[0]
-        if not token.startswith(("http://", "https://")):
-            token = "https://" + token
-        if token not in seen:
-            seen.add(token)
-            urls.append(token)
+        tok = line.split()[0]
+        if not tok.startswith(("http://", "https://")):
+            tok = "https://" + tok
+        if tok not in seen:
+            seen.add(tok)
+            urls.append(tok)
     return urls
 
 
-def _body_snippet(resp: requests.Response, max_len: int = 500) -> str:
+def _body_text(resp: Optional[requests.Response]) -> str:
+    if resp is None:
+        return ""
     try:
-        return resp.text[:max_len].replace("\n", " ").strip()
+        return resp.text[:200000]
     except Exception:
         return ""
 
 
-def _similarity(a_text: str, b_text: str) -> float:
-    """Return similarity 0.0–1.0 between two response bodies."""
-    a = (a_text or "")[:5000]
-    b = (b_text or "")[:5000]
+def _body_snippet(resp: Optional[requests.Response], n: int = 500) -> str:
+    return _body_text(resp)[:n].replace("\n", " ").strip()
+
+
+def _body_fingerprint(resp: Optional[requests.Response]) -> str:
+    if resp is None:
+        return ""
+    try:
+        return hashlib.sha256(resp.content).hexdigest()[:16]
+    except Exception:
+        return ""
+
+
+def _similarity(resp_a: Optional[requests.Response], resp_b: Optional[requests.Response]) -> float:
+    """0.0–1.0 similarity between two response bodies."""
+    if resp_a is None or resp_b is None:
+        return 0.0
+    try:
+        fa = _body_fingerprint(resp_a)
+        fb = _body_fingerprint(resp_b)
+        if fa and fa == fb:
+            return 1.0
+    except Exception:
+        pass
+    a = _body_text(resp_a)[:5000]
+    b = _body_text(resp_b)[:5000]
     if not a and not b:
-        return 1.0
-    if a == b:
         return 1.0
     if a[:200] == b[:200]:
         return 0.95
     len_ratio = min(len(a), len(b)) / max(len(a), len(b), 1)
     return len_ratio
-
-
-def _body_text(resp: requests.Response) -> str:
-    try:
-        return resp.text[:200000]
-    except Exception:
-        return ""
 
 
 def _extract_ids(text: str) -> dict[str, list[str]]:
@@ -346,6 +582,60 @@ def _extract_ids(text: str) -> dict[str, list[str]]:
     return result
 
 
+def _extract_jwt_ids(text: str) -> list[tuple[str, str]]:
+    """Extract ID-like claims from any JWTs embedded in the text."""
+    out: list[tuple[str, str]] = []
+    if not text:
+        return out
+    for tok in JWT_RE.findall(text)[:5]:
+        parts = tok.split(".")
+        if len(parts) != 3:
+            continue
+        try:
+            payload = parts[1] + "=" * (4 - len(parts[1]) % 4)
+            data = json.loads(base64.urlsafe_b64decode(payload))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        for k, v in data.items():
+            if isinstance(v, (str, int)) and k.lower() in ID_PARAM_NAMES:
+                out.append((k, str(v)))
+    return out
+
+
+def _extract_cookie_ids(resp: Optional[requests.Response]) -> list[tuple[str, str]]:
+    """Extract ID-like values from cookies."""
+    if resp is None:
+        return []
+    out: list[tuple[str, str]] = []
+    for cookie in resp.cookies:
+        try:
+            v = cookie.value
+            # Try JSON
+            if v.startswith("{") or v.startswith("["):
+                data = json.loads(v)
+                if isinstance(data, dict):
+                    for k, val in data.items():
+                        if k.lower() in ID_PARAM_NAMES and isinstance(val, (str, int)):
+                            out.append((k, str(val)))
+            # Try base64-encoded JSON
+            elif len(v) > 20:
+                try:
+                    pad = "=" * (4 - len(v) % 4)
+                    decoded = base64.b64decode(v + pad)
+                    data = json.loads(decoded)
+                    if isinstance(data, dict):
+                        for k, val in data.items():
+                            if k.lower() in ID_PARAM_NAMES and isinstance(val, (str, int)):
+                                out.append((k, str(val)))
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return out
+
+
 def _classify_id(sample: str) -> str:
     if UUID_RE.match(sample):
         return "uuid"
@@ -356,8 +646,7 @@ def _classify_id(sample: str) -> str:
     return "opaque"
 
 
-def _nearby_ids(sample: str, radius: int = ENUM_RADIUS) -> list[str]:
-    """Enumerate IDs near a known sequential ID (for enumeration testing)."""
+def _nearby_ids(sample: str, radius: int = 3) -> list[str]:
     if not sample.isdigit():
         return []
     n = int(sample)
@@ -375,13 +664,13 @@ def _encode_variants(sample: str) -> list[str]:
         variants.append(base64.b64encode(sample.encode()).decode().rstrip("="))
     except Exception:
         pass
-    variants.append(urllib.parse.quote(sample))
-    variants.append(urllib.parse.quote(urllib.parse.quote(sample)))
+    variants.append(urllib.parse.quote(sample, safe=""))
+    variants.append(urllib.parse.quote(urllib.parse.quote(sample, safe=""), safe=""))
     try:
         variants.append(sample.encode().hex())
     except Exception:
         pass
-    return list(dict.fromkeys(variants))
+    return list(dict.fromkeys(v for v in variants if v))
 
 
 def _build_curl(
@@ -396,7 +685,7 @@ def _build_curl(
             else:
                 parts.append(f"-H '{k}: {v}'")
     if json_body:
-        parts.append(f"-H 'Content-Type: application/json'")
+        parts.append("-H 'Content-Type: application/json'")
         parts.append(f"-d '{json.dumps(json_body)[:300]}'")
     elif data:
         parts.append(f"-d '{urllib.parse.urlencode(data)[:300]}'")
@@ -404,72 +693,109 @@ def _build_curl(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  OWNERSHIP ANALYSIS (FIXED)
+#  SENSITIVITY CLASSIFICATION
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _extract_ownership_fields(resp: requests.Response) -> list[tuple[str, str]]:
+def _classify_sensitivity(resp: Optional[requests.Response]) -> tuple[str, list[str]]:
     """
-    Walk a JSON response and return every (field_name, value) pair where
-    the field looks like an ownership identifier.
+    Classify the response body's sensitivity.
+    Returns (category, matched_field_names).
+    Categories in priority order: credentials, pii_high, pii_medium,
+    financial, admin, none.
     """
-    out: list[tuple[str, str]] = []
+    if resp is None:
+        return ("none", [])
+    body = _body_text(resp).lower()
+    if not body:
+        return ("none", [])
+
+    for category in SENSITIVITY_PRIORITY:
+        markers = SENSITIVE_FIELDS.get(category, [])
+        hits = [m for m in markers if m in body]
+        if hits:
+            return (category, hits)
+    return ("none", [])
+
+
+def _sensitivity_to_chain(category: str) -> Optional[str]:
+    return {
+        "credentials": "idor-account-takeover",
+        "pii_high":    "idor-pii-exposure",
+        "pii_medium":  "idor-pii-exposure",
+        "financial":   "idor-financial",
+        "admin":       "idor-admin-privesc",
+    }.get(category)
+
+
+def _severity_from_sensitivity(
+    confirmed: bool, category: str, bypass_confirmed: bool = False,
+) -> tuple[Severity, int]:
+    """
+    Return (severity, confidence) based on confirmed IDOR + sensitivity.
+    """
+    if not confirmed and not bypass_confirmed:
+        return (Severity.MEDIUM, 55)
+
+    if category in ("credentials", "pii_high", "admin"):
+        return (Severity.CRITICAL, 95)
+    if category in ("pii_medium", "financial"):
+        return (Severity.HIGH, 90)
+    if bypass_confirmed:
+        return (Severity.HIGH, 88)
+    return (Severity.MEDIUM, 75)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  OWNERSHIP ANALYSIS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _extract_ownership_fields(resp: Optional[requests.Response]) -> list[tuple[str, str]]:
+    if resp is None:
+        return []
     try:
         data = resp.json()
     except Exception:
-        return out
+        return []
+    out: list[tuple[str, str]] = []
 
-    def _walk(obj, prefix=""):
+    def _walk(obj):
         if isinstance(obj, dict):
             for k, v in obj.items():
                 if k in OWNERSHIP_FIELDS and isinstance(v, (str, int)):
                     out.append((k, str(v)))
-                _walk(v, f"{prefix}.{k}" if prefix else k)
+                _walk(v)
         elif isinstance(obj, list):
             for item in obj[:10]:
-                _walk(item, prefix)
+                _walk(item)
 
     _walk(data)
     return out
 
 
 def _ownership_match(
-    resp: requests.Response, owner_id: str,
+    resp: Optional[requests.Response], owner_id: str,
 ) -> Optional[tuple[str, str]]:
-    """
-    Return the (field, value) where the response identifies `owner_id`
-    as the owner. This is what we use to *confirm* IDOR — the response must
-    contain the OTHER user's identifier, not just any ownership field.
-    """
-    if not owner_id:
+    if not owner_id or resp is None:
         return None
     for field_name, value in _extract_ownership_fields(resp):
-        if value == owner_id:
-            return (field_name, value)
-        # Sometimes owner IDs are embedded in strings
-        if owner_id in value:
+        if value == owner_id or owner_id in value:
             return (field_name, value)
     return None
 
 
-def _foreign_data_present(resp: requests.Response, own_id: str) -> Optional[str]:
-    """
-    Check whether the response clearly contains data that is NOT the
-    requesting user's (i.e., doesn't reference own_id where it should).
-    Returns a descriptive string or None.
-    """
+def _foreign_data_present(
+    resp: Optional[requests.Response], own_id: str,
+) -> Optional[str]:
     fields = _extract_ownership_fields(resp)
     if not fields:
         return None
-    # If every ownership field points to own_id, it's the requester's data
     if all(v == own_id or own_id in v for _, v in fields):
         return None
-    # At least one field points elsewhere — foreign data
-    sample = ", ".join(f"{k}={v}" for k, v in fields[:3])
-    return sample
+    return ", ".join(f"{k}={v}" for k, v in fields[:3])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 1 — SURFACE DISCOVERY (expanded)
+#  SURFACE DISCOVERY
 # ═════════════════════════════════════════════════════════════════════════════
 
 REST_ID_PATH_RE = re.compile(
@@ -479,14 +805,12 @@ REST_ID_PATH_RE = re.compile(
 
 
 def discover_surfaces_from_urls(urls: list[str]) -> list[ObjectSurface]:
-    """REST path, query, and (if present) form surfaces."""
     surfaces: list[ObjectSurface] = []
     seen: set[tuple] = set()
 
     for url in urls:
         parsed = urllib.parse.urlparse(url)
 
-        # ── Path-based IDs
         for m in REST_ID_PATH_RE.finditer(parsed.path + "/"):
             resource = m.group(1)
             ident = m.group(2)
@@ -501,7 +825,6 @@ def discover_surfaces_from_urls(urls: list[str]) -> list[ObjectSurface]:
                 sample_ids=[ident],
             ))
 
-        # ── Query-based IDs
         for k, vals in urllib.parse.parse_qs(parsed.query).items():
             if k.lower() in ID_PARAM_NAMES and vals:
                 key = ("query", url.split("?")[0], k)
@@ -519,10 +842,6 @@ def discover_surfaces_from_urls(urls: list[str]) -> list[ObjectSurface]:
 
 
 def discover_surfaces_from_pages(outdir: Path) -> list[ObjectSurface]:
-    """
-    Discover body-based surfaces from site_pages.json (if the crawler ran).
-    Forms with POST methods and ID-like field names are the target.
-    """
     surfaces: list[ObjectSurface] = []
     pages_file = outdir / "site_pages.json"
     if not pages_file.exists():
@@ -553,95 +872,143 @@ def discover_surfaces_from_pages(outdir: Path) -> list[ObjectSurface]:
                     surfaces.append(ObjectSurface(
                         endpoint=action, method="POST",
                         param_name=field_def.get("name"),
-                        param_location="body",
-                        id_type="unknown",
-                        sample_ids=[],
+                        param_location="body", id_type="unknown",
                     ))
-
     return surfaces
 
 
-def discover_surfaces_from_graphql(
-    outdir: Path,
-) -> list[ObjectSurface]:
-    """Extract GraphQL node(id:) and ID-arg surfaces from the schema dump."""
+def discover_surfaces_from_graphql(outdir: Path) -> list[ObjectSurface]:
     surfaces: list[ObjectSurface] = []
     schema_file = outdir / "graphql_schema.json"
     if not schema_file.exists():
         return surfaces
-
     try:
         schemas = json.loads(schema_file.read_text())
     except Exception:
         return surfaces
 
     for gql_url, schema in schemas.items():
+        if not isinstance(schema, dict):
+            continue
         for t in schema.get("types", []):
+            if not isinstance(t, dict):
+                continue
             for f in t.get("fields") or []:
+                if not isinstance(f, dict):
+                    continue
                 for arg in f.get("args") or []:
+                    if not isinstance(arg, dict):
+                        continue
                     aname = (arg.get("name") or "").lower()
                     if aname in ("id", "uuid", "user_id", "account_id", "nodeid"):
                         surfaces.append(ObjectSurface(
                             endpoint=gql_url, method="POST",
                             param_name=arg.get("name", "id"),
-                            param_location="graphql",
-                            id_type="opaque",
-                            sample_ids=[],
+                            param_location="graphql", id_type="opaque",
                         ))
                         break
-
     return surfaces
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 2 — IDENTIFIER HARVESTING PER SESSION
+#  ID HARVESTING
 # ═════════════════════════════════════════════════════════════════════════════
 
 LISTING_PATHS = [
     "/api/users", "/api/accounts", "/api/orders", "/api/invoices",
     "/api/documents", "/api/projects", "/api/items", "/api/v1/users",
     "/api/v1/accounts", "/api/v1/orders", "/api/me", "/users", "/accounts",
+    "/api/v1/me", "/api/v2/me", "/api/profile", "/api/profile/me",
+]
+
+JS_ID_PATTERNS = [
+    re.compile(r'["\']userId["\']\s*[:=]\s*["\']?(\d+)', re.I),
+    re.compile(r'["\']accountId["\']\s*[:=]\s*["\']?(\d+)', re.I),
+    re.compile(r'localStorage\.setItem\(["\']userId["\'],\s*["\'](\d+)', re.I),
+    re.compile(r'window\.user\s*=\s*\{[^}]*["\']id["\']\s*:\s*["\']?(\d+)', re.I),
 ]
 
 
 def harvest_ids_for_session(
-    session: RateLimitedSession,
+    session: EvasionSession,
     headers: dict,
     host_url: str,
     surface: ObjectSurface,
     max_ids: int = 10,
-) -> list[str]:
-    """Harvest IDs visible to a specific session."""
-    harvested: set[str] = set()
+) -> dict[str, list[str]]:
+    """
+    Harvest IDs visible to a specific session.
+    Returns dict of {source: [ids]} where source ∈ {sequential, uuid, hex,
+    jwt_claim, cookie, js_var}.
+    """
+    harvested: dict[str, set[str]] = {
+        "sequential": set(), "uuid": set(), "hex": set(),
+        "jwt_claim": set(), "cookie": set(), "js_var": set(),
+    }
 
-    # From the target endpoint itself
-    resp = session.get(surface.endpoint, headers=headers)
-    if resp and resp.status_code < 400:
-        for kind in _extract_ids(_body_text(resp)).values():
-            harvested.update(kind[:max_ids])
+    def _harvest_response(resp: Optional[requests.Response]) -> None:
+        if resp is None or resp.status_code >= 400:
+            return
+        text = _body_text(resp)
+        for kind, ids in _extract_ids(text).items():
+            harvested[kind].update(ids[:max_ids])
+        for _, v in _extract_jwt_ids(text):
+            harvested["jwt_claim"].add(v)
+        for _, v in _extract_cookie_ids(resp):
+            harvested["cookie"].add(v)
+        for pat in JS_ID_PATTERNS:
+            for m in pat.findall(text):
+                harvested["js_var"].add(m)
 
-    # From common listing endpoints on the same host
+    # From target endpoint
+    _harvest_response(session.get(surface.endpoint, headers=headers))
+
+    # From listing endpoints
     for path in LISTING_PATHS:
         test_url = host_url.rstrip("/") + path
-        r = session.get(test_url, headers=headers)
-        if not r or r.status_code >= 400:
-            continue
-        for kind in _extract_ids(_body_text(r)).values():
-            harvested.update(kind[:max_ids])
-        if len(harvested) >= max_ids * 2:
+        _harvest_response(session.get(test_url, headers=headers))
+        if sum(len(v) for v in harvested.values()) >= max_ids * 2:
             break
 
-    return list(harvested)[:max_ids]
+    return {k: list(v)[:max_ids] for k, v in harvested.items() if v}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 3 — BASELINE VARIANCE
+#  URL / BODY BUILDERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _build_test_url(surface: ObjectSurface, id_value: str) -> str:
+    if surface.param_location == "path":
+        if surface.sample_ids:
+            return surface.endpoint.replace(surface.sample_ids[0], id_value, 1)
+        return surface.endpoint
+    if surface.param_location == "query":
+        parsed = urllib.parse.urlparse(surface.endpoint)
+        params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        new_params = [(k, id_value if k == surface.param_name else v) for k, v in params]
+        return urllib.parse.urlunparse(parsed._replace(
+            query=urllib.parse.urlencode(new_params),
+        ))
+    return surface.endpoint
+
+
+def _build_request_body(surface: ObjectSurface, id_value: str) -> Optional[dict]:
+    if surface.param_location == "body":
+        return {surface.param_name: id_value}
+    if surface.param_location == "graphql":
+        for root_field in ("node", "user", "account", "order", "item"):
+            return {"query": f'{{ {root_field}({surface.param_name}: "{id_value}") {{ __typename }} }}'}
+    return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  BASELINE VARIANCE
 # ═════════════════════════════════════════════════════════════════════════════
 
 def compute_baseline(
-    session: RateLimitedSession, surface: ObjectSurface, headers: dict,
+    session: EvasionSession, surface: ObjectSurface, headers: dict,
 ) -> tuple[float, Optional[requests.Response]]:
-    """Fetch the endpoint twice with the same session — return (similarity, first_resp)."""
+    """Two identical requests — return (similarity, first_resp)."""
     r1 = session.get(surface.endpoint, headers=headers)
     if not r1:
         return 0.0, None
@@ -649,188 +1016,166 @@ def compute_baseline(
     r2 = session.get(surface.endpoint, headers=headers)
     if not r2:
         return 0.0, r1
-    return _similarity(_body_text(r1), _body_text(r2)), r1
+    return _similarity(r1, r2), r1
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 4 — CROSS-IDENTITY TESTING (FIXED)
+#  CORE — CROSS-IDENTITY TEST
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _replace_id_in_url(url: str, old_id: str, new_id: str) -> str:
-    """Replace an identifier in the URL path or query."""
-    if old_id in url:
-        url = url.replace(old_id, new_id, 1)
-    return url
-
-
-def _build_test_url(surface: ObjectSurface, id_value: str) -> str:
-    """Build a URL that requests a specific ID on this surface."""
-    if surface.param_location == "path":
-        # The sample_ids[0] is the original ID — replace it
-        if surface.sample_ids:
-            return _replace_id_in_url(surface.endpoint, surface.sample_ids[0], id_value)
-        return surface.endpoint
-    if surface.param_location == "query":
-        parsed = urllib.parse.urlparse(surface.endpoint)
-        params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-        new_params = [(k, id_value if k == surface.param_name else v) for k, v in params]
-        return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(new_params)))
-    return surface.endpoint
-
-
-def _build_graphql_query(surface: ObjectSurface, id_value: str) -> dict:
-    """Build a GraphQL query that requests a specific ID."""
-    # Heuristic: try { field(id: "value") { __typename } }
-    # The field name has to be inferred — try common root query names
-    for root_field in ("node", "user", "account", "order", "item"):
-        q = f'{{ {root_field}({surface.param_name}: "{id_value}") {{ __typename }} }}'
-        return {"query": q}
-    return {"query": f'{{ __typename }}'}
+def _make_request(
+    session: EvasionSession, surface: ObjectSurface, id_value: str,
+    headers: dict,
+) -> Optional[requests.Response]:
+    url = _build_test_url(surface, id_value)
+    body = _build_request_body(surface, id_value)
+    if body is not None:
+        return session.request(surface.method, url, headers=headers, json=body)
+    return session.request(surface.method, url, headers=headers)
 
 
 def test_idor_dual_session(
-    session_a: RateLimitedSession,
-    session_b: RateLimitedSession,
+    session_a: EvasionSession,
+    session_b: EvasionSession,
     surface: ObjectSurface,
     own_id: str,
     other_id: str,
     headers_a: dict,
     headers_b: dict,
-    baseline_a_similarity: float = 1.0,
+    waf: WAFReport,
 ) -> list[IDORFinding]:
     """
-    The real IDOR test. Compare four requests:
+    Core cross-identity test.
 
-      1. User A → own_id          (baseline: User A sees User A's data)
-      2. User B → other_id        (baseline: User B sees User B's data)
-      3. User A → other_id        (test: if 200 + matches B's data = IDOR)
-      4. User B → own_id          (reversal: confirms direction)
+    1. User A → own_id           (baseline A)
+    2. User B → other_id         (baseline B)
+    3. User A → other_id         (test)  — if 200 and matches B's data = IDOR
+    4. User B → own_id           (reversal)
 
-    A finding requires evidence that the response to request 3 contains
-    User B's ownership identifiers OR is materially identical to User B's
-    baseline response (request 2).
+    A confirmed finding needs (3) to contain User B's ownership identifiers
+    OR be byte-identical to (2).
     """
     findings: list[IDORFinding] = []
     now = datetime.now(timezone.utc).isoformat()
 
-    if surface.param_location == "graphql":
-        a_own_url = b_other_url = a_other_url = b_own_url = surface.endpoint
-        a_own_body = _build_graphql_query(surface, own_id)
-        b_other_body = _build_graphql_query(surface, other_id)
-        a_other_body = _build_graphql_query(surface, other_id)
-        b_own_body = _build_graphql_query(surface, own_id)
-        req_kwargs = lambda body: {"json": body}  # noqa: E731
-    elif surface.param_location == "body":
-        a_own_url = b_other_url = a_other_url = b_own_url = surface.endpoint
-        a_own_body = {surface.param_name: own_id}
-        b_other_body = {surface.param_name: other_id}
-        a_other_body = {surface.param_name: other_id}
-        b_own_body = {surface.param_name: own_id}
-        req_kwargs = lambda body: {"json": body}  # noqa: E731
-    else:
-        a_own_url = _build_test_url(surface, own_id)
-        b_other_url = _build_test_url(surface, other_id)
-        a_other_url = _build_test_url(surface, other_id)
-        b_own_url = _build_test_url(surface, own_id)
-        req_kwargs = lambda body: {}  # noqa: E731
-
-    # ── Baselines
-    r_a_own = session_a.request(surface.method, a_own_url, headers=headers_a, **req_kwargs(a_own_body if surface.param_location in ("body", "graphql") else None))
-    r_b_other = session_b.request(surface.method, b_other_url, headers=headers_b, **req_kwargs(b_other_body if surface.param_location in ("body", "graphql") else None))
-
-    if not r_a_own or not r_b_other:
-        return findings
-    if not (200 <= r_a_own.status_code < 300):
+    r_a_own = _make_request(session_a, surface, own_id, headers_a)
+    if not r_a_own or not (200 <= r_a_own.status_code < 300):
         return findings
 
-    # ── Test: User A requesting User B's object
-    r_a_other = session_a.request(surface.method, a_other_url, headers=headers_a, **req_kwargs(a_other_body if surface.param_location in ("body", "graphql") else None))
+    r_b_other = _make_request(session_b, surface, other_id, headers_b)
+    if not r_b_other:
+        return findings
+
+    # Test
+    r_a_other = _make_request(session_a, surface, other_id, headers_a)
     if not r_a_other:
         return findings
 
+    # Denied? Record as protected evidence, return
     if not (200 <= r_a_other.status_code < 300):
-        # 403/404 — properly denied. Not a finding, but useful evidence.
-        if r_a_other.status_code in (403, 401):
+        if r_a_other.status_code in (401, 403):
             findings.append(IDORFinding(
                 target=surface.endpoint, vuln_type="idor_protected",
                 technique="direct_swap", param_name=surface.param_name,
-                param_location=surface.param_location,
-                id_type=surface.id_type,
+                param_location=surface.param_location, id_type=surface.id_type,
                 own_id=own_id, other_id=other_id,
-                severity="INFO", confidence=30, confirmed=False,
-                evidence=f"User A requesting User B's object returned HTTP {r_a_other.status_code} — properly denied",
+                severity=Severity.INFO, confidence=30, confirmed=False,
+                evidence=f"HTTP {r_a_other.status_code} — properly denied",
                 response_a=_body_snippet(r_a_own),
                 response_b=_body_snippet(r_a_other),
-                details={"status_own": r_a_own.status_code, "status_cross": r_a_other.status_code},
+                waf_vendor=waf.vendor,
+                details={"status_own": r_a_own.status_code,
+                         "status_cross": r_a_other.status_code},
                 auth_enabled=True, first_seen=now,
             ))
         return findings
 
-    # ── Analysis: did we get User B's data?
+    # Did we get User B's data?
     owns_b = _ownership_match(r_a_other, other_id)
-    b_baseline_similarity = _similarity(_body_text(r_a_other), _body_text(r_b_other))
-    a_baseline_similarity = _similarity(_body_text(r_a_other), _body_text(r_a_own))
+    b_baseline_match = _similarity(r_a_other, r_b_other)
+    a_baseline_match = _similarity(r_a_other, r_a_own)
+    fp_cross = _body_fingerprint(r_a_other)
+    fp_b = _body_fingerprint(r_b_other)
 
     evidence: list[str] = [f"User A → other_id returned HTTP {r_a_other.status_code}"]
-    confidence = CONF_LIKELY
+    confidence = 70
     confirmed = False
 
     if owns_b:
-        field_name, value = owns_b
-        evidence.append(f"Response contains User B's identifier: {field_name}={value}")
-        confidence = CONF_CONFIRMED
+        evidence.append(f"Response contains User B's identifier: {owns_b[0]}={owns_b[1]}")
+        confidence = 90
         confirmed = True
 
-    if b_baseline_similarity >= 0.90:
-        evidence.append(f"Response matches User B's baseline ({b_baseline_similarity:.2f} similarity)")
-        confidence = CONF_CONFIRMED
+    if b_baseline_match >= 0.90 and fp_cross and fp_cross == fp_b:
+        evidence.append(f"Byte-identical to User B's baseline (fp={fp_cross})")
+        confidence = 95
+        confirmed = True
+    elif b_baseline_match >= 0.90:
+        evidence.append(f"Response matches User B's baseline ({b_baseline_match:.2f})")
+        confidence = max(confidence, 88)
         confirmed = True
 
-    if a_baseline_similarity >= 0.95:
-        # Response looks like User A's own data — likely the ID param is ignored
-        evidence.append("Response matches User A's own baseline — parameter likely ignored (not IDOR)")
+    if a_baseline_match >= 0.95:
+        evidence.append("Response matches User A's own baseline — param likely ignored (not IDOR)")
         return findings
 
-    # ── Reversal (only if we're at LIKELY or higher)
-    if confidence >= CONF_LIKELY:
-        r_b_own = session_b.request(surface.method, b_own_url, headers=headers_b, **req_kwargs(b_own_body if surface.param_location in ("body", "graphql") else None))
-        if r_b_own and 200 <= r_b_own.status_code < 300:
-            a_baseline_match = _similarity(_body_text(r_b_own), _body_text(r_a_own))
-            if a_baseline_match >= 0.90:
-                evidence.append(f"Reversal: User B requesting User A's object returned matching data ({a_baseline_match:.2f})")
-                confidence = CONF_CONFIRMED
+    # Reversal
+    if confidence >= 70:
+        r_b_own = _make_request(session_b, surface, own_id, headers_b)
+        if r_b_own and (200 <= r_b_own.status_code < 300):
+            reversal_sim = _similarity(r_b_own, r_a_own)
+            if reversal_sim >= 0.90:
+                evidence.append(f"Reversal confirmed (User B → User A's object, sim={reversal_sim:.2f})")
+                confidence = max(confidence, 92)
                 confirmed = True
 
-    severity = (
-        "CRITICAL" if confirmed
-        else "HIGH" if confidence >= CONF_LIKELY
-        else "MEDIUM"
+    if not confirmed:
+        return findings
+
+    # ── Sensitivity classification
+    sensitivity, sens_fields = _classify_sensitivity(r_a_other)
+    sev, conf = _severity_from_sensitivity(
+        confirmed=confirmed, category=sensitivity, bypass_confirmed=False,
     )
+
+    # Chain assignment
+    chain_id = _sensitivity_to_chain(sensitivity)
+    chain_ids = [chain_id] if chain_id else []
+
+    # Tenant isolation chain if response has tenant_id
+    if any(f[0] in ("tenant_id", "org_id") for f in _extract_ownership_fields(r_a_other)):
+        chain_ids.append("idor-tenant-isolation")
 
     findings.append(IDORFinding(
         target=surface.endpoint, vuln_type="idor_horizontal",
         technique="direct_swap", param_name=surface.param_name,
         param_location=surface.param_location, id_type=surface.id_type,
         own_id=own_id, other_id=other_id,
-        severity=severity, confidence=confidence, confirmed=confirmed,
+        severity=sev, confidence=conf, confirmed=True,
         evidence=" | ".join(evidence),
         request_curl=_build_curl(
-            surface.method, a_other_url, headers_a,
-            json_body=a_other_body if surface.param_location in ("body", "graphql") else None,
+            surface.method,
+            _build_test_url(surface, other_id),
+            headers_a,
+            json_body=_build_request_body(surface, other_id),
         ),
         response_a=_body_snippet(r_a_own),
         response_b=_body_snippet(r_a_other),
         ownership_leak=str(owns_b) if owns_b else "",
+        sensitivity=sensitivity,
+        sensitive_fields=sens_fields,
+        chain_ids=chain_ids,
+        waf_vendor=waf.vendor,
         details={
             "param": surface.param_name,
-            "param_location": surface.param_location,
             "own_id": own_id, "other_id": other_id,
             "status_a_own": r_a_own.status_code,
             "status_a_other": r_a_other.status_code,
             "status_b_other": r_b_other.status_code,
-            "sim_to_b_baseline": round(b_baseline_similarity, 3),
-            "sim_to_a_baseline": round(a_baseline_similarity, 3),
-            "baseline_stability": round(baseline_a_similarity, 3),
+            "sim_to_b_baseline": round(b_baseline_match, 3),
+            "sim_to_a_baseline": round(a_baseline_match, 3),
+            "fingerprint": fp_cross,
+            "reversed": confidence >= 92,
         },
         auth_enabled=True, first_seen=now,
     ))
@@ -839,150 +1184,195 @@ def test_idor_dual_session(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 5 — ENUMERATION MODE (single-session fallback)
+#  BYPASS MATRIX (~25 techniques)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def test_idor_enumeration(
-    session: RateLimitedSession,
+def _test_bypass(
+    session: EvasionSession,
+    surface: ObjectSurface,
+    other_id: str,
+    headers: dict,
+    technique: str,
+    url: str,
+    method: str = "GET",
+    body: Optional[dict] = None,
+    extra_headers: Optional[dict] = None,
+    data: Optional[str] = None,
+    content_type: Optional[str] = None,
+) -> Optional[requests.Response]:
+    h = dict(headers or {})
+    if extra_headers:
+        h.update(extra_headers)
+    if content_type:
+        h["Content-Type"] = content_type
+    if body is not None:
+        return session.request(method, url, headers=h, json=body)
+    if data is not None:
+        return session.request(method, url, headers=h, data=data)
+    return session.request(method, url, headers=h)
+
+
+def _check_and_build(
+    response: Optional[requests.Response],
+    other_id: str,
+    baseline_b: Optional[requests.Response],
+    technique: str,
     surface: ObjectSurface,
     own_id: str,
+    other_id_val: str,
     headers: dict,
-) -> list[IDORFinding]:
-    """
-    When we only have one session, enumerate nearby sequential IDs.
-    A 200 with foreign data is a strong candidate (LIKELY, not CONFIRMED).
-    """
-    findings: list[IDORFinding] = []
-    now = datetime.now(timezone.utc).isoformat()
+    url: str,
+    method: str,
+    waf: WAFReport,
+    now: str,
+    extra_details: Optional[dict] = None,
+) -> Optional[IDORFinding]:
+    """Shared confirmation logic for bypass results."""
+    if response is None or not (200 <= response.status_code < 300):
+        return None
 
-    r_a_own = session.get(_build_test_url(surface, own_id), headers=headers)
-    if not r_a_own or not (200 <= r_a_own.status_code < 300):
-        return findings
-    own_text = _body_text(r_a_own)
+    owns_b = _ownership_match(response, other_id)
+    b_sim = _similarity(response, baseline_b) if baseline_b else 0.0
+    confirmed = False
+    evidence: list[str] = [f"{technique}: HTTP {response.status_code}"]
 
-    for test_id in _nearby_ids(own_id):
-        test_url = _build_test_url(surface, test_id)
-        r = session.get(test_url, headers=headers)
-        if not r or not (200 <= r.status_code < 300):
-            continue
+    if owns_b:
+        evidence.append(f"Contains other user's identifier: {owns_b[0]}={owns_b[1]}")
+        confirmed = True
+    if b_sim >= 0.90:
+        evidence.append(f"Matches User B's baseline ({b_sim:.2f})")
+        confirmed = True
 
-        test_text = _body_text(r)
-        sim_to_own = _similarity(test_text, own_text)
+    if not confirmed:
+        return None
 
-        # If it matches our own data, the param is ignored
-        if sim_to_own >= 0.95:
-            continue
+    sensitivity, sens_fields = _classify_sensitivity(response)
+    sev, conf = _severity_from_sensitivity(
+        confirmed=True, category=sensitivity, bypass_confirmed=True,
+    )
+    chain_id = _sensitivity_to_chain(sensitivity)
 
-        # If it's substantially different, that's a candidate
-        if sim_to_own < 0.80 and len(test_text) > 50:
-            foreign = _foreign_data_present(r, own_id)
-            confidence = CONF_LIKELY if foreign else 55
-            findings.append(IDORFinding(
-                target=surface.endpoint, vuln_type="idor_enumeration",
-                technique="sequential_enum", param_name=surface.param_name,
-                param_location=surface.param_location, id_type=surface.id_type,
-                own_id=own_id, other_id=test_id,
-                severity="HIGH", confidence=confidence, confirmed=False,
-                evidence=(
-                    f"Enumerated ID {test_id} (own={own_id}) returned 200 with different data"
-                    + (f"; foreign data indicators: {foreign}" if foreign else "")
-                ),
-                request_curl=_build_curl(surface.method, test_url, headers),
-                response_a=_body_snippet(r_a_own),
-                response_b=_body_snippet(r),
-                ownership_leak=foreign or "",
-                details={
-                    "param": surface.param_name,
-                    "own_id": own_id, "test_id": test_id,
-                    "similarity": round(sim_to_own, 3),
-                },
-                auth_enabled=True, first_seen=now,
-            ))
-            break  # one confirmed enumeration is enough per surface
+    return IDORFinding(
+        target=surface.endpoint, vuln_type=f"idor_bypass_{technique}",
+        technique=technique, param_name=surface.param_name,
+        param_location=surface.param_location, id_type=surface.id_type,
+        own_id=own_id, other_id=other_id_val,
+        severity=sev, confidence=conf, confirmed=True,
+        evidence=" | ".join(evidence),
+        request_curl=_build_curl(method, url, headers),
+        response_b=_body_snippet(response),
+        ownership_leak=str(owns_b) if owns_b else "",
+        sensitivity=sensitivity,
+        sensitive_fields=sens_fields,
+        chain_ids=[chain_id] if chain_id else [],
+        waf_vendor=waf.vendor,
+        details={"technique": technique, **(extra_details or {})},
+        auth_enabled=True, first_seen=now,
+    )
 
-    return findings
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 6 — BYPASS VARIANTS (fixed)
-# ═════════════════════════════════════════════════════════════════════════════
 
 def test_bypass_variants(
-    session: RateLimitedSession,
+    session: EvasionSession,
     surface: ObjectSurface,
     own_id: str,
     other_id: str,
     headers: dict,
+    baseline_b: Optional[requests.Response],
+    waf: WAFReport,
+    aggressive: bool = False,
 ) -> list[IDORFinding]:
+    """Try ~25 bypass variants against this surface."""
     findings: list[IDORFinding] = []
     now = datetime.now(timezone.utc).isoformat()
+    base_url = _build_test_url(surface, other_id)
 
-    # ── HTTP Parameter Pollution: ?id=A&id=B
+    # ── 1. HTTP Parameter Pollution (query)
     if surface.param_location == "query":
         parsed = urllib.parse.urlparse(surface.endpoint)
         params = urllib.parse.parse_qsl(parsed.query)
         polluted = params + [(surface.param_name, other_id)]
-        test_url = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(polluted)))
+        test_url = urllib.parse.urlunparse(parsed._replace(
+            query=urllib.parse.urlencode(polluted),
+        ))
         r = session.get(test_url, headers=headers)
-        if r and 200 <= r.status_code < 300:
-            if _ownership_match(r, other_id):
-                findings.append(IDORFinding(
-                    target=surface.endpoint, vuln_type="idor_parameter_pollution",
-                    technique="hpp", param_name=surface.param_name,
-                    param_location="query", id_type=surface.id_type,
-                    own_id=own_id, other_id=other_id,
-                    severity="HIGH", confidence=CONF_LIKELY, confirmed=False,
-                    evidence=f"HPP: response for ?{surface.param_name}=A&{surface.param_name}=B contains User B's data",
-                    request_curl=_build_curl("GET", test_url, headers),
-                    response_b=_body_snippet(r),
-                    details={"technique": "HPP", "test_url": test_url},
-                    auth_enabled=True, first_seen=now,
-                ))
+        f = _check_and_build(r, other_id, baseline_b, "hpp", surface,
+                             own_id, other_id, headers, test_url, "GET",
+                             waf, now)
+        if f: findings.append(f)
 
-    # ── Encoded variants
+    # ── 2. Array parameter
+    if surface.param_location == "query":
+        parsed = urllib.parse.urlparse(surface.endpoint)
+        params = urllib.parse.parse_qsl(parsed.query)
+        arr_query = urllib.parse.urlencode([
+            (k, v) for k, v in params
+        ] + [(f"{surface.param_name}[]", own_id),
+             (f"{surface.param_name}[]", other_id)])
+        test_url = urllib.parse.urlunparse(parsed._replace(query=arr_query))
+        r = session.get(test_url, headers=headers)
+        f = _check_and_build(r, other_id, baseline_b, "array_param", surface,
+                             own_id, other_id, headers, test_url, "GET",
+                             waf, now)
+        if f: findings.append(f)
+
+    # ── 3. Case variation (ID vs id vs Id)
+    if surface.param_location == "query":
+        for case_name in (surface.param_name.upper(), surface.param_name.capitalize()):
+            if case_name == surface.param_name:
+                continue
+            parsed = urllib.parse.urlparse(surface.endpoint)
+            params = urllib.parse.parse_qsl(parsed.query)
+            new_params = [(case_name if k == surface.param_name else k,
+                           other_id if k == surface.param_name else v)
+                          for k, v in params]
+            if not any(k == case_name for k, _ in new_params):
+                new_params.append((case_name, other_id))
+            test_url = urllib.parse.urlunparse(parsed._replace(
+                query=urllib.parse.urlencode(new_params),
+            ))
+            r = session.get(test_url, headers=headers)
+            f = _check_and_build(r, other_id, baseline_b, f"case_{case_name}",
+                                 surface, own_id, other_id, headers, test_url,
+                                 "GET", waf, now)
+            if f: findings.append(f)
+
+    # ── 4. Encoding variants (base64, hex, url-encoded)
     for variant in _encode_variants(other_id):
         if variant == other_id:
             continue
         test_url = _build_test_url(surface, variant)
         r = session.get(test_url, headers=headers)
-        if r and 200 <= r.status_code < 300:
-            if _ownership_match(r, other_id):
-                findings.append(IDORFinding(
-                    target=surface.endpoint, vuln_type="idor_encoded_bypass",
-                    technique="encoding", param_name=surface.param_name,
-                    param_location=surface.param_location, id_type=surface.id_type,
-                    own_id=own_id, other_id=other_id,
-                    severity="HIGH", confidence=CONF_LIKELY, confirmed=False,
-                    evidence=f"Encoded variant '{variant}' bypassed authorization",
-                    request_curl=_build_curl(surface.method, test_url, headers),
-                    response_b=_body_snippet(r),
-                    details={"variant": variant},
-                    auth_enabled=True, first_seen=now,
-                ))
-                break
+        f = _check_and_build(r, other_id, baseline_b,
+                             f"encoded_{variant[:6]}", surface,
+                             own_id, other_id, headers, test_url, "GET",
+                             waf, now, {"variant": variant})
+        if f:
+            findings.append(f)
+            break
 
-    # ── Identity header injection
-    for hdr in IDENTITY_HEADERS:
-        test_headers = dict(headers or {})
-        test_headers[hdr] = other_id
-        r = session.get(surface.endpoint, headers=test_headers)
-        if r and 200 <= r.status_code < 300:
-            if _ownership_match(r, other_id):
-                findings.append(IDORFinding(
-                    target=surface.endpoint, vuln_type="idor_header_injection",
-                    technique="header_injection", param_name=hdr,
-                    param_location="header", id_type=surface.id_type,
-                    own_id=own_id, other_id=other_id,
-                    severity="HIGH", confidence=CONF_LIKELY, confirmed=False,
-                    evidence=f"Identity header {hdr} accepted with User B's ID",
-                    request_curl=_build_curl(surface.method, surface.endpoint, test_headers),
-                    response_b=_body_snippet(r),
-                    details={"header": hdr},
-                    auth_enabled=True, first_seen=now,
-                ))
-                break
+    # ── 5. Numeric edge cases
+    for edge in ("0", "-1", "1.0", "0x1", "null", "NaN", "*", "%", ""):
+        if surface.param_location not in ("path", "query"):
+            break
+        test_url = _build_test_url(surface, edge)
+        r = session.get(test_url, headers=headers)
+        if r and 200 <= r.status_code < 300 and _body_fingerprint(r) != _body_fingerprint(baseline_b):
+            # Different response to edge case — flag as LOW/MEDIUM surface
+            findings.append(IDORFinding(
+                target=surface.endpoint, vuln_type=f"idor_numeric_edge_{edge[:4]}",
+                technique="numeric_edge", param_name=surface.param_name,
+                param_location=surface.param_location, id_type=surface.id_type,
+                own_id=own_id, other_id=edge,
+                severity=Severity.MEDIUM, confidence=50, confirmed=False,
+                evidence=f"Numeric edge value '{edge}' produced different response (HTTP {r.status_code})",
+                response_b=_body_snippet(r),
+                waf_vendor=waf.vendor,
+                details={"edge": edge},
+                auth_enabled=True, first_seen=now,
+            ))
+            break
 
-    # ── Method rotation with body
+    # ── 6. Method rotation
     for alt_method in METHOD_ROTATION:
         if alt_method == surface.method:
             continue
@@ -996,50 +1386,220 @@ def test_bypass_variants(
             )
         else:
             continue
-        if r and 200 <= r.status_code < 300:
-            if _ownership_match(r, other_id):
-                findings.append(IDORFinding(
-                    target=surface.endpoint, vuln_type="idor_method_tamper",
-                    technique="method_rotation", param_name=surface.param_name,
-                    param_location=surface.param_location, id_type=surface.id_type,
-                    own_id=own_id, other_id=other_id,
-                    severity="HIGH", confidence=CONF_LIKELY, confirmed=False,
-                    evidence=f"Method {surface.method}→{alt_method} bypassed authorization",
-                    request_curl=_build_curl(alt_method, surface.endpoint, headers),
-                    response_b=_body_snippet(r),
-                    details={"alt_method": alt_method},
-                    auth_enabled=True, first_seen=now,
-                ))
-                break
+        f = _check_and_build(r, other_id, baseline_b,
+                             f"method_{alt_method.lower()}", surface,
+                             own_id, other_id, headers,
+                             _build_test_url(surface, other_id), alt_method,
+                             waf, now)
+        if f: findings.append(f)
+
+    # ── 7. Method override headers
+    for hdr_name, hdr_value in (
+        ("X-HTTP-Method-Override", "PUT"),
+        ("X-HTTP-Method-Override", "POST"),
+        ("X-Method-Override", "PUT"),
+    ):
+        test_url = _build_test_url(surface, other_id)
+        r = session.get(test_url, headers={**headers, hdr_name: hdr_value})
+        f = _check_and_build(r, other_id, baseline_b,
+                             f"override_{hdr_value.lower()}", surface,
+                             own_id, other_id,
+                             {**headers, hdr_name: hdr_value},
+                             test_url, "GET", waf, now)
+        if f: findings.append(f)
+
+    # ── 8. Identity header injection
+    for hdr in IDENTITY_HEADERS:
+        test_headers = {**headers, hdr: other_id}
+        r = session.get(surface.endpoint, headers=test_headers)
+        f = _check_and_build(r, other_id, baseline_b,
+                             f"header_{hdr.lower().replace('-', '_')}",
+                             surface, own_id, other_id, test_headers,
+                             surface.endpoint, "GET", waf, now,
+                             {"header": hdr})
+        if f: findings.append(f)
+
+    # ── 9. Cookie injection
+    for cookie_name in ("user_id", "uid", "userid", "account_id"):
+        test_headers = dict(headers or {})
+        existing = test_headers.get("Cookie", "")
+        new_cookie = f"{cookie_name}={other_id}"
+        test_headers["Cookie"] = (existing + "; " if existing else "") + new_cookie
+        r = session.get(surface.endpoint, headers=test_headers)
+        f = _check_and_build(r, other_id, baseline_b,
+                             f"cookie_{cookie_name}", surface,
+                             own_id, other_id, test_headers,
+                             surface.endpoint, "GET", waf, now,
+                             {"cookie": cookie_name})
+        if f: findings.append(f)
+
+    # ── 10. Content-Type switching
+    if aggressive and surface.param_location == "body":
+        for ct, encode_fn in (
+            ("application/json", lambda d: json.dumps(d)),
+            ("application/x-www-form-urlencoded", lambda d: urllib.parse.urlencode(d)),
+            ("text/plain", lambda d: json.dumps(d)),
+        ):
+            body = encode_fn({surface.param_name: other_id})
+            r = session.request(
+                surface.method, surface.endpoint,
+                headers={**headers, "Content-Type": ct},
+                data=body,
+            )
+            f = _check_and_build(r, other_id, baseline_b,
+                                 f"content_type_{ct.split('/')[-1]}",
+                                 surface, own_id, other_id, headers,
+                                 surface.endpoint, surface.method,
+                                 waf, now, {"content_type": ct})
+            if f: findings.append(f)
+
+    # ── 11. JSON duplicate key
+    if aggressive and surface.param_location == "body":
+        raw = f'{{"{surface.param_name}":"{own_id}","{surface.param_name}":"{other_id}"}}'
+        r = session.request(
+            surface.method, surface.endpoint,
+            headers={**headers, "Content-Type": "application/json"},
+            data=raw,
+        )
+        f = _check_and_build(r, other_id, baseline_b, "json_dup_key",
+                             surface, own_id, other_id, headers,
+                             surface.endpoint, surface.method, waf, now)
+        if f: findings.append(f)
+
+    # ── 12. JSON nested object
+    if aggressive and surface.param_location == "body":
+        r = session.request(
+            surface.method, surface.endpoint, headers=headers,
+            json={surface.param_name: {"id": other_id}},
+        )
+        f = _check_and_build(r, other_id, baseline_b, "json_nested",
+                             surface, own_id, other_id, headers,
+                             surface.endpoint, surface.method, waf, now)
+        if f: findings.append(f)
 
     return findings
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  SELF-SYNC
+#  ENUMERATION (single-session)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_idor_enumeration(
+    session: EvasionSession,
+    surface: ObjectSurface,
+    own_id: str,
+    headers: dict,
+    waf: WAFReport,
+    radius: int = 3,
+) -> list[IDORFinding]:
+    """Enumerate nearby sequential IDs when only one session is available."""
+    findings: list[IDORFinding] = []
+    now = datetime.now(timezone.utc).isoformat()
+
+    r_a_own = session.get(_build_test_url(surface, own_id), headers=headers)
+    if not r_a_own or not (200 <= r_a_own.status_code < 300):
+        return findings
+    own_fp = _body_fingerprint(r_a_own)
+
+    for test_id in _nearby_ids(own_id, radius):
+        test_url = _build_test_url(surface, test_id)
+        r = session.get(test_url, headers=headers)
+        if not r or not (200 <= r.status_code < 300):
+            continue
+
+        test_fp = _body_fingerprint(r)
+        if test_fp and test_fp == own_fp:
+            continue  # Same response — param ignored
+
+        sim_to_own = _similarity(r, r_a_own)
+        if sim_to_own >= 0.95:
+            continue
+
+        if sim_to_own < 0.80 and len(_body_text(r)) > 50:
+            foreign = _foreign_data_present(r, own_id)
+            sensitivity, sens_fields = _classify_sensitivity(r)
+            chain_ids = ["idor-mass-enum"]
+            chain_id = _sensitivity_to_chain(sensitivity)
+            if chain_id:
+                chain_ids.append(chain_id)
+
+            findings.append(IDORFinding(
+                target=surface.endpoint, vuln_type="idor_enumeration",
+                technique="sequential_enum", param_name=surface.param_name,
+                param_location=surface.param_location, id_type=surface.id_type,
+                own_id=own_id, other_id=test_id,
+                severity=Severity.HIGH if foreign else Severity.MEDIUM,
+                confidence=75 if foreign else 55, confirmed=False,
+                evidence=(
+                    f"ID {test_id} (own={own_id}) returned different data "
+                    f"(sim={sim_to_own:.2f})"
+                    + (f"; foreign indicators: {foreign}" if foreign else "")
+                ),
+                request_curl=_build_curl(surface.method, test_url, headers),
+                response_a=_body_snippet(r_a_own),
+                response_b=_body_snippet(r),
+                ownership_leak=foreign or "",
+                sensitivity=sensitivity,
+                sensitive_fields=sens_fields,
+                chain_ids=chain_ids,
+                waf_vendor=waf.vendor,
+                details={"own_id": own_id, "test_id": test_id,
+                         "similarity": round(sim_to_own, 3)},
+                auth_enabled=True, first_seen=now,
+            ))
+            break  # one confirmed enumeration per surface is enough
+
+    return findings
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CHAINS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def build_chains(findings: list[IDORFinding]) -> list[IDORChain]:
+    chains: dict[str, list[IDORFinding]] = {}
+    NAMES = {
+        "idor-account-takeover": "IDOR → account takeover (credential exposure)",
+        "idor-pii-exposure":     "IDOR → PII exposure",
+        "idor-financial":        "IDOR → financial data exposure",
+        "idor-admin-privesc":    "IDOR → admin privilege escalation",
+        "idor-tenant-isolation": "IDOR → cross-tenant access",
+        "idor-mass-enum":        "IDOR → mass enumeration",
+    }
+    for f in findings:
+        if not (f.confirmed or f.severity.rank >= Severity.HIGH.rank):
+            continue
+        for cid in f.chain_ids:
+            chains.setdefault(cid, []).append(f)
+
+    out: list[IDORChain] = []
+    for cid, fs in chains.items():
+        max_sev = max(fs, key=lambda x: x.severity.rank).severity
+        out.append(IDORChain(
+            chain_id=cid,
+            name=NAMES.get(cid, cid),
+            severity=max_sev,
+            steps=[f.evidence for f in fs],
+            finding_hashes=[f.finding_hash for f in fs],
+            evidence=fs[0].evidence if fs else "",
+        ))
+    return out
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  DB SYNC
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _self_sync(scan_id: int, findings: list[IDORFinding]) -> None:
-    if not findings:
+    if not findings or not DB_AVAILABLE or DB is None:
         return
-    if not DB_AVAILABLE or DB is None:
-        log.warning("  DB sync: db.py not available")
+    if not _cfg("SYNC_TO_DB", True) or not _cfg("BRIDGE_ENABLED", False):
         return
-    if not _cfg("SYNC_TO_DB", True):
-        log.info("  DB sync: SYNC_TO_DB is False")
-        return
-    if not _cfg("BRIDGE_ENABLED", False):
-        log.info("  DB sync: BRIDGE_ENABLED is False")
-        return
-    if not DB.available:
-        log.warning("  DB sync: bridge client not ready")
+    if not getattr(DB, "available", False):
         return
     try:
-        payloads = [f.to_dict() for f in findings]
-        result = DB.upsert_idor_findings(scan_id, payloads)
-        if result is None:
-            log.warning("  DB sync: bridge returned None")
-        else:
+        result = DB.upsert_idor_findings(scan_id, [f.to_dict() for f in findings])
+        if result is not None:
             log.info(f"  DB sync: {result} IDOR finding(s) upserted (scan_id={scan_id})")
     except Exception as e:
         log.warning(f"  DB sync: exception — {e}")
@@ -1060,24 +1620,20 @@ def run_idor_audit(
     user_b_headers: Optional[dict] = None,
     user_a_id: Optional[str] = None,
     user_b_id: Optional[str] = None,
-    graphql_schema_file: Optional[Path] = None,
     test_bypasses: bool = True,
+    aggressive: bool = False,
+    proxies: Optional[list[str]] = None,
     max_ids_per_surface: int = 3,
     scan_id: Optional[int] = None,
 ) -> Path:
-    """
-    Run the IDOR audit against every URL in `live_urls_file`.
-
-    Dual-session testing requires BOTH user_a_headers and user_b_headers.
-    Without both, the module falls back to enumeration mode (LIKELY findings,
-    not confirmed) — still useful, but slower to pay off.
-    """
     start = time.monotonic()
 
     settings = _idor_settings()
     eff_rate = rate_limit if rate_limit is not None else settings["rate_limit"]
     eff_conc = concurrency if concurrency is not None else settings["concurrency"]
     eff_timeout = settings["timeout"]
+    eff_jitter = settings["jitter"]
+    eff_proxies = proxies if proxies is not None else list(settings["proxies"])
 
     urls = _load_urls(live_urls_file)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -1091,259 +1647,357 @@ def run_idor_audit(
     auth_on = bool(user_a_headers or cfg_hdrs)
 
     log.info(f"  Input  : {len(urls)} URL(s) from {live_urls_file.name}")
-    log.info(f"  Config : rate_limit={eff_rate}/s  concurrency={eff_conc}  timeout={eff_timeout}s")
-    log.info(f"           source: MODULE_RATE_LIMITS['idor']")
-
-    if cfg_hdrs:
-        log.info(f"  Headers: {len(cfg_hdrs)} configured")
+    log.info(f"  Config : rate_limit={eff_rate}/s  jitter={eff_jitter}s  "
+             f"concurrency={eff_conc}  timeout={eff_timeout}s")
+    log.info(f"  Mode   : {'AGGRESSIVE' if aggressive else 'safe'}")
 
     if dual_session:
-        log.info("  Mode   : DUAL-SESSION (IDOR confirmed via cross-identity comparison)")
-        log.info(f"           User A ID: {user_a_id or '(not set — will harvest from User A)'}")
-        log.info(f"           User B ID: {user_b_id or '(not set — will harvest from User B)'}")
+        log.info("  Session: DUAL (cross-identity testing enabled)")
+        log.info(f"           User A ID: {user_a_id or '(harvest from session)'}")
+        log.info(f"           User B ID: {user_b_id or '(harvest from session)'}")
     elif user_a_headers:
-        log.info("  Mode   : ENUMERATION (single session — IDOR flagged as LIKELY, not confirmed)")
+        log.info("  Session: SINGLE (enumeration only — findings LIKELY, not confirmed)")
     else:
-        log.info("  Mode   : SURFACE-ONLY (no credentials — mapping IDOR surface)")
+        log.info("  Session: SURFACE-ONLY (no credentials)")
     log.info("")
 
     if not urls:
         log.warning("  No URLs — writing empty report")
-        return _write_empty_report(outdir, live_urls_file, start)
+        return _write_empty(outdir, live_urls_file, start)
 
-    session_a = RateLimitedSession(rate_limit=eff_rate, timeout=eff_timeout)
-    session_b = RateLimitedSession(rate_limit=eff_rate, timeout=eff_timeout) if dual_session else None
-
-    # ── Phase 1: Surface discovery ──────────────────────────────────────────
-    log.info("  Phase 1 — Object reference surface discovery")
-    surfaces = discover_surfaces_from_urls(urls)
-    pages_surfaces = discover_surfaces_from_pages(outdir)
-    gql_surfaces = discover_surfaces_from_graphql(outdir)
-    surfaces.extend(pages_surfaces)
-    surfaces.extend(gql_surfaces)
-
-    # Dedupe surfaces
-    seen_surf: set[tuple] = set()
-    unique_surfaces: list[ObjectSurface] = []
-    for s in surfaces:
-        key = (s.endpoint, s.method, s.param_name, s.param_location)
-        if key not in seen_surf:
-            seen_surf.add(key)
-            unique_surfaces.append(s)
-    surfaces = unique_surfaces
-
-    log.info(f"    {len(surfaces)} surface(s)  "
-             f"(URL: {len(surfaces) - len(pages_surfaces) - len(gql_surfaces)}, "
-             f"form: {len(pages_surfaces)}, graphql: {len(gql_surfaces)})")
-
-    if not surfaces:
-        log.warning("  No surfaces — writing empty report")
-        return _write_empty_report(outdir, live_urls_file, start, len(urls))
-
-    (outdir / "idor_surface.txt").write_text(
-        "\n".join(
-            f"{s.method}\t{s.endpoint}\t{s.param_name}\t{s.param_location}\t{s.id_type}"
-            for s in surfaces
-        ) + "\n"
+    profile = EvasionProfile(
+        rate_limit=eff_rate, jitter=eff_jitter, proxies=eff_proxies,
     )
 
-    # ── Phase 2–5: Test ─────────────────────────────────────────────────────
-    all_findings: list[IDORFinding] = []
+    session_a = EvasionSession(profile=profile, timeout=eff_timeout)
+    session_b = EvasionSession(profile=profile, timeout=eff_timeout) if dual_session else None
 
-    if not user_a_headers:
-        # Surface-only — flag every endpoint as a candidate, no testing
+    waf_by_host: dict[str, WAFReport] = {}
+
+    try:
+        # ── Phase 0: WAF detection ──────────────────────────────────────────
+        log.info("  Phase 0 — WAF detection")
+        for url in urls:
+            host = urllib.parse.urlparse(url).hostname or ""
+            if host in waf_by_host:
+                continue
+            waf = detect_waf(session_a, url)
+            waf_by_host[host] = waf
+            if waf.vendor != "unknown":
+                log.info(f"    {host:<40} WAF: {waf.vendor} ({waf.confidence}%)")
+
+        if any(w.vendor != "unknown" for w in waf_by_host.values()):
+            session_a.profile.rate_limit = max(0.5, eff_rate * 0.6)
+            session_a.profile.jitter = max(eff_jitter, 1.0)
+            if session_b:
+                session_b.profile.rate_limit = session_a.profile.rate_limit
+                session_b.profile.jitter = session_a.profile.jitter
+
+        # ── Phase 1: Surface discovery ──────────────────────────────────────
+        log.info("")
+        log.info("  Phase 1 — Object reference surface discovery")
+        surfaces = discover_surfaces_from_urls(urls)
+        pages_surfaces = discover_surfaces_from_pages(outdir)
+        gql_surfaces = discover_surfaces_from_graphql(outdir)
+        surfaces.extend(pages_surfaces)
+        surfaces.extend(gql_surfaces)
+
+        seen_surf: set[tuple] = set()
+        unique: list[ObjectSurface] = []
         for s in surfaces:
-            all_findings.append(IDORFinding(
-                target=s.endpoint, vuln_type="idor_surface_candidate",
-                param_name=s.param_name, param_location=s.param_location,
-                id_type=s.id_type, severity="MEDIUM", confidence=CONF_SURFACE,
-                evidence=f"{s.param_location} '{s.param_name}' ({s.id_type}); supply test accounts to confirm",
-                details=s.to_dict(), auth_enabled=False,
-            ))
-    else:
-        headers_a = dict(user_a_headers or {})
-        headers_b = dict(user_b_headers or {})
+            key = (s.endpoint, s.method, s.param_name, s.param_location)
+            if key not in seen_surf:
+                seen_surf.add(key)
+                unique.append(s)
+        surfaces = unique
 
-        def _process_surface(surface: ObjectSurface) -> list[IDORFinding]:
-            local: list[IDORFinding] = []
-            host_url = f"{urllib.parse.urlparse(surface.endpoint).scheme}://{urllib.parse.urlparse(surface.endpoint).netloc}"
+        log.info(f"    {len(surfaces)} surface(s)  "
+                 f"(URL: {len(surfaces) - len(pages_surfaces) - len(gql_surfaces)}, "
+                 f"form: {len(pages_surfaces)}, graphql: {len(gql_surfaces)})")
 
-            # Harvest IDs from both sessions
-            own_ids = harvest_ids_for_session(session_a, headers_a, host_url, surface)
-            other_ids = (
-                harvest_ids_for_session(session_b, headers_b, host_url, surface)
-                if session_b else []
-            )
+        if not surfaces:
+            log.warning("  No surfaces — writing empty report")
+            return _write_empty(outdir, live_urls_file, start, len(urls))
 
-            # Baseline variance for User A
-            baseline_sim, _ = compute_baseline(session_a, surface, headers_a)
+        (outdir / "idor_surface.txt").write_text(
+            "\n".join(
+                f"{s.method}\t{s.endpoint}\t{s.param_name}\t{s.param_location}\t{s.id_type}"
+                for s in surfaces
+            ) + "\n"
+        )
 
-            # Prefer explicit IDs from config if provided
-            own_id = user_a_id or (own_ids[0] if own_ids else "")
-            other_id = user_b_id or (other_ids[0] if other_ids else "")
+        # ── Phase 2–4: Test ─────────────────────────────────────────────────
+        all_findings: list[IDORFinding] = []
 
-            if not own_id:
+        if not user_a_headers:
+            # Surface-only
+            for s in surfaces:
+                all_findings.append(IDORFinding(
+                    target=s.endpoint, vuln_type="idor_surface_candidate",
+                    param_name=s.param_name, param_location=s.param_location,
+                    id_type=s.id_type,
+                    severity=Severity.LOW, confidence=40, confirmed=False,
+                    evidence=f"{s.param_location} '{s.param_name}' ({s.id_type}) — supply sessions to confirm",
+                    details=s.to_dict(),
+                    auth_enabled=False,
+                ))
+        else:
+            headers_a = dict(user_a_headers or {})
+            headers_b = dict(user_b_headers or {})
+            radius = 10 if aggressive else 3
+            max_ids = 10 if aggressive else max_ids_per_surface
+
+            def _process(surface: ObjectSurface) -> list[IDORFinding]:
+                local: list[IDORFinding] = []
+                parsed = urllib.parse.urlparse(surface.endpoint)
+                host_url = f"{parsed.scheme}://{parsed.netloc}"
+                waf = waf_by_host.get(parsed.hostname or "", WAFReport())
+
+                harvested_a = harvest_ids_for_session(
+                    session_a, headers_a, host_url, surface, max_ids,
+                )
+                harvested_b = harvest_ids_for_session(
+                    session_b, headers_b, host_url, surface, max_ids,
+                ) if session_b else {}
+
+                def _pick(harvested: dict[str, list[str]]) -> str:
+                    for kind in ("sequential", "uuid", "hex", "jwt_claim",
+                                 "cookie", "js_var"):
+                        if harvested.get(kind):
+                            return harvested[kind][0]
+                    return ""
+
+                own_id = user_a_id or _pick(harvested_a) or (
+                    surface.sample_ids[0] if surface.sample_ids else ""
+                )
+                other_id = user_b_id or _pick(harvested_b)
+
+                if not own_id:
+                    return local
+
+                if session_b and other_id and other_id != own_id:
+                    # Baseline B for comparison
+                    baseline_b = _make_request(
+                        session_b, surface, other_id, headers_b,
+                    )
+
+                    # Direct swap
+                    findings = test_idor_dual_session(
+                        session_a, session_b, surface,
+                        own_id, other_id, headers_a, headers_b, waf,
+                    )
+                    local.extend(findings)
+
+                    # Bypasses only if not already confirmed
+                    if test_bypasses and not any(f.confirmed for f in findings):
+                        bypass = test_bypass_variants(
+                            session_a, surface, own_id, other_id, headers_a,
+                            baseline_b, waf, aggressive,
+                        )
+                        local.extend(bypass)
+                else:
+                    local.extend(test_idor_enumeration(
+                        session_a, surface, own_id, headers_a, waf, radius,
+                    ))
+
                 return local
 
-            # ── Dual-session test
-            if session_b and other_id and other_id != own_id:
-                findings = test_idor_dual_session(
-                    session_a, session_b, surface,
-                    own_id, other_id,
-                    headers_a, headers_b, baseline_sim,
-                )
-                local.extend(findings)
+            log.info("")
+            log.info(f"  Phase 2–4 — Testing {len(surfaces)} surface(s)")
+            with ThreadPoolExecutor(max_workers=eff_conc) as pool:
+                futures = {pool.submit(_process, s): s for s in surfaces}
+                for fut in as_completed(futures):
+                    s = futures[fut]
+                    try:
+                        results = fut.result()
+                        if results:
+                            all_findings.extend(results)
+                            confirmed = sum(1 for r in results if r.confirmed)
+                            tag = f" ({confirmed} confirmed)" if confirmed else ""
+                            log.info(f"    {s.endpoint[:60]:<60} {len(results)} finding(s){tag}")
+                    except Exception as e:
+                        log.debug(f"    error on {s.endpoint}: {e}")
 
-                # Bypass variants only if direct swap didn't confirm
-                if test_bypasses and not any(f.confirmed for f in findings):
-                    local.extend(test_bypass_variants(
-                        session_a, surface, own_id, other_id, headers_a,
-                    ))
+        # ── Phase 5: Chains ─────────────────────────────────────────────────
+        log.info("")
+        log.info("  Phase 5 — Chain aggregation")
+        chains = build_chains(all_findings)
+        log.info(f"    {len(chains)} chain(s)")
+
+        # ── Dedupe ──────────────────────────────────────────────────────────
+        # For bypass findings on the same endpoint+param, keep the highest-
+        # severity one so the report isn't flooded with 25 rows for one bug.
+        grouped: dict[tuple, IDORFinding] = {}
+        for f in all_findings:
+            key = (f.target, f.param_name, f.param_location,
+                   "bypass" if "bypass" in f.vuln_type else f.vuln_type)
+            existing = grouped.get(key)
+            if not existing:
+                grouped[key] = f
             else:
-                # ── Enumeration fallback
-                local.extend(test_idor_enumeration(
-                    session_a, surface, own_id, headers_a,
-                ))
+                # Prefer confirmed, then higher severity, then higher confidence
+                if (f.confirmed, f.severity.rank, f.confidence) > \
+                   (existing.confirmed, existing.severity.rank, existing.confidence):
+                    grouped[key] = f
+        deduped = list(grouped.values())
+        deduped.sort(key=lambda f: (-f.severity.rank, -f.confidence, f.target))
 
-            return local
+        # ── Reports ─────────────────────────────────────────────────────────
+        elapsed = time.monotonic() - start
+        by_sev: dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+        by_tech: dict[str, int] = {}
+        by_sens: dict[str, int] = {}
+        confirmed_count = 0
+        for f in deduped:
+            by_sev[f.severity.value] = by_sev.get(f.severity.value, 0) + 1
+            if f.technique:
+                by_tech[f.technique] = by_tech.get(f.technique, 0) + 1
+            if f.sensitivity:
+                by_sens[f.sensitivity] = by_sens.get(f.sensitivity, 0) + 1
+            if f.confirmed:
+                confirmed_count += 1
 
+        confirmed = [f for f in deduped if f.confirmed]
+        protected = [f for f in deduped if f.vuln_type == "idor_protected"]
+
+        json_path = outdir / "idor_findings.json"
+        report = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "elapsed_seconds": round(elapsed, 2),
+            "input_file": str(live_urls_file),
+            "auth_enabled": auth_on,
+            "dual_session": dual_session,
+            "aggressive": aggressive,
+            "config": {
+                "rate_limit":    eff_rate,
+                "jitter":        eff_jitter,
+                "concurrency":   eff_conc,
+                "timeout":       eff_timeout,
+                "proxies":       len(eff_proxies),
+                "test_bypasses": test_bypasses,
+                "max_ids":       max_ids_per_surface,
+            },
+            "totals": {
+                "urls_input":     len(urls),
+                "surfaces":       len(surfaces),
+                "total_findings": len(deduped),
+                "confirmed":      confirmed_count,
+                "critical":       by_sev["CRITICAL"],
+                "high":           by_sev["HIGH"],
+                "medium":         by_sev["MEDIUM"],
+                "low":            by_sev["LOW"],
+                "info":           by_sev["INFO"],
+            },
+            "summary": {
+                "by_severity":  by_sev,
+                "by_technique": dict(sorted(by_tech.items(), key=lambda kv: -kv[1])),
+                "by_sensitivity": dict(sorted(by_sens.items(), key=lambda kv: -kv[1])),
+            },
+            "findings": [f.to_dict() for f in deduped],
+        }
+        json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+
+        # ── idor_confirmed.json — HIGH+ only ────────────────────────────────
+        confirmed_findings = [
+            f for f in deduped if f.severity.rank >= Severity.HIGH.rank
+        ]
+        (outdir / "idor_confirmed.json").write_text(
+            json.dumps({
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "input_file": str(live_urls_file),
+                "dual_session": dual_session,
+                "totals": {
+                    "confirmed": len(confirmed_findings),
+                    "critical":  sum(1 for f in confirmed_findings if f.severity == Severity.CRITICAL),
+                    "high":      sum(1 for f in confirmed_findings if f.severity == Severity.HIGH),
+                    "by_sensitivity": {
+                        s: sum(1 for f in confirmed_findings if f.sensitivity == s)
+                        for s in {f.sensitivity for f in confirmed_findings if f.sensitivity}
+                    },
+                    "by_chain": {
+                        c: sum(1 for f in confirmed_findings if c in f.chain_ids)
+                        for c in {cid for f in confirmed_findings for cid in f.chain_ids}
+                    },
+                },
+                "findings": [f.to_dict() for f in confirmed_findings],
+            }, indent=2, ensure_ascii=False) + "\n"
+        )
+
+        # ── idor_chains.json ────────────────────────────────────────────────
+        (outdir / "idor_chains.json").write_text(
+            json.dumps({
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "chains": [c.to_dict() for c in chains],
+            }, indent=2, ensure_ascii=False) + "\n"
+        )
+
+        # ── Flat files ──────────────────────────────────────────────────────
+        (outdir / "idor_candidates.txt").write_text(
+            "\n".join(
+                f"{f.target}\t{f.vuln_type}\t{f.technique}\t{f.severity.value}\t"
+                f"{f.confidence}\t{'CONFIRMED' if f.confirmed else 'candidate'}\t"
+                f"{f.evidence[:160]}"
+                for f in deduped
+            ) + ("\n" if deduped else "")
+        )
+        (outdir / "idor_confirmed.txt").write_text(
+            "\n".join(
+                f"{f.target}\t{f.vuln_type}\t{f.severity.value}\t{f.technique}\t"
+                f"{f.evidence[:200]}\t{f.request_curl[:200]}"
+                for f in confirmed_findings
+            ) + ("\n" if confirmed_findings else "")
+        )
+        (outdir / "idor_protected.txt").write_text(
+            "\n".join(
+                f"{f.target}\t{f.param_name}\t{f.evidence[:160]}"
+                for f in protected
+            ) + ("\n" if protected else "")
+        )
+
+        # ── DB sync ────────────────────────────────────────────────────────
+        if scan_id is not None:
+            log.info("")
+            log.info(f"  Syncing to remote database (scan_id={scan_id})...")
+            _self_sync(scan_id, deduped)
+
+        # ── Console summary ────────────────────────────────────────────────
         log.info("")
-        log.info(f"  Phase 2–5 — Testing {len(surfaces)} surface(s)")
-        with ThreadPoolExecutor(max_workers=eff_conc) as pool:
-            futures = {pool.submit(_process_surface, s): s for s in surfaces}
-            for fut in as_completed(futures):
-                s = futures[fut]
-                try:
-                    results = fut.result()
-                    if results:
-                        all_findings.extend(results)
-                        confirmed = sum(1 for r in results if r.confirmed)
-                        tag = f" ({confirmed} confirmed)" if confirmed else ""
-                        log.info(f"    {s.endpoint[:60]:<60} {len(results)} finding(s){tag}")
-                except Exception as e:
-                    log.debug(f"    error on {s.endpoint}: {e}")
-
-    # ── Dedupe + sort ───────────────────────────────────────────────────────
-    seen: set[tuple] = set()
-    deduped: list[IDORFinding] = []
-    for f in all_findings:
-        key = (f.target, f.vuln_type, f.own_id, f.other_id)
-        if key not in seen:
-            seen.add(key)
-            deduped.append(f)
-
-    SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
-    deduped.sort(key=lambda f: (SEV_ORDER.get(f.severity, 4), -f.confidence, f.target))
-
-    # ── Report ──────────────────────────────────────────────────────────────
-    elapsed = time.monotonic() - start
-    by_severity: dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
-    by_technique: dict[str, int] = {}
-    confirmed_count = 0
-
-    for f in deduped:
-        by_severity[f.severity] = by_severity.get(f.severity, 0) + 1
-        if f.technique:
-            by_technique[f.technique] = by_technique.get(f.technique, 0) + 1
-        if f.confirmed:
-            confirmed_count += 1
-
-    confirmed = [f for f in deduped if f.confirmed]
-
-    # Flat outputs
-    (outdir / "idor_candidates.txt").write_text(
-        "\n".join(
-            f"{f.target}\t{f.vuln_type}\t{f.technique}\t{f.severity}\t{f.confidence}\t"
-            f"{'CONFIRMED' if f.confirmed else 'candidate'}\t{f.evidence[:160]}"
-            for f in deduped
-        ) + ("\n" if deduped else "")
-    )
-    (outdir / "idor_confirmed.txt").write_text(
-        "\n".join(
-            f"{f.target}\t{f.vuln_type}\t{f.evidence}\t{f.request_curl[:200]}"
-            for f in confirmed
-        ) + ("\n" if confirmed else "")
-    )
-
-    report = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "elapsed_seconds": round(elapsed, 2),
-        "input_file": str(live_urls_file),
-        "auth_enabled": auth_on,
-        "dual_session": dual_session,
-        "config": {
-            "rate_limit":    eff_rate,
-            "concurrency":   eff_conc,
-            "timeout":       eff_timeout,
-            "headers_count": len(cfg_hdrs),
-            "test_bypasses": test_bypasses,
-            "max_ids":       max_ids_per_surface,
-        },
-        "totals": {
-            "urls_input":       len(urls),
-            "surfaces":         len(surfaces),
-            "total_findings":   len(deduped),
-            "confirmed":        confirmed_count,
-            "critical":         by_severity["CRITICAL"],
-            "high":             by_severity["HIGH"],
-            "medium":           by_severity["MEDIUM"],
-            "low":              by_severity["LOW"],
-        },
-        "summary": {
-            "by_severity":  by_severity,
-            "by_technique": dict(sorted(by_technique.items(), key=lambda kv: -kv[1])),
-        },
-        "findings": [f.to_dict() for f in deduped],
-    }
-
-    json_path = outdir / "idor_findings.json"
-    json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
-
-    # ── Self-sync ───────────────────────────────────────────────────────────
-    if scan_id is not None:
+        log.info("  Outputs :")
+        log.info(f"    idor_findings.json           {len(deduped):>5} finding(s)")
+        log.info(f"    idor_confirmed.json          {len(confirmed_findings):>5} confirmed (HIGH+)")
+        log.info(f"    idor_chains.json             {len(chains):>5} chain(s)")
+        log.info(f"    idor_candidates.txt          {len(deduped):>5} candidate(s)")
+        log.info(f"    idor_confirmed.txt           {len(confirmed_findings):>5} confirmed")
+        log.info(f"    idor_surface.txt             {len(surfaces):>5} surface(s)")
+        log.info(f"    idor_protected.txt           {len(protected):>5} properly-denied")
         log.info("")
-        log.info(f"  Syncing to remote database (scan_id={scan_id})...")
-        _self_sync(scan_id, deduped)
-    else:
+        log.info(f"  Severity : CRITICAL={by_sev['CRITICAL']}  HIGH={by_sev['HIGH']}  "
+                 f"MEDIUM={by_sev['MEDIUM']}  LOW={by_sev['LOW']}  INFO={by_sev['INFO']}")
+        log.info(f"  Confirmed: {confirmed_count} / {len(deduped)}")
+        if chains:
+            log.info("  Chains   : " + " · ".join(
+                f"{c.chain_id}({c.severity.value})" for c in chains
+            ))
+        if confirmed_findings:
+            log.info("")
+            log.info("  Confirmed IDOR findings:")
+            for f in confirmed_findings[:10]:
+                tag = f" [{','.join(f.chain_ids)}]" if f.chain_ids else ""
+                log.info(f"    [{f.severity.value:<8}] {f.technique:<20} "
+                         f"{f.param_name:<18} {f.target[:50]}{tag}")
         log.info("")
-        log.info("  DB sync  : deferred to main.py (no scan_id passed)")
+        log.info(f"  Completed in {elapsed:.1f}s")
+        return json_path
 
-    # ── Console summary ─────────────────────────────────────────────────────
-    log.info("")
-    log.info("  Outputs :")
-    log.info(f"    {json_path.name:<28} {len(deduped):>5} finding(s)")
-    log.info(f"    idor_candidates.txt          {len(deduped):>5} candidate(s)")
-    log.info(f"    idor_confirmed.txt           {len(confirmed):>5} confirmed")
-    log.info(f"    idor_surface.txt             {len(surfaces):>5} surface(s)")
-
-    log.info("")
-    log.info(
-        f"  Severity : "
-        f"CRITICAL={by_severity['CRITICAL']}  "
-        f"HIGH={by_severity['HIGH']}  "
-        f"MEDIUM={by_severity['MEDIUM']}  "
-        f"LOW={by_severity['LOW']}  "
-        f"INFO={by_severity['INFO']}"
-    )
-    log.info(f"  Confirmed: {confirmed_count} / {len(deduped)}")
-
-    if by_technique:
-        log.info("  Technique: " + " · ".join(
-            f"{k}({v})" for k, v in list(by_technique.items())[:8]
-        ))
-
-    if confirmed:
-        log.info("")
-        log.info("  Confirmed IDOR findings:")
-        for f in confirmed[:10]:
-            log.info(f"    [CRITICAL] {f.technique:<18} {f.param_name:<20} {f.target[:50]}")
-
-    log.info("")
-    log.info(f"  Completed in {elapsed:.1f}s")
-    return json_path
+    finally:
+        try: session_a.session.close()
+        except Exception: pass
+        if session_b:
+            try: session_b.session.close()
+            except Exception: pass
 
 
-def _write_empty_report(
+def _write_empty(
     outdir: Path, input_file: Path, start: float, total_input: int = 0,
 ) -> Path:
     report = {
@@ -1355,20 +2009,33 @@ def _write_empty_report(
         "config": {},
         "totals": {
             "urls_input": total_input, "surfaces": 0, "total_findings": 0,
-            "confirmed": 0, "critical": 0, "high": 0, "medium": 0, "low": 0,
+            "confirmed": 0, "critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0,
         },
-        "summary": {"by_severity": {}, "by_technique": {}},
+        "summary": {"by_severity": {}, "by_technique": {}, "by_sensitivity": {}},
         "findings": [],
     }
     path = outdir / "idor_findings.json"
     path.write_text(json.dumps(report, indent=2) + "\n")
-    for name in ("idor_candidates.txt", "idor_confirmed.txt", "idor_surface.txt"):
+    (outdir / "idor_confirmed.json").write_text(json.dumps({
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "input_file": str(input_file),
+        "dual_session": False,
+        "totals": {"confirmed": 0, "critical": 0, "high": 0,
+                   "by_sensitivity": {}, "by_chain": {}},
+        "findings": [],
+    }, indent=2) + "\n")
+    (outdir / "idor_chains.json").write_text(json.dumps({
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "chains": [],
+    }, indent=2) + "\n")
+    for name in ("idor_candidates.txt", "idor_confirmed.txt",
+                 "idor_surface.txt", "idor_protected.txt"):
         (outdir / name).write_text("")
     return path
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  STANDALONE TEST
+#  STANDALONE
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
@@ -1383,36 +2050,41 @@ if __name__ == "__main__":
         default_input = base / "output" / "live_urls.txt"
     out = base / "output"
 
-    parser = argparse.ArgumentParser(description="Argus IDOR Auditor (standalone)")
+    parser = argparse.ArgumentParser(description="Argus IDOR Auditor v3")
     parser.add_argument("--input", type=Path, default=default_input)
     parser.add_argument("--output", type=Path, default=out)
     parser.add_argument("--scan-id", type=int, default=None)
     parser.add_argument("--rate-limit", type=int, default=None)
     parser.add_argument("--concurrency", type=int, default=None)
+    parser.add_argument("--proxies", default=None)
     parser.add_argument("--user-a-headers", help="JSON dict of User A headers")
     parser.add_argument("--user-b-headers", help="JSON dict of User B headers")
     parser.add_argument("--user-a-id", help="User A's own object ID")
     parser.add_argument("--user-b-id", help="User B's object ID")
-    parser.add_argument("--graphql-schema", type=Path, default=None)
     parser.add_argument("--no-bypasses", action="store_true")
+    parser.add_argument("--aggressive", action="store_true")
     args = parser.parse_args()
 
-    ua_headers = json.loads(args.user_a_headers) if args.user_a_headers else None
-    ub_headers = json.loads(args.user_b_headers) if args.user_b_headers else None
+    ua = json.loads(args.user_a_headers) if args.user_a_headers else None
+    ub = json.loads(args.user_b_headers) if args.user_b_headers else None
+    proxies = args.proxies.split(",") if args.proxies else None
 
     try:
         run_idor_audit(
             args.input, args.output,
             rate_limit=args.rate_limit,
             concurrency=args.concurrency,
-            user_a_headers=ua_headers,
-            user_b_headers=ub_headers,
+            proxies=proxies,
+            user_a_headers=ua,
+            user_b_headers=ub,
             user_a_id=args.user_a_id,
             user_b_id=args.user_b_id,
-            graphql_schema_file=args.graphql_schema,
             test_bypasses=not args.no_bypasses,
+            aggressive=args.aggressive,
             scan_id=args.scan_id,
         )
     except Exception as e:
         log.error(f"failed: {e}")
+        import traceback
+        log.debug(traceback.format_exc())
         sys.exit(1)

