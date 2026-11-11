@@ -703,8 +703,18 @@ RESOURCE_TOOLS = [
          sudo=True, description="Standard wordlist collection"),
 ]
 
+PYTHON_TOOLS = [
+    Tool("mmh3", "python", methods={
+        "linux":   ("pip", "mmh3"),
+        "macos":   ("pip", "mmh3"),
+        "windows": ("pip", "mmh3"),
+        "termux":  ("pip", "mmh3"),
+        "nethunter": ("pip", "mmh3")},
+        check_cmd="python3 -c 'import mmh3'",
+        description="MurmurHash3 library for favicon hashing"),
+]
 
-ALL_TOOLS = BASE_TOOLS + SECURITY_TOOLS + GO_TOOLS + RESOURCE_TOOLS
+ALL_TOOLS = BASE_TOOLS + SECURITY_TOOLS + GO_TOOLS + RESOURCE_TOOLS + PYTHON_TOOLS
 TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
 
 
@@ -901,6 +911,40 @@ def install_via_git(tool: Tool, repo_url: str) -> bool:
         log.warn(f"  git clone failed: {err.strip()[:250]}")
     return ok
 
+def install_via_pip(tool: Tool, package: str) -> bool:
+    """Install a Python package via pip (cross-platform)."""
+    # Ensure we use the same Python interpreter that runs tools.py
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", package]
+
+    # On some systems, --user might be needed, but it's often safer to
+    # install into the current environment. We can try --user as a fallback.
+    ok, _, err = run(cmd, timeout=600, quiet=True)
+    if not ok:
+        # Fallback: try with --user
+        cmd_user = [sys.executable, "-m", "pip", "install", "--user", "--upgrade", package]
+        ok_user, _, err_user = run(cmd_user, timeout=600, quiet=True)
+        if ok_user:
+            return True
+        log.warn(f"  pip install {package} failed: {err.strip()[:250]}")
+        log.warn(f"  pip install --user {package} also failed: {err_user.strip()[:250]}")
+        return False
+    return True
+
+def ensure_c_compiler() -> bool:
+    """Check for a C compiler (gcc or cl.exe)."""
+    if cmd_available("gcc") or cmd_available("cl"):
+        return True
+    # Attempt platform-specific installation if missing
+    if PLATFORM.is_debian:
+        log.info("  C compiler not found. Installing build-essential...")
+        return install_via_pkg(Tool("build-essential", "base"), "build-essential")
+    elif PLATFORM.kind == PlatformKind.MACOS:
+        log.info("  C compiler not found. Please run: xcode-select --install")
+        return False
+    elif PLATFORM.kind == PlatformKind.WINDOWS:
+        log.warn("  C compiler not found. Please install 'Build Tools for Visual Studio'.")
+        return False
+    return False
 
 # ══════════════════════════════════════════════════════════════════════════
 #  ᛜ  SPECIAL HANDLERS
@@ -1188,6 +1232,8 @@ def install_tool(tool: Tool, dry_run: bool = False, force: bool = False) -> str:
     elif kind == "special":
         handler = SPECIAL_HANDLERS.get(arg)
         ok = handler(tool) if handler else False
+    elif kind == "pip":
+        ok = install_via_pip(tool, arg)
     else:
         ok = False
 
@@ -1272,6 +1318,10 @@ def selftest() -> int:
         ("_install_rust",       lambda: callable(_install_rust)),
         ("_confirm_heavy_compile", lambda: callable(_confirm_heavy_compile)),
         ("SPECIAL_HANDLERS",    lambda: all(callable(f) for f in SPECIAL_HANDLERS.values())),
+        ("install_via_pip",     lambda: callable(install_via_pip)),
+        ("ensure_c_compiler",   lambda: callable(ensure_c_compiler)),
+        ("mmh3 tool registry",  lambda: "mmh3" in TOOLS_BY_NAME),
+        ("mmh3 install method", lambda: install_method_for(TOOLS_BY_NAME["mmh3"]) is not None),
         ("install_method resolution", lambda: all(
             install_method_for(t) is not None
             for t in ALL_TOOLS
