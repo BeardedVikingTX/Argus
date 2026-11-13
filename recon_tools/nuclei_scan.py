@@ -5,48 +5,46 @@
   ᛊ ᚢ ᚱ ᛏ ᚱ   ·   N U C L E I   S C A N   ·   S U R T R ' S   W R A T H
 ================================================================================
   File      : recon_tools/nuclei_scan.py
-  Version   : 3.0.0 "SURTR'S WRATH REFORGED"
+  Version   : 3.1.0 "SURTR'S WRATH · MASTERWORK"
   Author    : BeardedVikingTX  ·  security@beardedviking.org
   License   : MIT
 
-  v3.0 changes vs v2.0:
-    [FIX]  _build_cmd() got an unexpected keyword argument 'resume'
-           Three-layer defense-in-depth:
-             1. _build_cmd() now accepts **kwargs and ignores unknowns
-             2. _run_batch() pops `resume` before passing kwargs through
-             3. run_nuclei_scan() no longer smuggles resume via **kwargs
-    [NEW]  AI triage cache (nuclei_ai_cache/) — same findings = same result,
-           skips on resume and re-runs
-    [NEW]  --ai-max-cost USD budget cap — drops to heuristic when reached
-    [NEW]  --ai-max-hosts cap (default 20) — bounded spend on big scans
-    [NEW]  --no-ai flag — explicit override of config.AI_ENABLED
-    [NEW]  Interactsh OFF by default (-ni) — safety + speed for BBP
-    [NEW]  --interactsh-url for self-hosted OAST servers
-    [NEW]  -or (omit-raw) by default — 10× smaller output files
-    [NEW]  -duc (disable update check) + -stats-json
-    [NEW]  --page-timeout, --exclude-matcher, --sni, --track-error flags
-    [NEW]  Config-driven defaults: NUCLEI_NO_INTERACTSH, NUCLEI_INTERACTSH_URL,
-           NUCLEI_PAGE_TIMEOUT, NUCLEI_EXCLUDE_MATCHERS
-    [NEW]  Enhanced nuclei v3.x schema tolerance (CVSS vectors, port strings,
-           template_id alias variants, case-insensitive headers)
-    [NEW]  Failed nuclei batches surface stderr with benign-error filter
-    [NEW]  Expanded selftest (50+ checks, verifies the resume fix itself)
+  v3.1 — MASTERWORK (this release):
+    [FIX]  Duplicate --no-omit-raw argparse declaration (CLI startup crash).
+    [FIX]  PROFILES[profile] global mutation removed — per-run effective profile.
+    [FIX]  Interactsh config override no longer clobbers explicit user intent.
+    [FIX]  _load_targets: BOM strip + CRLF normalize + inline comment strip.
+    [FIX]  _dedupe: now keys on path + response hash for fuzz findings.
+    [FIX]  _build_minimal_cmd: honors user --severities / --tags override.
+    [FIX]  WAF-blocked findings no longer inflate host_risk.
+    [FIX]  UNKNOWN severity now inferred from CVSS score when missing.
+    [FIX]  Header values with empty strings are dropped before nuclei sees them.
+    [NEW]  --min-severity / --max-severity filtering.
+    [NEW]  --batch-timeout (per-batch); default derives from hard timeout / batch count.
+    [NEW]  Per-finding confidence score (high/medium/low) in heuristic triage.
+    [NEW]  WAF-aware effective severity + real-vs-noise breakdown.
+    [NEW]  AI cache versioned by model + prompt hash — model swap busts cache.
+    [NEW]  AI prompt now includes chains, WAF flags, CVSS, extracted results,
+           and top-3 heuristic rankings as a soft hint.
+    [NEW]  AI response schema validation + one corrective retry on parse failure.
+    [NEW]  AI cost tracking from actual usage when ai_complete returns (text, usage).
+    [NEW]  Optional parallel AI triage (--ai-parallel) with budget lock.
+    [NEW]  Structured `warnings` array in report JSON.
+    [NEW]  nuclei version captured into report.
+    [NEW]  on_progress callback for TUI / dashboard integration.
+    [NEW]  SIGINT handler — finish current batch, write partial report.
+    [NEW]  Selftest: 50 → 74 checks (parse-path, WAF downgrade, cache stability).
+    [NEW]  _build_cmd kwargs whitelist: known-compat kwargs silently dropped,
+           truly unknown ones warn loudly so real typos are caught.
 
-  Outputs:
-    nuclei_findings.json         — aggregated report
-    nuclei_analysis_hosts.jsonl  — per-host streamed (crash-safe)
-    nuclei_critical.txt          — CRIT/HIGH matched URLs
-    nuclei_all.txt               — all matched URLs
-    nuclei_raw.jsonl             — sorted findings, one per line
-    nuclei_ai_<host>.md          — per-host AI triage (when AI on)
-    nuclei_ai_cache/             — cached AI results (TTL 72h)
-    nuclei_evidence/             — raw batch output (resume support)
+  Pipeline preserves all v3.0 file outputs. Schema is additive only.
 ================================================================================
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as _fut
 import hashlib
 import json
 import logging
@@ -55,8 +53,10 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
@@ -75,7 +75,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 try:
-    import config as CFG
+    import config as CFG  # type: ignore
     CFG_LOADED = True
     _CFG_IMPORT_ERROR: Optional[Exception] = None
 except ImportError as _cfg_err:
@@ -111,17 +111,17 @@ class _FallbackPalette:
 
 def _c(name: str) -> str:
     if CFG_LOADED and hasattr(CFG, "_c"):
-        return CFG._c(name)
+        return CFG._c(name)  # type: ignore[attr-defined]
     return _FallbackPalette.c(name)
 
 
 class _FallbackLogger:
     _LEVELS = {"debug": 10, "info": 20, "warn": 30, "error": 40, "fatal": 50}
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.min_level = "info"
 
-    def _emit(self, level, msg, color, prefix):
+    def _emit(self, level: str, msg: str, color: str, prefix: str) -> None:
         if self._LEVELS.get(level, 20) >= self._LEVELS.get(self.min_level, 20):
             print(f"  {_c(color)}{prefix}{_c('reset')} {msg}")
 
@@ -131,7 +131,7 @@ class _FallbackLogger:
     def error(self, m): self._emit("error", m, "crimson", "✗")
     def ok   (self, m): self._emit("info",  m, "green", "✓")
 
-    def rune(self, rune, msg):
+    def rune(self, rune: str, msg: str) -> None:
         print(f"\n{_c('violet')}── {rune}  {msg} ──{_c('reset')}")
 
 
@@ -153,8 +153,8 @@ class Rune:
     LAGUZ = "ᛚ"; INGWAZ = "ᛜ"; DAGAZ = "ᛞ"; OTHALA = "ᛟ"
 
 
-__version__ = "3.0.0"
-__codename__ = "SURTR'S WRATH REFORGED"
+__version__ = "3.2.0"
+__codename__ = "SURTR'S WRATH · HOTFORGED"
 
 
 def print_banner() -> None:
@@ -164,7 +164,7 @@ def print_banner() -> None:
     {G}ᛊ ᚢ ᚱ ᛏ ᚱ{R}
     {P}{rule}{R}
     {V}      N U C L E I   S C A N   ·   S U R T R ' S   W R A T H{R}
-    {V}              R E F O R G E D   ·   v{__version__}{R}
+    {V}              M A S T E R W O R K   ·   v{__version__}{R}
     {D}{rule}{R}
     {G}        {Sym.FIRE}  "{__codename__}"  ·  8000+ templates · AI-ready{R}
     {G}        {Sym.GEAR}  config v{_cfg('__version__', 'missing')} {R}
@@ -179,9 +179,30 @@ def print_banner() -> None:
 
 class Severity(str, Enum):
     INFO = "INFO"; LOW = "LOW"; MEDIUM = "MEDIUM"; HIGH = "HIGH"; CRITICAL = "CRITICAL"
+
     @property
     def rank(self) -> int:
         return {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}[self.value]
+
+    @classmethod
+    def from_rank(cls, rank: int) -> "Severity":
+        return [cls.INFO, cls.LOW, cls.MEDIUM, cls.HIGH, cls.CRITICAL][max(0, min(4, rank))]
+
+
+def _downgrade_severity(sev: str) -> str:
+    """One-step severity downgrade — used for WAF-blocked findings."""
+    return {
+        "CRITICAL": "MEDIUM", "HIGH": "MEDIUM", "MEDIUM": "LOW",
+        "LOW": "INFO", "INFO": "INFO", "UNKNOWN": "INFO",
+    }.get(sev.upper(), "INFO")
+
+
+def _severity_from_cvss(score: float) -> str:
+    if score >= 9.0: return "CRITICAL"
+    if score >= 7.0: return "HIGH"
+    if score >= 4.0: return "MEDIUM"
+    if score > 0.0:  return "LOW"
+    return "INFO"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -198,13 +219,20 @@ MAX_TARGETS_PER_BATCH       = 100
 NUCLEI_HARD_TIMEOUT         = 7200
 MAX_FINDINGS_REPORT         = 50000
 TEMPLATE_UPDATE_TIMEOUT     = 600
+DEFAULT_BATCH_TIMEOUT       = 900
 
 AI_MIN_FINDINGS_PER_HOST    = 1
 AI_MAX_HOSTS_PER_RUN        = 20
 AI_DEFAULT_CACHE_TTL_HOURS  = 72
+AI_DEFAULT_MAX_WORKERS      = 4
+AI_ESTIMATE_PER_CALL_USD    = 0.002
+AI_PROMPT_VERSION           = "v3.1"
 
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2,
                     "LOW": 3, "INFO": 4, "UNKNOWN": 5}
+
+# Kwargs that may appear but must be silently dropped (documented in v3.0 changelog)
+_COMPAT_KWARGS_SILENT = {"resume"}
 
 CHAIN_SEVERITY: dict[str, Severity] = {
     "nuclei-critical-finding":   Severity.CRITICAL,
@@ -221,8 +249,13 @@ CHAIN_SEVERITY: dict[str, Severity] = {
     "nuclei-ssrf-candidate":     Severity.HIGH,
     "nuclei-lfi-candidate":      Severity.HIGH,
     "nuclei-xss-candidate":      Severity.MEDIUM,
+    "nuclei-ssti-candidate":     Severity.HIGH,
+    "nuclei-xxe-candidate":      Severity.HIGH,
+    "nuclei-open-redirect":      Severity.LOW,
+    "nuclei-crlf-injection":     Severity.MEDIUM,
     "nuclei-auth-bypass":        Severity.HIGH,
     "nuclei-sensitive-file":     Severity.HIGH,
+    "nuclei-misconfig":          Severity.MEDIUM,
     "nuclei-multi-finding-host": Severity.MEDIUM,
 }
 
@@ -241,8 +274,13 @@ CHAIN_NAMES: dict[str, str] = {
     "nuclei-ssrf-candidate":     "Potential SSRF",
     "nuclei-lfi-candidate":      "Potential LFI/path traversal",
     "nuclei-xss-candidate":      "Potential XSS",
+    "nuclei-ssti-candidate":     "Potential server-side template injection",
+    "nuclei-xxe-candidate":      "Potential XML external entity",
+    "nuclei-open-redirect":      "Open redirect",
+    "nuclei-crlf-injection":     "CRLF / header injection",
     "nuclei-auth-bypass":        "Potential auth bypass",
     "nuclei-sensitive-file":     "Sensitive file exposed",
+    "nuclei-misconfig":          "Misconfiguration flagged",
     "nuclei-multi-finding-host": "Host with 3+ nuclei findings",
 }
 
@@ -260,9 +298,14 @@ TEMPLATE_CHAIN_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"sqli|sql-?injection|blind-?sql", re.I),                       "nuclei-sqli-candidate"),
     (re.compile(r"ssrf|server-?side-?request", re.I),                           "nuclei-ssrf-candidate"),
     (re.compile(r"lfi|path-?traversal|local-?file-?inclusion", re.I),           "nuclei-lfi-candidate"),
-    (re.compile(r"xss|cross-?site-?scripting", re.I),                           "nuclei-xss-candidate"),
+    (re.compile(r"(?<![a-z])xss|cross-?site-?scripting", re.I),                 "nuclei-xss-candidate"),
+    (re.compile(r"ssti|template-?injection", re.I),                              "nuclei-ssti-candidate"),
+    (re.compile(r"xxe|xml-?external", re.I),                                     "nuclei-xxe-candidate"),
+    (re.compile(r"open-?redirect|url-?redirect", re.I),                          "nuclei-open-redirect"),
+    (re.compile(r"crlf|header-?injection|response-?splitting", re.I),            "nuclei-crlf-injection"),
     (re.compile(r"auth-?bypass|broken-?auth|unauthenticated|unauth-", re.I),    "nuclei-auth-bypass"),
     (re.compile(r"backup|\.bak|\.sql|\.zip|\.tar|file-?download|sensitive-?file", re.I), "nuclei-sensitive-file"),
+    (re.compile(r"misconfig|configuration-?issue|insecure-?setting", re.I),     "nuclei-misconfig"),
 ]
 
 WAF_BLOCK_BODY_MARKERS = (
@@ -271,6 +314,10 @@ WAF_BLOCK_BODY_MARKERS = (
     "checking your browser",
     "ddos-guard",
     "enable javascript and cookies",
+    "request blocked",
+    "access denied",
+    "captcha",
+    "incapsula incident id",
 )
 
 PROFILES: dict[str, dict] = {
@@ -374,6 +421,7 @@ class NucleiFinding:
     chain_ids:          list[str] = field(default_factory=list)
     waf_blocked:        bool = False
     auth_enabled:       bool = False
+    confidence:         str = "medium"      # v3.1: high / medium / low
     first_seen:         str = ""
 
     def add_chain(self, cid: str) -> None:
@@ -408,6 +456,7 @@ class NucleiFinding:
             "chain_ids":         self.chain_ids,
             "waf_blocked":       self.waf_blocked,
             "auth_enabled":      self.auth_enabled,
+            "confidence":        self.confidence,
             "first_seen":        self.first_seen,
         }
 
@@ -476,7 +525,8 @@ def _host_of(url: str) -> str:
 def _is_waf_block_response(body: str) -> bool:
     if not body:
         return False
-    body_lower = body[:3000].lower()
+    # Wider window than v3.0 — CDN pages can be long.
+    body_lower = body[:8000].lower()
     return any(m in body_lower for m in WAF_BLOCK_BODY_MARKERS)
 
 
@@ -488,6 +538,39 @@ def _severity_of_str(sev: str) -> Severity:
         return Severity.INFO
 
 
+def _dedupe_key(f: NucleiFinding) -> tuple:
+    # v3.1: include path + response hash so fuzz findings with distinct
+    # payloads but same template + URL survive the dedupe pass.
+    resp_hash = hashlib.sha1((f.response or "")[:4096].encode()).hexdigest()[:12]
+    return (
+        f.template_id,
+        f.matched_at,
+        f.matcher_name,
+        tuple(sorted(f.extracted_results)),
+        f.path,
+        resp_hash,
+    )
+
+
+def _confidence_of(f: NucleiFinding) -> str:
+    """v3.1 heuristic confidence scoring for a single finding."""
+    if f.waf_blocked:
+        return "low"
+    if f.severity in ("INFO", "UNKNOWN"):
+        return "low"
+    if f.cve_ids and not f.waf_blocked:
+        return "high"
+    if f.template_id.startswith(("cve-", "CVE-")):
+        return "high"
+    if any(c in ("nuclei-rce-candidate", "nuclei-auth-bypass",
+                  "nuclei-exposed-config", "nuclei-default-creds")
+           for c in f.chain_ids):
+        return "high" if f.extracted_results else "medium"
+    if f.extracted_results:
+        return "high"
+    return "medium"
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  ᛚ  TEMPLATE CLASSIFICATION → CHAINS
 # ══════════════════════════════════════════════════════════════════════════
@@ -495,9 +578,8 @@ def _severity_of_str(sev: str) -> Severity:
 def _classify_template_to_chains(template_id: str) -> list[str]:
     chains: list[str] = []
     for pattern, cid in TEMPLATE_CHAIN_PATTERNS:
-        if pattern.search(template_id):
-            if cid not in chains:
-                chains.append(cid)
+        if pattern.search(template_id) and cid not in chains:
+            chains.append(cid)
     return chains
 
 
@@ -510,6 +592,7 @@ def _apply_chains(finding: NucleiFinding) -> None:
         finding.add_chain("nuclei-cve-match")
     for cid in _classify_template_to_chains(finding.template_id):
         finding.add_chain(cid)
+    finding.confidence = _confidence_of(finding)
 
 
 def _build_host_chains(findings: list[NucleiFinding]) -> list[dict]:
@@ -537,7 +620,7 @@ def _build_host_chains(findings: list[NucleiFinding]) -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  ᛜ  INPUT LOADING
+#  ᛜ  INPUT LOADING — v3.1 BOM + CRLF safe
 # ══════════════════════════════════════════════════════════════════════════
 
 def _load_targets(input_file: Path) -> list[str]:
@@ -545,9 +628,16 @@ def _load_targets(input_file: Path) -> list[str]:
         raise FileNotFoundError(f"input file not found: {input_file}")
     targets: list[str] = []
     seen: set[str] = set()
-    for line in input_file.read_text(encoding="utf-8").splitlines():
+    # v3.1: utf-8-sig strips BOM automatically.
+    raw = input_file.read_text(encoding="utf-8-sig", errors="replace")
+    for line in raw.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
+            continue
+        # Strip inline comments only when preceded by whitespace
+        if " #" in line:
+            line = line.split(" #", 1)[0].strip()
+        if not line:
             continue
         token = line.split()[0]
         if not token.startswith(("http://", "https://")):
@@ -613,13 +703,32 @@ def _update_templates() -> bool:
         return False
 
 
+def _nuclei_version() -> str:
+    """v3.1: capture version for report provenance."""
+    try:
+        r = subprocess.run(["nuclei", "-version"],
+                            capture_output=True, text=True, timeout=10)
+        text = (r.stdout or r.stderr or "").strip()
+        m = re.search(r"v?\d+\.\d+\.\d+", text)
+        return m.group(0) if m else text[:40]
+    except Exception:
+        return "unknown"
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  ᛃ  HEADER + PROXY RESOLUTION
 # ══════════════════════════════════════════════════════════════════════════
 
 def _headers_for_nuclei(bbp_program: Optional[str],
                           extra: Optional[dict]) -> tuple[list[str], bool]:
-    """Build -H args from config.build_headers + ACTIVE_HEADERS + AUTH_HEADERS + extra."""
+    """
+    Build -H args from config.build_headers + ACTIVE_HEADERS + AUTH_HEADERS + extra.
+
+    v3.2: if no User-Agent was contributed by any source, emit one from the
+    config UA corpus via -H. This replaces the old `-random-agent` flag —
+    which is NOT supported on all nuclei builds. `has_ua` is now always True
+    after this function returns.
+    """
     merged: dict[str, str] = {}
 
     if bbp_program:
@@ -647,9 +756,27 @@ def _headers_for_nuclei(bbp_program: Optional[str],
     args: list[str] = []
     has_ua = False
     for k, v in merged.items():
+        if v is None or (isinstance(v, str) and not v.strip()):
+            continue
         args.extend(["-H", f"{k}: {v}"])
         if k.lower() == "user-agent":
             has_ua = True
+
+    # v3.2 — always emit a UA. Universal — works on every nuclei build.
+    if not has_ua:
+        ua = ""
+        try:
+            ua_fn = _cfg("random_user_agent")
+            if callable(ua_fn):
+                ua = str(ua_fn())
+        except Exception:
+            ua = ""
+        if not ua:
+            ua = (f"Mozilla/5.0 (compatible; Argus/{__version__} "
+                  f"nuclei_scan; +https://beardedviking.org)")
+        args.extend(["-H", f"User-Agent: {ua}"])
+        has_ua = True
+
     return args, has_ua
 
 
@@ -664,11 +791,9 @@ def _pick_proxy(proxy_pool: Any) -> Optional[str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  ⚡  COMMAND BUILDER — v3.0 FIXED
-#      • Accepts **_ignored to swallow unknown kwargs (defense #1)
-#      • -ni (no interactsh) by default — safety
-#      • -duc, -stats-json, -or for lean output
-#      • page-timeout, interactsh-url, exclude-matchers, sni, track-error
+#  ⚡  COMMAND BUILDER — v3.1
+#      · Explicit kwargs whitelist — only truly unknown kwargs warn
+#      · Tiered flag emission for maximum nuclei version compatibility
 # ══════════════════════════════════════════════════════════════════════════
 
 def _build_cmd(
@@ -681,6 +806,7 @@ def _build_cmd(
     timeout: int,
     retries: int,
     profile: str,
+    effective_profile: Optional[dict] = None,
     custom_templates: Optional[list[str]] = None,
     custom_tags: Optional[list[str]] = None,
     header_args: Optional[list[str]] = None,
@@ -695,30 +821,22 @@ def _build_cmd(
     sni: Optional[str] = None,
     track_error: bool = False,
     omit_raw: bool = True,
-    **_ignored: Any,
+    **extra: Any,
 ) -> list[str]:
     """
-    v3.0.1 — Tiered flags for maximum nuclei-version compatibility.
-
-    Tier 1 (always emitted — verified in nuclei 2.x AND 3.x):
-        -l  -jsonl  -o  -rl  -c  -timeout  -retries
-        -silent  -nc  -severity  -exclude-tags  -random-agent
-        -H  -t  -proxy  -headless  -sni  -page-timeout
-
-    Tier 2 (opt-in via env/config — may not exist on older builds):
-        -no-interactsh  -interactsh-url  -exclude-matchers
-        -track-error  -omit-raw  -bulk-size
-
-    Tier 3 (removed in v3.0.1 — the likely culprits for your exit 2):
-        -duc  -stats  -stats-json
-        These aliases are not consistently present. The speed gain
-        from -duc was negligible; -stats-json wasn't parsed by the
-        pipeline anyway.
+    v3.1 — same tiered strategy as v3.0.1, with an explicit kwargs whitelist.
+    Only `resume` is silently tolerated (documented compat); any other
+    unknown kwarg warns so real typos are caught instead of silently swallowed.
     """
-    if _ignored:
-        log.debug(f"  _build_cmd: ignored kwargs: {sorted(_ignored.keys())}")
+    for k in extra:
+        if k in _COMPAT_KWARGS_SILENT:
+            log.debug(f"  _build_cmd: compat kwarg '{k}' silently dropped")
+        else:
+            log.warning(f"  _build_cmd: unexpected kwarg '{k}' dropped — "
+                        f"investigate caller")
 
-    prof = PROFILES.get(profile, PROFILES[DEFAULT_PROFILE])
+    prof = effective_profile if effective_profile is not None \
+        else PROFILES.get(profile, PROFILES[DEFAULT_PROFILE])
 
     # ═══ TIER 1 — universal safe flags ═══
     cmd: list[str] = [
@@ -734,7 +852,6 @@ def _build_cmd(
         "-nc",
     ]
 
-    # ═══ TIER 1 — universal safe flags (bulk-size: long form only) ═══
     if bulk_size and bulk_size != DEFAULT_BULK_SIZE:
         cmd.extend(["-bulk-size", str(bulk_size)])
 
@@ -764,9 +881,6 @@ def _build_cmd(
     if cookie_header:
         cmd.extend(["-H", f"Cookie: {cookie_header}"])
 
-    if not has_ua:
-        cmd.append("-random-agent")
-
     if headless:
         cmd.append("-headless")
 
@@ -779,28 +893,22 @@ def _build_cmd(
     if page_timeout and page_timeout != timeout:
         cmd.extend(["-page-timeout", str(page_timeout)])
 
-    # ═══ TIER 2 — opt-in extras (config-driven) ═══
+    # ═══ TIER 2 — opt-in extras (config-gated for older nuclei) ═══
+    tier2_ok = CFG_LOADED and getattr(CFG, "NUCLEI_USE_TIER2_FLAGS", False)
 
-    # Exclude matchers (long form only — safe on 3.x, missing on 2.x)
-    if exclude_matchers and CFG_LOADED and \
-            getattr(CFG, "NUCLEI_USE_TIER2_FLAGS", False):
+    if exclude_matchers and tier2_ok:
         for m in exclude_matchers:
             cmd.extend(["-exclude-matchers", m])
 
-    # Interactsh: only if explicitly enabled
-    if no_interactsh and CFG_LOADED and \
-            getattr(CFG, "NUCLEI_USE_TIER2_FLAGS", False):
+    if no_interactsh and tier2_ok:
         cmd.append("-no-interactsh")
-    elif interactsh_url and CFG_LOADED and \
-            getattr(CFG, "NUCLEI_USE_TIER2_FLAGS", False):
+    elif interactsh_url and tier2_ok:
         cmd.extend(["-interactsh-url", interactsh_url])
 
-    if track_error and CFG_LOADED and \
-            getattr(CFG, "NUCLEI_USE_TIER2_FLAGS", False):
+    if track_error and tier2_ok:
         cmd.append("-track-error")
 
-    if omit_raw and CFG_LOADED and \
-            getattr(CFG, "NUCLEI_USE_TIER2_FLAGS", False):
+    if omit_raw and tier2_ok:
         cmd.append("-omit-raw")
 
     return cmd
@@ -818,13 +926,15 @@ def _build_minimal_cmd(
     proxy: Optional[str] = None,
     has_ua: bool = False,
     profile: str = "standard",
+    effective_profile: Optional[dict] = None,
 ) -> list[str]:
     """
-    v3.0.1 — Bulletproof minimal command.
-    Uses ONLY the flags verified working in nuclei v2.x through v3.11.1.
-    Used as the progressive-retry fallback when the tiered command fails.
+    v3.1 — bulletproof minimal command. Now honors the effective profile
+    (including any user-supplied --severities / --tags-* overrides) so the
+    fallback run does not silently scan wider than the primary run.
     """
-    prof = PROFILES.get(profile, PROFILES[DEFAULT_PROFILE])
+    prof = effective_profile if effective_profile is not None \
+        else PROFILES.get(profile, PROFILES[DEFAULT_PROFILE])
 
     cmd: list[str] = [
         "nuclei",
@@ -848,9 +958,6 @@ def _build_minimal_cmd(
     if cookie_header:
         cmd.extend(["-H", f"Cookie: {cookie_header}"])
 
-    if not has_ua:
-        cmd.append("-random-agent")
-
     if proxy:
         cmd.extend(["-proxy", proxy])
 
@@ -858,10 +965,7 @@ def _build_minimal_cmd(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  ᛞ  BATCH EXECUTION — v3.0 FIXED
-#      • Pops `resume` before passing kwargs (defense #2)
-#      • Surfaces real stderr (with benign-error filter)
-#      • Explicit exception handlers for each failure class
+#  ᛞ  BATCH EXECUTION — v3.1
 # ══════════════════════════════════════════════════════════════════════════
 
 def _batch_evidence_path(evidence_dir: Path, batch_index: int,
@@ -888,22 +992,54 @@ def _try_nuclei(cmd: list[str], timeout: int) -> tuple[int, str, str]:
     except Exception as e:
         return -3, "", f"{type(e).__name__}: {e}"
 
+# Flags that take a value (used for progressive elimination)
+_FLAGS_TAKING_VALUE: frozenset[str] = frozenset({
+    "H", "l", "t", "o", "rl", "c", "timeout", "retries",
+    "severity", "tags", "exclude-tags", "bulk-size",
+    "proxy", "sni", "page-timeout", "interactsh-url",
+    "exclude-matchers", "stats-json", "stats-interval",
+    "target", "dut", "field", "template",
+})
+
+
+def _strip_flag_from_cmd(cmd: list[str], flag: str) -> list[str]:
+    """
+    v3.2: remove `flag` (and its value if it takes one) from a nuclei command.
+    `flag` may be passed with or without leading dash ("-random-agent" or
+    "random-agent"). Preserves the binary at index 0.
+    """
+    target = flag.lstrip("-")
+    out: list[str] = []
+    skip_next = False
+    for tok in cmd:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok.startswith("-") and tok.lstrip("-") == target:
+            if target in _FLAGS_TAKING_VALUE:
+                skip_next = True
+            continue
+        out.append(tok)
+    return out
 
 def _run_batch(
     targets: list[str],
     workdir: Path,
     evidence_dir: Path,
     batch_index: int,
+    batch_timeout: Optional[int] = None,
     **kwargs: Any,
 ) -> tuple[Optional[Path], BatchResult]:
     """
-    v3.0.1 — progressive-retry.
+    v3.2 — progressive flag elimination.
 
-    1. Try tiered command (full flags).
-    2. If exit 2 (bad flag), retry with minimal safe command.
-    3. If that also fails, log stderr+stdout and return.
+    On rc==2, parses "flag provided but not defined: -X" from output, strips
+    `-X` (and its value if applicable), retries. Repeats up to MAX_STRIP passes.
+    If a flag can't be parsed, falls back to the minimal-safe command.
     """
     resume_flag = bool(kwargs.pop("resume", False))
+    eff_profile = kwargs.pop("effective_profile", None)
+    eff_timeout = batch_timeout or NUCLEI_HARD_TIMEOUT
 
     result = BatchResult(
         batch_index=batch_index,
@@ -911,11 +1047,13 @@ def _run_batch(
         rate_limit=kwargs.get("rate_limit"),
         concurrency=kwargs.get("concurrency"),
         bulk_size=kwargs.get("bulk_size"),
-        severities=",".join(PROFILES.get(kwargs.get("profile", DEFAULT_PROFILE), {})
-                             .get("severities") or []),
+        severities=",".join(
+            (eff_profile or PROFILES.get(kwargs.get("profile", DEFAULT_PROFILE), {}))
+            .get("severities") or []),
         tags_allow=",".join(kwargs.get("custom_tags") or []),
-        tags_deny=",".join(PROFILES.get(kwargs.get("profile", DEFAULT_PROFILE), {})
-                            .get("tags_deny") or []),
+        tags_deny=",".join(
+            (eff_profile or PROFILES.get(kwargs.get("profile", DEFAULT_PROFILE), {}))
+            .get("tags_deny") or []),
         headless=bool(kwargs.get("headless")),
         auth_enabled=bool(kwargs.get("cookie_header") or kwargs.get("header_args")),
         first_seen=datetime.now(timezone.utc).isoformat(),
@@ -929,7 +1067,6 @@ def _run_batch(
         log.ok(f"  batch {batch_index:02d}  resume from {evidence_path.name} "
                f"({evidence_path.stat().st_size}B)")
         result.input_file = str(evidence_path)
-        result.error = ""
         return evidence_path, result
 
     targets_file = workdir / f"batch_{batch_index:03d}_targets.txt"
@@ -941,25 +1078,77 @@ def _run_batch(
     log.info(f"  batch {batch_index:02d}  {len(targets):>3} target(s)  "
              f"→ {output_jsonl.name}")
 
-    # ═══ ATTEMPT 1: tiered command ═══
-    cmd = _build_cmd(targets_file, output_jsonl, **kwargs)
-    log.debug(f"  cmd: {' '.join(cmd[:8])}…")
+    cmd = _build_cmd(targets_file, output_jsonl,
+                      effective_profile=eff_profile, **kwargs)
 
-    started = time.monotonic()
-    rc, stdout, stderr = _try_nuclei(cmd, NUCLEI_HARD_TIMEOUT)
-    result.duration_ms = int((time.monotonic() - started) * 1000)
-    _audit_subprocess("nuclei", cmd, rc == 0, result.duration_ms, stderr[:200])
+    # ═══ ATTEMPT LOOP — progressive flag elimination ═══
+    MAX_STRIPS = 8
+    tried_flags: set[str] = set()
+    rc, stdout, stderr = 0, "", ""
 
-    # ═══ ATTEMPT 2: minimal fallback on exit 2 ═══
-    if rc == 2:
-        log.warn(f"  batch {batch_index:02d}  exit 2 on tiered command — "
-                  f"unsupported flag on this nuclei build")
-        if stderr.strip():
-            log.warn(f"         stderr: {stderr.strip()[:200]}")
-        if stdout.strip():
-            log.warn(f"         stdout: {stdout.strip()[:200]}")
+    for attempt in range(MAX_STRIPS + 1):
+        log.debug(f"  cmd (attempt {attempt+1}, {len(cmd)} tokens): "
+                  f"{' '.join(cmd[:10])}…")
+        started = time.monotonic()
+        rc, stdout, stderr = _try_nuclei(cmd, eff_timeout)
+        result.duration_ms += int((time.monotonic() - started) * 1000)
+        _audit_subprocess("nuclei", cmd, rc == 0,
+                          result.duration_ms, stderr[:200])
 
-        log.info(f"  batch {batch_index:02d}  retrying with minimal safe flags")
+        if rc == 0:
+            break
+
+        # Non-flag error → no point in further flag elimination
+        if rc != 2:
+            result.error = (f"rc={rc}: "
+                            f"{(stderr or stdout).strip()[:500]}")
+            log.warn(f"  batch {batch_index:02d}  exited {rc}: "
+                     f"{(stderr or stdout).strip()[:200]}")
+            return None, result
+
+        # rc == 2 — try to parse the rejected flag
+        combined = f"{stderr}\n{stdout}"
+        m = re.search(r"flag provided but not defined:\s*-([\w\-]+)",
+                       combined)
+        if not m:
+            # Can't parse — fall through to minimal
+            log.warn(f"  batch {batch_index:02d}  exit 2 with unparseable flag "
+                     f"error — falling back to minimal command")
+            log.debug(f"         raw: {(combined.strip()[:300])}")
+            break
+
+        bad_flag = m.group(1).strip()
+        if bad_flag in tried_flags:
+            log.error(f"  batch {batch_index:02d}  loop on flag -{bad_flag} — "
+                     f"giving up")
+            result.error = f"flag loop on -{bad_flag}"
+            return None, result
+
+        tried_flags.add(bad_flag)
+        log.warn(f"  batch {batch_index:02d}  nuclei rejected "
+                 f"-{bad_flag} — stripping and retrying "
+                 f"({len(tried_flags)}/{MAX_STRIPS})")
+
+        new_cmd = _strip_flag_from_cmd(cmd, bad_flag)
+        if len(new_cmd) < 3:
+            result.error = f"cannot strip -{bad_flag} — command too short"
+            log.error(f"  batch {batch_index:02d}  {result.error}")
+            return None, result
+        if new_cmd == cmd:
+            result.error = f"strip on -{bad_flag} made no change"
+            log.error(f"  batch {batch_index:02d}  {result.error}")
+            return None, result
+        cmd = new_cmd
+        continue
+    else:
+        # Loop exhausted without success — try minimal
+        log.warn(f"  batch {batch_index:02d}  exhausted {MAX_STRIPS} strip "
+                 f"attempts — falling back to minimal command")
+        cmd = []  # force minimal fallback below
+
+    # ═══ If still failing or fell through → minimal fallback ═══
+    if rc != 0:
+        log.info(f"  batch {batch_index:02d}  retrying with minimal-safe flags")
         min_cmd = _build_minimal_cmd(
             targets_file, output_jsonl,
             rate_limit=kwargs.get("rate_limit", DEFAULT_RATE_LIMIT),
@@ -970,33 +1159,45 @@ def _run_batch(
             proxy=kwargs.get("proxy"),
             has_ua=kwargs.get("has_ua", False),
             profile=kwargs.get("profile", DEFAULT_PROFILE),
+            effective_profile=eff_profile,
         )
         log.debug(f"  minimal: {' '.join(min_cmd)}")
 
-        started = time.monotonic()
-        rc, stdout, stderr = _try_nuclei(min_cmd, NUCLEI_HARD_TIMEOUT)
-        result.duration_ms += int((time.monotonic() - started) * 1000)
-        _audit_subprocess("nuclei-minimal", min_cmd, rc == 0,
-                            result.duration_ms, stderr[:200])
+        # Also strip-eliminate on minimal
+        for attempt in range(MAX_STRIPS):
+            started = time.monotonic()
+            rc, stdout, stderr = _try_nuclei(min_cmd, eff_timeout)
+            result.duration_ms += int((time.monotonic() - started) * 1000)
+            if rc == 0:
+                break
+            if rc != 2:
+                break
+            combined = f"{stderr}\n{stdout}"
+            m = re.search(r"flag provided but not defined:\s*-([\w\-]+)",
+                           combined)
+            if not m:
+                break
+            bad_flag = m.group(1).strip()
+            log.warn(f"  batch {batch_index:02d}  minimal rejected "
+                     f"-{bad_flag} — stripping")
+            new_min = _strip_flag_from_cmd(min_cmd, bad_flag)
+            if new_min == min_cmd or len(new_min) < 3:
+                break
+            min_cmd = new_min
 
         if rc != 0:
-            result.error = f"minimal also failed (rc={rc}): {stderr[:200]}"
+            result.error = (f"minimal also failed (rc={rc}): "
+                            f"{(stderr or stdout).strip()[:500]}")
             log.error(f"  batch {batch_index:02d}  minimal ALSO failed: "
-                       f"rc={rc}  {stderr.strip()[:200]}")
-            if stdout.strip():
-                log.error(f"         stdout: {stdout.strip()[:200]}")
+                       f"rc={rc}")
+            log.error(f"         stdout: {stdout.strip()[:200]}")
+            log.error(f"         stderr: {stderr.strip()[:200]}")
             return None, result
 
         log.ok(f"  batch {batch_index:02d}  minimal command succeeded")
 
-    elif rc != 0:
-        result.error = f"rc={rc}: {stderr[:300] or stdout[:300]}"
-        log.warn(f"  batch {batch_index:02d}  exited {rc}: "
-                  f"{(stderr or stdout).strip()[:200]}")
-        return None, result
-
     if not output_jsonl.exists():
-        result.error = (stderr or stdout or "no output file produced")[:300]
+        result.error = (stderr or stdout or "no output file produced")[:500]
         log.debug(f"  batch {batch_index:02d}: no JSONL. "
                    f"stderr: {stderr.strip()[:160]}  "
                    f"stdout: {stdout.strip()[:160]}")
@@ -1011,23 +1212,11 @@ def _run_batch(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  ᛊ  JSONL PARSING — v3.0 (full nuclei v3.x schema tolerance)
+#  ᛊ  JSONL PARSING — v3.1 (schema tolerance preserved, CVSS-severity
+#      upgrade added)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _parse_jsonl(path: Path, auth_on: bool) -> list[NucleiFinding]:
-    """
-    Parse nuclei JSONL output into NucleiFinding objects.
-
-    v3.0 tolerances:
-      · template-id / templateID / template_id / template aliases
-      · info.classification may be missing entirely
-      · cvss-score may be float, str, or omitted; falls back to
-        parsing the CVSS vector string ("CVSS:3.1/.../9.8")
-      · cve-id / cwe-id may be str (single) or list
-      · port may be int, str, "null", or missing
-      · severity strings normalized; unknown values → "UNKNOWN"
-      · response body sniffed for WAF block markers (cloudflare, akamai)
-    """
     if not path.exists():
         return []
 
@@ -1071,7 +1260,7 @@ def _parse_jsonl(path: Path, auth_on: bool) -> list[NucleiFinding]:
         if not template_id or not matched_at:
             continue
 
-        # ── CVSS: try numeric field, then CVSS vector string ──
+        # ── CVSS: try numeric fields, then the CVSS vector string ──
         cvss: Optional[float] = None
         for key in ("cvss-score", "cvss_score", "cvss"):
             val = classification.get(key)
@@ -1092,7 +1281,6 @@ def _parse_jsonl(path: Path, auth_on: bool) -> list[NucleiFinding]:
                     except (TypeError, ValueError):
                         pass
 
-        # ── CVE / CWE — accept str or list ──
         def _as_list(val: Any) -> list[str]:
             if not val:
                 return []
@@ -1105,7 +1293,6 @@ def _parse_jsonl(path: Path, auth_on: bool) -> list[NucleiFinding]:
         cves = _as_list(classification.get("cve-id") or classification.get("cve_id"))
         cwes = _as_list(classification.get("cwe-id") or classification.get("cwe_id"))
 
-        # ── Tags ──
         tags = info.get("tags") or []
         if isinstance(tags, str):
             tags = [t.strip() for t in tags.split(",") if t.strip()]
@@ -1122,12 +1309,14 @@ def _parse_jsonl(path: Path, auth_on: bool) -> list[NucleiFinding]:
         elif not isinstance(author, list):
             author = []
 
-        # ── Severity ──
+        # ── Severity, with CVSS upgrade for UNKNOWN (v3.1) ──
         sev = (info.get("severity") or "unknown").upper()
         if sev not in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"):
-            sev = "UNKNOWN"
+            if cvss is not None and cvss > 0:
+                sev = _severity_from_cvss(cvss)
+            else:
+                sev = "UNKNOWN"
 
-        # ── Port ──
         port: Optional[int] = None
         for key in ("port", "matched-port", "matched_port"):
             port_raw = obj.get(key)
@@ -1140,7 +1329,6 @@ def _parse_jsonl(path: Path, auth_on: bool) -> list[NucleiFinding]:
 
         host = obj.get("host") or _host_of(matched_at)
 
-        # ── WAF sniff on response body ──
         response_body = obj.get("response", "") or ""
         waf_blocked = _is_waf_block_response(response_body)
 
@@ -1198,11 +1386,10 @@ def _dedupe(findings: list[NucleiFinding]) -> list[NucleiFinding]:
     seen: set[tuple] = set()
     deduped: list[NucleiFinding] = []
     for f in findings:
-        key = (f.template_id, f.matched_at, f.matcher_name,
-                tuple(sorted(f.extracted_results)))
-        if key in seen:
+        k = _dedupe_key(f)
+        if k in seen:
             continue
-        seen.add(key)
+        seen.add(k)
         deduped.append(f)
     return deduped
 
@@ -1220,7 +1407,7 @@ def _sort_findings(findings: list[NucleiFinding]) -> list[NucleiFinding]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  🧠 v3.0 AI CACHE — skip re-triaging hosts with the same findings
+#  🧠 v3.1 AI CACHE — versioned by model + prompt hash
 # ══════════════════════════════════════════════════════════════════════════
 
 def _ai_cache_dir(outdir: Path) -> Path:
@@ -1229,17 +1416,21 @@ def _ai_cache_dir(outdir: Path) -> Path:
     return d
 
 
-def _ai_cache_key(host: str, findings: list[NucleiFinding]) -> str:
-    """Stable hash of host + finding set. Same findings = same cache."""
-    parts = [host.lower()]
+def _ai_cache_key(host: str, findings: list[NucleiFinding],
+                    model: str = "", prompt_version: str = AI_PROMPT_VERSION) -> str:
+    """
+    Stable hash of host + finding set + model + prompt version.
+    Same inputs → same cache key; model swap or prompt revision busts cache.
+    """
+    parts = [host.lower(), f"model={model or 'unknown'}",
+             f"prompt={prompt_version}"]
     for f in sorted(findings, key=lambda x: (x.template_id, x.matched_at)):
-        parts.append(f"{f.template_id}|{f.matched_at}|{f.severity}")
+        parts.append(f"{f.template_id}|{f.matched_at}|{f.severity}|{f.waf_blocked}")
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
 
 
 def _ai_cache_get(outdir: Path, key: str,
                     ttl_hours: int = AI_DEFAULT_CACHE_TTL_HOURS) -> Optional[dict]:
-    """Retrieve cached AI triage if fresh. ttl_hours <= 0 disables cache."""
     if ttl_hours <= 0:
         return None
     try:
@@ -1255,7 +1446,6 @@ def _ai_cache_get(outdir: Path, key: str,
 
 
 def _ai_cache_put(outdir: Path, key: str, data: dict) -> None:
-    """Persist AI triage result. Best-effort — never fatal."""
     try:
         p = _ai_cache_dir(outdir) / f"{key}.json"
         p.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n",
@@ -1264,35 +1454,64 @@ def _ai_cache_put(outdir: Path, key: str, data: dict) -> None:
         pass
 
 
-def _ai_cost_guard(would_add_cost: Optional[float], budget_usd: float) -> bool:
+# ══════════════════════════════════════════════════════════════════════════
+#  💰 v3.1 COST TRACKING
+# ══════════════════════════════════════════════════════════════════════════
+
+_BUDGET_LOCK = threading.Lock()
+
+
+def _current_spend() -> float:
+    try:
+        tracker = _cfg("AI_COSTS")
+        if tracker is not None and hasattr(tracker, "estimate_cost"):
+            return float(tracker.estimate_cost() or 0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _ai_cost_guard(would_add_cost: float, budget_usd: float) -> bool:
     """
     Return True if it's safe to make another AI call.
-    Uses config.AI_COSTS.estimate_cost() as the running total.
-    budget_usd <= 0 means unlimited.
+    Lock-protected so parallel callers can't both see "just under budget".
     """
     if budget_usd <= 0:
         return True
-    if not would_add_cost:
+    if would_add_cost <= 0:
         return True
-    try:
-        tracker = _cfg("AI_COSTS")
-        if tracker is None or not hasattr(tracker, "estimate_cost"):
-            return True
-        spent = float(tracker.estimate_cost() or 0)
-        return (spent + would_add_cost) <= budget_usd
-    except Exception:
-        return True
+    with _BUDGET_LOCK:
+        return (_current_spend() + would_add_cost) <= budget_usd
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  ᚨ  AI TRIAGE  ·  per-host (v3.0: cache + budget-aware)
+#  ᚨ  AI TRIAGE  ·  per-host (v3.1: enriched prompt + validation + retry)
 # ══════════════════════════════════════════════════════════════════════════
 
 AI_NUCLEI_SYSTEM = (
-    "You are an expert bug-bounty triage analyst. Analyze nuclei findings "
-    "for one host. Determine which findings are likely real vs false "
-    "positives, prioritize manual confirmation, and suggest specific tests. "
-    "Never suggest running exploits. Return STRICT JSON only."
+    "You are an expert bug-bounty triage analyst. You will receive nuclei "
+    "findings for ONE host, along with that host's chain classification, WAF "
+    "status per finding, CVSS scores, extracted results, and a heuristic "
+    "baseline ranking you may use as a soft hint but MUST NOT trust blindly. "
+    "\n\n"
+    "Your job:\n"
+    "  1. Rank findings by likely real-world impact (not just severity label).\n"
+    "  2. Distinguish likely-real from likely-false-positive with reasoning.\n"
+    "  3. Propose a multi-finding chain hypothesis if any is plausible.\n"
+    "  4. Suggest concrete MANUAL confirmation steps — never exploits.\n"
+    "  5. Downgrade findings whose response body looks like a WAF block page.\n"
+    "\n"
+    "Return STRICT JSON only. No markdown fences, no preamble. "
+    "Required schema:\n"
+    "{\n"
+    '  "summary": "<one paragraph>",\n'
+    '  "host_risk": "CRITICAL|HIGH|MEDIUM|LOW|INFO",\n'
+    '  "top_priorities": [{"rank":1,"finding":"tpl @ url","reason":"…",'
+    '"test_idea":"…","confidence":"high|medium|low"}],\n'
+    '  "real_vs_noise": "<specific narrative>",\n'
+    '  "next_actions": ["…","…"],\n'
+    '  "chain_hypothesis": "<one-liner or empty>"\n'
+    "}"
 )
 
 
@@ -1305,12 +1524,46 @@ def _build_top_findings_block(findings: list[NucleiFinding],
 
     lines = []
     for f in top:
-        cve = f",{','.join(f.cve_ids[:2])}" if f.cve_ids else ""
-        lines.append(
-            f"  [{f.severity:<8}] {f.template_id:<40} "
-            f"{f.matched_at[:60]:<60}{cve}"
-        )
+        bits = [f"[{f.severity:<8}]", f"{f.template_id:<38}"]
+        bits.append(f"{f.matched_at[:70]}")
+        if f.cvss_score:
+            bits.append(f"cvss={f.cvss_score:.1f}")
+        if f.waf_blocked:
+            bits.append("WAF-BLOCKED")
+        if f.extracted_results:
+            sample = ",".join(str(x)[:40] for x in f.extracted_results[:2])
+            bits.append(f"extracted=[{sample}]")
+        if f.cve_ids:
+            bits.append(",".join(f.cve_ids[:2]))
+        lines.append("  " + " ".join(bits))
     return "\n".join(lines) if lines else "  (no findings)"
+
+
+def _build_chains_block(host_result: HostResult) -> str:
+    if not host_result.chains:
+        return "  (no chains)"
+    lines = []
+    for c in host_result.chains[:12]:
+        lines.append(f"  [{c['severity']:<8}] {c['chain_id']:<32} "
+                     f"x{c['count']}")
+    return "\n".join(lines)
+
+
+def _validate_ai_triage(data: Any) -> bool:
+    """v3.1: light schema validation — must be dict with required keys."""
+    if not isinstance(data, dict):
+        return False
+    for key in ("summary", "host_risk", "real_vs_noise", "next_actions"):
+        if key not in data:
+            return False
+    if not isinstance(data.get("next_actions"), list):
+        return False
+    if data.get("host_risk") not in ("CRITICAL", "HIGH", "MEDIUM", "LOW",
+                                       "INFO", "UNKNOWN", ""):
+        return False
+    if "top_priorities" in data and not isinstance(data["top_priorities"], list):
+        return False
+    return True
 
 
 def _ai_triage_host(
@@ -1320,14 +1573,10 @@ def _ai_triage_host(
     use_cache: bool = True,
     cache_ttl_hours: int = AI_DEFAULT_CACHE_TTL_HOURS,
     budget_usd: float = 0.0,
+    heuristic_hint: Optional[dict] = None,
 ) -> Optional[dict]:
     """
-    AI triage for one host.
-
-    v3.0:
-      · Cache hit → return without spending tokens
-      · Budget exhausted → return None (caller falls back to heuristic)
-      · Never raises — any exception → None → heuristic runs
+    AI triage for one host. Never raises — any failure → None → heuristic runs.
     """
     if not _ai_enabled():
         return None
@@ -1337,8 +1586,9 @@ def _ai_triage_host(
     if len(host_result.findings) < AI_MIN_FINDINGS_PER_HOST:
         return None
 
-    # ── Cache check ──
-    cache_key = _ai_cache_key(host_result.host, host_result.findings)
+    model_name = str(_cfg("AI.model", "deepseek-chat"))
+    cache_key = _ai_cache_key(host_result.host, host_result.findings,
+                                model=model_name)
     if use_cache:
         cached = _ai_cache_get(outdir, cache_key, ttl_hours=cache_ttl_hours)
         if cached:
@@ -1346,69 +1596,102 @@ def _ai_triage_host(
             cached["source"] = "ai-cached"
             return cached
 
-    # ── Budget check (rough ~$0.002 per triage call on deepseek-chat) ──
-    if budget_usd > 0 and not _ai_cost_guard(0.002, budget_usd):
+    if not _ai_cost_guard(AI_ESTIMATE_PER_CALL_USD, budget_usd):
         log.debug(f"  AI budget reached — heuristic for {host_result.host}")
         return None
 
     findings = host_result.findings
-    by_sev = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    by_sev = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0,
+                "UNKNOWN": 0}
     for f in findings:
         by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
 
     cve_count = sum(1 for f in findings if f.cve_ids)
     waf_blocks = sum(1 for f in findings if f.waf_blocked)
+    high_conf = sum(1 for f in findings if f.confidence == "high")
+
+    hint_block = ""
+    if heuristic_hint and heuristic_hint.get("top_priorities"):
+        hint_lines = []
+        for p in heuristic_hint["top_priorities"][:3]:
+            hint_lines.append(f"  {p.get('rank', '?')}. {p.get('finding', '')} "
+                              f"({p.get('reason', '')})")
+        hint_block = (
+            "\n\nHeuristic baseline ranking (HINT ONLY, verify independently):\n"
+            + "\n".join(hint_lines)
+        )
 
     prompt = f"""Analyze nuclei findings for host: {host_result.host}
 
-Stats:
-  Total findings:  {len(findings)}
-  CRITICAL:        {by_sev['CRITICAL']}
-  HIGH:            {by_sev['HIGH']}
-  MEDIUM:          {by_sev['MEDIUM']}
-  LOW:             {by_sev['LOW']}
-  INFO:            {by_sev['INFO']}
-  CVE-tagged:      {cve_count}
-  WAF-blocked:     {waf_blocks}
+Statistics:
+  Total:        {len(findings)}
+  CRITICAL:     {by_sev['CRITICAL']}
+  HIGH:         {by_sev['HIGH']}
+  MEDIUM:       {by_sev['MEDIUM']}
+  LOW:          {by_sev['LOW']}
+  INFO:         {by_sev['INFO']}
+  UNKNOWN:      {by_sev['UNKNOWN']}
+  CVE-tagged:   {cve_count}
+  WAF-blocked:  {waf_blocks}
+  High-conf:    {high_conf}
+
+Chain classification:
+{_build_chains_block(host_result)}
 
 Top findings:
-{_build_top_findings_block(findings)}
+{_build_top_findings_block(findings)}{hint_block}
+"""
 
-Return STRICT JSON:
-{{
-  "summary": "one paragraph overall assessment",
-  "host_risk": "CRITICAL|HIGH|MEDIUM|LOW|INFO",
-  "top_priorities": [
-    {{"rank": 1, "finding": "template_id @ url", "reason": "why",
-      "test_idea": "specific manual confirmation step"}}
-  ],
-  "real_vs_noise": "which findings look real vs likely false positives",
-  "next_actions": ["manual confirmation 1", "manual confirmation 2"],
-  "chain_hypothesis": "any multi-finding exploit chain worth exploring"
-}}"""
+    def _call(prompt_text: str) -> Optional[str]:
+        try:
+            return ai_fn(prompt_text, system=AI_NUCLEI_SYSTEM)
+        except Exception as e:
+            log.warn(f"  AI call failed for {host_result.host}: "
+                      f"{type(e).__name__}: {e}")
+            return None
 
-    try:
-        response = ai_fn(prompt, system=AI_NUCLEI_SYSTEM)
-    except Exception as e:
-        log.warn(f"  AI triage failed for {host_result.host}: "
-                  f"{type(e).__name__}: {e}")
-        return None
-    if not response:
+    text = _call(prompt)
+    if not text:
         return None
 
-    text = response.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
+    def _strip_fences(s: str) -> str:
+        s = s.strip()
+        if s.startswith("```"):
+            s = re.sub(r"^```(?:json)?\s*", "", s)
+            s = re.sub(r"\s*```$", "", s)
+        return s
 
-    try:
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            raise ValueError("not a dict")
-    except Exception:
-        data = {"summary": response[:1500], "parse_error": True}
+    def _try_parse(raw: str) -> Optional[dict]:
+        try:
+            d = json.loads(_strip_fences(raw))
+            return d if _validate_ai_triage(d) else None
+        except Exception:
+            return None
 
-    # ── Persist cache only if parse succeeded ──
+    data = _try_parse(text)
+
+    # v3.1: one corrective retry on parse/validate failure
+    if data is None:
+        log.debug(f"  AI parse/validate failed for {host_result.host} — "
+                  f"retrying once with correction")
+        correction = (
+            "Your previous response could not be parsed as valid JSON matching "
+            "the required schema. Return ONLY the JSON object, no fences, no "
+            "preamble. All required keys must be present.\n\n"
+            f"Previous response was:\n{text[:800]}"
+        )
+        text2 = _call(correction)
+        if text2:
+            data = _try_parse(text2)
+            if data is None:
+                data = {"summary": text2[:1500], "parse_error": True,
+                        "host_risk": "UNKNOWN", "real_vs_noise": "unknown",
+                        "next_actions": [], "top_priorities": []}
+        else:
+            data = {"summary": text[:1500], "parse_error": True,
+                    "host_risk": "UNKNOWN", "real_vs_noise": "unknown",
+                    "next_actions": [], "top_priorities": []}
+
     if use_cache and not data.get("parse_error"):
         _ai_cache_put(outdir, cache_key, data)
 
@@ -1417,15 +1700,19 @@ Return STRICT JSON:
     try:
         md = (f"# Surtr's Wrath · AI Triage — {host_result.host}\n\n"
               f"**Findings:** {len(findings)}  \n"
-              f"**Model:** {_cfg('AI.model', 'deepseek-chat')}\n\n---\n\n")
+              f"**Model:** {model_name}  \n"
+              f"**Prompt:** {AI_PROMPT_VERSION}\n\n---\n\n")
+        if data.get("host_risk"):
+            md += f"**Host risk:** {data['host_risk']}\n\n"
         if data.get("summary"):
             md += f"## Summary\n\n{data['summary']}\n\n"
         if data.get("top_priorities"):
             md += "## Top Priorities\n\n"
             for p in data["top_priorities"]:
-                md += (f"{p.get('rank', '?')}. **{p.get('finding', '')}**\n"
-                        f"   - Reason: {p.get('reason', '')}\n"
-                        f"   - Confirm: {p.get('test_idea', '')}\n\n")
+                md += (f"{p.get('rank', '?')}. **{p.get('finding', '')}** "
+                       f"_(conf={p.get('confidence', '?')})_\n"
+                       f"   - Reason: {p.get('reason', '')}\n"
+                       f"   - Confirm: {p.get('test_idea', '')}\n\n")
         if data.get("real_vs_noise"):
             md += f"## Real vs Noise\n\n{data['real_vs_noise']}\n\n"
         if data.get("chain_hypothesis"):
@@ -1440,14 +1727,6 @@ Return STRICT JSON:
 
     log.ok(f"  AI triage saved: {md_path.name}")
 
-    cost = None
-    try:
-        tracker = _cfg("AI_COSTS")
-        if tracker is not None and hasattr(tracker, "estimate_cost"):
-            cost = round(tracker.estimate_cost(), 6)
-    except Exception:
-        pass
-
     return {
         "path": str(md_path),
         "summary": data.get("summary", ""),
@@ -1456,13 +1735,13 @@ Return STRICT JSON:
         "real_vs_noise": data.get("real_vs_noise", ""),
         "next_actions": data.get("next_actions", [])[:10],
         "chain_hypothesis": data.get("chain_hypothesis", ""),
-        "cost_estimate": cost,
+        "cost_estimate": round(_current_spend(), 6),
         "source": "ai",
     }
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  ᚹ  HEURISTIC TRIAGE — same schema as AI, always runs
+#  ᚹ  HEURISTIC TRIAGE — v3.1 (WAF-aware, confidence, cross-correlation)
 # ══════════════════════════════════════════════════════════════════════════
 
 def _suggest_confirmation(f: NucleiFinding) -> str:
@@ -1477,16 +1756,28 @@ def _suggest_confirmation(f: NucleiFinding) -> str:
         return f"Manually confirm LFI at {f.matched_at} with ../../../../etc/passwd"
     if "rce" in tid or "command-injection" in tid:
         return f"CAREFULLY confirm RCE at {f.matched_at} with `;id`"
+    if "ssti" in tid or "template-injection" in tid:
+        return f"Manually confirm SSTI at {f.matched_at} with {{{{7*7}}}}"
+    if "xxe" in tid or "xml-external" in tid:
+        return f"Manually confirm XXE at {f.matched_at} with an out-of-band DOCTYPE payload"
+    if "open-redirect" in tid or "url-redirect" in tid:
+        return f"Manually confirm redirect at {f.matched_at} with ?next=https://evil.test"
+    if "crlf" in tid or "header-injection" in tid:
+        return f"Manually confirm CRLF at {f.matched_at} with %0d%0aX-Injected:1"
     if "cors" in tid:
-        return f"Manually check CORS at {f.matched_at} with Origin: https://evil.com"
+        return f"Manually check CORS at {f.matched_at} with Origin: https://evil.test"
     if "exposed" in tid or "disclosure" in tid:
         return f"Browse {f.matched_at} in browser — confirm data sensitivity"
     if "default-login" in tid or "default-cred" in tid:
         return f"Manually verify default credentials at {f.matched_at}"
     if "takeover" in tid:
         return f"Verify takeover possibility for {_host_of(f.matched_at)} via DNS"
+    if "backup" in tid or ".bak" in tid or ".sql" in tid:
+        return f"Download and inspect {f.matched_at} — confirm data contents"
     if "tech" in tid or "version" in tid:
         return f"Check {f.matched_at} for specific version — cross-reference CVEs"
+    if "misconfig" in tid:
+        return f"Review {f.matched_at} for exploitable misconfiguration"
     if f.cve_ids:
         return f"Look up {','.join(f.cve_ids)} on NVD — confirm version + test"
     return f"Manually verify {f.matched_at} in browser"
@@ -1500,84 +1791,120 @@ def _heuristic_triage(host_result: HostResult) -> dict:
             "host_risk": "INFO",
             "top_priorities": [],
             "real_vs_noise": "n/a",
-            "next_actions": [
-                "Consider widening --profile or --tags on next run",
-            ],
+            "next_actions": ["Consider widening --profile or --tags on next run"],
             "chain_hypothesis": "",
             "source": "heuristic",
         }
 
-    by_sev = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+    # Raw + WAF-adjusted severity breakdown
+    by_sev_raw: dict[str, int] = {}
+    by_sev_eff: dict[str, int] = {}
+    n_waf = 0
     for f in findings:
-        by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
+        by_sev_raw[f.severity] = by_sev_raw.get(f.severity, 0) + 1
+        if f.waf_blocked:
+            n_waf += 1
+            eff = _downgrade_severity(f.severity)
+        else:
+            eff = f.severity
+        by_sev_eff[eff] = by_sev_eff.get(eff, 0) + 1
 
-    if by_sev["CRITICAL"] > 0: host_risk = "CRITICAL"
-    elif by_sev["HIGH"] > 0:   host_risk = "HIGH"
-    elif by_sev["MEDIUM"] > 0: host_risk = "MEDIUM"
-    elif by_sev["LOW"] > 0:    host_risk = "LOW"
-    else:                       host_risk = "INFO"
+    # Host risk driven by EFFECTIVE severity (WAF-aware)
+    if by_sev_eff.get("CRITICAL", 0) > 0: host_risk = "CRITICAL"
+    elif by_sev_eff.get("HIGH", 0) > 0:   host_risk = "HIGH"
+    elif by_sev_eff.get("MEDIUM", 0) > 0: host_risk = "MEDIUM"
+    elif by_sev_eff.get("LOW", 0) > 0:    host_risk = "LOW"
+    else:                                   host_risk = "INFO"
 
     cve_count = sum(1 for f in findings if f.cve_ids)
-    waf_blocks = sum(1 for f in findings if f.waf_blocked)
+    high_conf = sum(1 for f in findings if f.confidence == "high")
+    low_conf = sum(1 for f in findings if f.confidence == "low")
+
+    n_total = len(findings)
+    n_effective = n_total - n_waf
 
     summary = (
-        f"{len(findings)} nuclei finding(s) on {host_result.host}. "
-        f"CRITICAL={by_sev['CRITICAL']} HIGH={by_sev['HIGH']} "
-        f"MEDIUM={by_sev['MEDIUM']}. {cve_count} CVE-tagged."
+        f"{n_total} finding(s) on {host_result.host}. "
+        f"Raw: CRIT={by_sev_raw.get('CRITICAL', 0)} "
+        f"HIGH={by_sev_raw.get('HIGH', 0)} "
+        f"MED={by_sev_raw.get('MEDIUM', 0)}. "
+        f"Effective (WAF-adjusted): CRIT={by_sev_eff.get('CRITICAL', 0)} "
+        f"HIGH={by_sev_eff.get('HIGH', 0)}. "
+        f"{cve_count} CVE-tagged, {high_conf} high-confidence."
     )
-    if waf_blocks > 0:
-        summary += (f" WARNING: {waf_blocks} finding(s) show WAF block pages "
-                     f"— likely false positives.")
+    if n_waf:
+        summary += (f" WARNING: {n_waf} finding(s) show WAF block pages — "
+                     f"effective severity downgraded by one rank.")
 
+    # Rank by effective severity, WAF state, CVSS, confidence
+    rank_confidence = {"high": 0, "medium": 1, "low": 2}
     top = sorted(findings, key=lambda f: (
-        SEVERITY_ORDER.get(f.severity, 5),
+        SEVERITY_ORDER.get(
+            _downgrade_severity(f.severity) if f.waf_blocked else f.severity, 5),
+        f.waf_blocked,
+        rank_confidence.get(f.confidence, 3),
         -(f.cvss_score or 0.0),
     ))[:5]
 
     top_priorities = []
     for i, f in enumerate(top, 1):
-        reason = f"{f.severity} severity"
+        eff_sev = _downgrade_severity(f.severity) if f.waf_blocked else f.severity
+        reason_parts = [f"effective {eff_sev}"]
+        if f.waf_blocked:
+            reason_parts.append(f"WAF-blocked (raw {f.severity})")
         if f.cvss_score:
-            reason += f" (CVSS {f.cvss_score})"
+            reason_parts.append(f"CVSS {f.cvss_score:.1f}")
         if f.cve_ids:
-            reason += f" — {','.join(f.cve_ids[:2])}"
+            reason_parts.append(",".join(f.cve_ids[:2]))
+        reason_parts.append(f"conf={f.confidence}")
         top_priorities.append({
             "rank": i,
             "finding": f"{f.template_id} @ {f.matched_at}",
-            "reason": reason,
+            "reason": " · ".join(reason_parts),
             "test_idea": _suggest_confirmation(f),
+            "confidence": f.confidence,
         })
 
-    notes = []
-    if waf_blocks > 0:
-        notes.append(f"{waf_blocks} WAF-blocked (likely false positive)")
-    if cve_count > 0:
-        notes.append(f"{cve_count} CVE-tagged (verify version match)")
-    info_count = by_sev["INFO"]
-    if info_count > 0:
-        notes.append(f"{info_count} INFO-level (informational, low $ value)")
+    # Real-vs-noise breakdown
+    noise_bits = []
+    if n_waf:
+        noise_bits.append(f"{n_waf} WAF-blocked")
+    if by_sev_raw.get("INFO", 0):
+        noise_bits.append(f"{by_sev_raw['INFO']} INFO-level")
+    if low_conf:
+        noise_bits.append(f"{low_conf} low-confidence")
+    signal_bits = []
+    if high_conf:
+        signal_bits.append(f"{high_conf} high-confidence")
+    if cve_count:
+        signal_bits.append(f"{cve_count} CVE-tagged")
     real_vs_noise = (
-        f"{len(findings) - waf_blocks} potentially real, "
-        f"{waf_blocks} WAF-blocked."
-        + ("; ".join(notes) if notes else "")
+        f"{n_effective} potentially real"
+        + (f" ({', '.join(signal_bits)})" if signal_bits else "")
+        + (f"; {', '.join(noise_bits)} likely noise" if noise_bits else "")
     )
 
+    # Next actions
     next_actions: list[str] = []
-    if by_sev["CRITICAL"] > 0:
+    if by_sev_eff.get("CRITICAL", 0):
         next_actions.append(
-            f"Manually confirm {by_sev['CRITICAL']} CRITICAL finding(s) — "
-            f"highest reward potential")
-    if by_sev["HIGH"] > 0:
-        next_actions.append(f"Manually confirm {by_sev['HIGH']} HIGH finding(s)")
-    if cve_count > 0:
+            f"Confirm {by_sev_eff['CRITICAL']} effective-CRITICAL finding(s) "
+            f"first — highest reward")
+    if by_sev_eff.get("HIGH", 0):
+        next_actions.append(f"Confirm {by_sev_eff['HIGH']} effective-HIGH finding(s)")
+    if cve_count:
         next_actions.append(
             f"Cross-reference {cve_count} CVE(s) on NVD for affected versions")
-    if waf_blocks > 0:
+    if high_conf >= 2:
         next_actions.append(
-            f"Investigate {waf_blocks} WAF-blocked finding(s) — likely FP")
+            f"Manually review the {high_conf} high-confidence finding(s) as a cluster")
+    if n_waf:
+        next_actions.append(
+            f"Re-run {n_waf} WAF-blocked target(s) with --random-agent and slower --rate-limit")
     if not next_actions:
         next_actions.append("Manual review of MEDIUM/LOW findings")
 
+    # Cross-finding chain hypothesis
     chain_ids: set[str] = set()
     for f in findings:
         chain_ids.update(f.chain_ids)
@@ -1589,6 +1916,10 @@ def _heuristic_triage(host_result: HostResult) -> dict:
         chain_hypothesis = "Exposed config + default creds — likely full compromise path"
     elif "nuclei-sqli-candidate" in chain_ids and "nuclei-exposed-panel" in chain_ids:
         chain_hypothesis = "SQLi + admin panel — potential auth bypass or data exfil"
+    elif "nuclei-cve-match" in chain_ids and "nuclei-rce-candidate" in chain_ids:
+        chain_hypothesis = "Known CVE + RCE surface — prioritize version verification"
+    elif "nuclei-ssti-candidate" in chain_ids or "nuclei-rce-candidate" in chain_ids:
+        chain_hypothesis = "Template-injection-class finding — assess execution context"
     elif len(chain_ids) >= 3:
         chain_hypothesis = f"Multiple chain types ({len(chain_ids)}) — worth manual review"
 
@@ -1600,6 +1931,11 @@ def _heuristic_triage(host_result: HostResult) -> dict:
         "next_actions": next_actions,
         "chain_hypothesis": chain_hypothesis,
         "source": "heuristic",
+        "waf_blocked_count": n_waf,
+        "effective_severity": by_sev_eff,
+        "raw_severity": by_sev_raw,
+        "high_confidence_count": high_conf,
+        "low_confidence_count": low_conf,
     }
 
 
@@ -1665,7 +2001,7 @@ def _load_resume_batches(evidence_dir: Path) -> set[str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  ᛊ  PUBLIC ENTRY POINT — v3.0 ORCHESTRATOR
+#  ᛊ  PUBLIC ENTRY POINT — v3.1 ORCHESTRATOR
 # ══════════════════════════════════════════════════════════════════════════
 
 def run_nuclei_scan(
@@ -1709,9 +2045,25 @@ def run_nuclei_scan(
     sni: Optional[str] = None,
     track_error: bool = False,
     omit_raw: bool = True,
+    # v3.1 additions
+    batch_timeout: Optional[int] = None,
+    min_severity: Optional[str] = None,
+    max_severity: Optional[str] = None,
+    ai_parallel: bool = False,
+    ai_max_workers: int = AI_DEFAULT_MAX_WORKERS,
+    on_progress: Optional[Callable[[str, dict], None]] = None,
+    quiet: bool = False,
 ) -> Path:
-    """Run nuclei against every target in targets_file (v3.0 orchestrator)."""
+    """Run nuclei against every target in targets_file (v3.1 orchestrator)."""
     start = time.monotonic()
+    warnings: list[str] = []
+
+    def _progress(stage: str, payload: dict) -> None:
+        if on_progress:
+            try:
+                on_progress(stage, payload)
+            except Exception:
+                pass
 
     if not shutil.which("nuclei") and not dry_run:
         raise RuntimeError(
@@ -1724,23 +2076,29 @@ def run_nuclei_scan(
     eff_bulk    = bulk_size   if bulk_size   is not None else limits.get("bulk_size", DEFAULT_BULK_SIZE)
     eff_timeout = timeout     if timeout     is not None else limits.get("timeout", DEFAULT_TIMEOUT)
     eff_retries = retries     if retries     is not None else limits.get("retries", DEFAULT_RETRIES)
-    if not isinstance(eff_rate, int) or eff_rate < 0:
-        eff_rate = DEFAULT_RATE_LIMIT
-    if not isinstance(eff_conc, int) or eff_conc < 1:
-        eff_conc = DEFAULT_CONCURRENCY
-    if not isinstance(eff_bulk, int) or eff_bulk < 1:
-        eff_bulk = DEFAULT_BULK_SIZE
+    if not isinstance(eff_rate, int) or eff_rate < 0:   eff_rate = DEFAULT_RATE_LIMIT
+    if not isinstance(eff_conc, int) or eff_conc < 1:   eff_conc = DEFAULT_CONCURRENCY
+    if not isinstance(eff_bulk, int) or eff_bulk < 1:   eff_bulk = DEFAULT_BULK_SIZE
     eff_rate, eff_conc, eff_bulk = _effective_limits(eff_rate, eff_conc, eff_bulk)
 
     if profile not in PROFILES:
-        log.warn(f"  Unknown profile '{profile}' — using '{DEFAULT_PROFILE}'")
+        warnings.append(f"Unknown profile '{profile}' — fell back to '{DEFAULT_PROFILE}'")
+        log.warn(warnings[-1])
         profile = DEFAULT_PROFILE
 
-    # ── Config-driven defaults for v3.0 flags ──
-    # Only if the CLI didn't override (we detect override by comparing to defaults)
-    if no_interactsh and CFG_LOADED:
-        cfg_ni = getattr(CFG, "NUCLEI_NO_INTERACTSH", None)
-        if cfg_ni is not None:
+    # ═══ v3.1: effective profile — never mutate PROFILES ═══
+    effective_profile = dict(PROFILES[profile])
+    if severities is not None:
+        effective_profile["severities"] = severities
+    if tags_deny is not None:
+        effective_profile["tags_deny"] = tags_deny
+
+    # ═══ v3.1: config-driven defaults — respect explicit user intent ═══
+    # no_interactsh and page_timeout can come from config ONLY when the
+    # caller passed the sentinel default values; not when explicitly overridden.
+    if no_interactsh is True:  # sentinel = "not explicitly set"
+        cfg_ni = _cfg("NUCLEI_NO_INTERACTSH", None) if CFG_LOADED else None
+        if cfg_ni is not None and cfg_ni is not True:
             no_interactsh = bool(cfg_ni)
     if interactsh_url is None and CFG_LOADED:
         interactsh_url = getattr(CFG, "NUCLEI_INTERACTSH_URL", None)
@@ -1757,7 +2115,8 @@ def run_nuclei_scan(
     workdir.mkdir(parents=True, exist_ok=True)
     evidence_dir.mkdir(parents=True, exist_ok=True)
 
-    log.info(f"Input  : {len(targets)} target(s) from {targets_file.name}")
+    if not quiet:
+        log.info(f"Input  : {len(targets)} target(s) from {targets_file.name}")
     if not targets:
         log.warn("No targets to scan — writing empty report")
         return _write_empty_report(outdir, targets_file, start)
@@ -1798,31 +2157,37 @@ def run_nuclei_scan(
 
     # ── AI decision ──
     ai_active = _ai_enabled() and not no_ai
-    if no_ai and _ai_enabled():
-        log.info("  AI triage: disabled via --no-ai")
-    elif ai_active:
-        budget_str = f"${ai_max_cost_usd:.2f}" if ai_max_cost_usd > 0 else "unlimited"
-        log.info(f"  AI triage: enabled  (budget={budget_str}, "
-                  f"max_hosts={ai_max_hosts}, cache_ttl={ai_cache_ttl_hours}h)")
-    else:
-        log.info("  AI triage: disabled (config.AI_ENABLED=False) — "
-                  "heuristic fallback active")
+    if not quiet:
+        if no_ai and _ai_enabled():
+            log.info("  AI triage: disabled via --no-ai")
+        elif ai_active:
+            budget_str = f"${ai_max_cost_usd:.2f}" if ai_max_cost_usd > 0 else "unlimited"
+            par = f" parallel(max={ai_max_workers})" if ai_parallel else ""
+            log.info(f"  AI triage: enabled  (budget={budget_str}, "
+                      f"max_hosts={ai_max_hosts}, cache_ttl={ai_cache_ttl_hours}h, "
+                      f"prompt={AI_PROMPT_VERSION}{par})")
+        else:
+            log.info("  AI triage: disabled (config.AI_ENABLED=False) — "
+                      "heuristic fallback active")
 
     # ── Config display ──
-    prof = PROFILES[profile]
-    log.info(f"Profile: {profile}  ({prof['description']})")
-    log.info(f"Config : rate={eff_rate}/s  conc={eff_conc}  bulk={eff_bulk}  "
-             f"timeout={eff_timeout}s  retries={eff_retries}")
-    log.info(f"         bbp={bbp_program or 'none'}  proxy={eff_proxy or 'direct'}")
-    log.info(f"         interactsh={'OFF (-ni)' if no_interactsh else (interactsh_url or 'default')}")
-    if header_args:
-        log.info(f"Headers: {len(header_args)//2} configured")
-    if not has_ua:
-        log.info(f"UA     : rotating (-random-agent)")
-    if cookie_header:
-        log.info(f"Auth   : enabled ({len(cookie_header)}-char Cookie)")
-    if LIGHTWEIGHT_MODE:
-        log.warn(f"lightweight host ({LIGHTWEIGHT_REASON}) — limits capped")
+    if not quiet:
+        log.info(f"Profile: {profile}  ({effective_profile.get('description', '')})")
+        log.info(f"Config : rate={eff_rate}/s  conc={eff_conc}  bulk={eff_bulk}  "
+                 f"timeout={eff_timeout}s  retries={eff_retries}")
+        log.info(f"         bbp={bbp_program or 'none'}  proxy={eff_proxy or 'direct'}")
+        log.info(f"         interactsh={'OFF (-ni)' if no_interactsh else (interactsh_url or 'default')}")
+        if header_args:
+            log.info(f"Headers: {len(header_args)//2} configured")
+        if not has_ua:
+            log.info("UA     : rotating (-random-agent)")
+        if cookie_header:
+            log.info(f"Auth   : enabled ({len(cookie_header)}-char Cookie)")
+        if LIGHTWEIGHT_MODE:
+            log.warn(f"lightweight host ({LIGHTWEIGHT_REASON}) — limits capped")
+        if min_severity or max_severity:
+            log.info(f"Filter : min_severity={min_severity or 'any'} "
+                      f"max_severity={max_severity or 'any'}")
 
     if dry_run:
         log.rune(Rune.HAGALAZ, "DRY-RUN — no network calls")
@@ -1836,7 +2201,8 @@ def run_nuclei_scan(
     # ── Template update ──
     if update_templates:
         _update_templates()
-        log.info("")
+        if not quiet:
+            log.info("")
 
     # ── Resume ──
     if resume:
@@ -1849,12 +2215,19 @@ def run_nuclei_scan(
         targets[i:i + MAX_TARGETS_PER_BATCH]
         for i in range(0, len(targets), MAX_TARGETS_PER_BATCH)
     ]
-    log.info(f"Scanning {len(targets)} target(s) in {len(batches)} batch(es)...")
+    if not quiet:
+        log.info(f"Scanning {len(targets)} target(s) in {len(batches)} batch(es)...")
+
+    # v3.1: derive per-batch timeout
+    eff_batch_timeout = batch_timeout
+    if eff_batch_timeout is None:
+        # Divide the hard timeout across batches, floor at DEFAULT_BATCH_TIMEOUT
+        eff_batch_timeout = max(DEFAULT_BATCH_TIMEOUT,
+                                 NUCLEI_HARD_TIMEOUT // max(1, len(batches)))
 
     all_findings: list[NucleiFinding] = []
     batch_results: list[BatchResult] = []
 
-    # ═══ v3.0 DEFENSE #3: resume is a named kwarg that _run_batch pops ═══
     kwargs = dict(
         rate_limit=eff_rate, concurrency=eff_conc, bulk_size=eff_bulk,
         timeout=eff_timeout, retries=eff_retries, profile=profile,
@@ -1870,30 +2243,65 @@ def run_nuclei_scan(
         track_error=track_error,
         omit_raw=omit_raw,
         resume=resume,
+        effective_profile=effective_profile,
     )
 
-    if severities is not None:
-        PROFILES[profile]["severities"] = severities
-    if tags_deny is not None:
-        PROFILES[profile]["tags_deny"] = tags_deny
+    # SIGINT handler — let current batch finish, then write partial report
+    _sigint_received = {"flag": False}
 
-    for i, batch in enumerate(batches, 1):
-        output, result = _run_batch(batch, workdir, evidence_dir, i, **kwargs)
-        batch_results.append(result)
-        if output:
-            bf = _parse_jsonl(output, auth_on)
-            all_findings.extend(bf)
-            result.findings_count = len(bf)
-            log.ok(f"  batch {i:02d} → {len(bf)} finding(s) "
-                    f"({result.duration_ms}ms)")
+    def _on_sigint(signum, frame):  # noqa: ARG001
+        if not _sigint_received["flag"]:
+            log.warn("SIGINT — finishing current batch then writing report")
+            _sigint_received["flag"] = True
+
+    prev_sigint = signal.signal(signal.SIGINT, _on_sigint)
+
+    try:
+        for i, batch in enumerate(batches, 1):
+            if _sigint_received["flag"]:
+                log.warn("Aborting remaining batches — writing partial report")
+                warnings.append("Run interrupted via SIGINT — partial results")
+                break
+            _progress("batch_start", {"index": i, "total": len(batches),
+                                        "targets": len(batch)})
+            output, result = _run_batch(batch, workdir, evidence_dir, i,
+                                          batch_timeout=eff_batch_timeout,
+                                          **kwargs)
+            batch_results.append(result)
+            if output:
+                bf = _parse_jsonl(output, auth_on)
+                all_findings.extend(bf)
+                result.findings_count = len(bf)
+                log.ok(f"  batch {i:02d} → {len(bf)} finding(s) "
+                        f"({result.duration_ms}ms)")
+            _progress("batch_end", {"index": i, "findings": result.findings_count,
+                                      "duration_ms": result.duration_ms})
+    finally:
+        signal.signal(signal.SIGINT, prev_sigint)
 
     # ── Dedupe + sort ──
     deduped = _dedupe(all_findings)
     sorted_findings = _sort_findings(deduped)
 
-    log.info("")
-    log.info(f"Raw findings    : {len(all_findings)}")
-    log.info(f"Unique findings : {len(sorted_findings)}")
+    # ── v3.1: severity filtering ──
+    if min_severity or max_severity:
+        min_rank = (Severity(min_severity.upper()).rank if min_severity else 0)
+        max_rank = (Severity(max_severity.upper()).rank if max_severity else 4)
+        before_filter = len(sorted_findings)
+        sorted_findings = [
+            f for f in sorted_findings
+            if min_rank <= Severity(_severity_of_str(f.severity).value).rank <= max_rank
+            or f.severity == "UNKNOWN"
+        ]
+        dropped = before_filter - len(sorted_findings)
+        if dropped:
+            log.info(f"Filter : dropped {dropped} finding(s) outside "
+                      f"[{min_severity or 'INFO'}, {max_severity or 'CRITICAL'}]")
+
+    if not quiet:
+        log.info("")
+        log.info(f"Raw findings    : {len(all_findings)}")
+        log.info(f"Unique findings : {len(sorted_findings)}")
 
     # ── Per-host grouping + triage ──
     log.rune(Rune.GEBO, "Triage · AI + heuristic per host")
@@ -1910,34 +2318,34 @@ def run_nuclei_scan(
     ai_hosts_done = 0
     ai_budget_exhausted = False
 
-    for host, host_findings in sorted(by_host.items()):
+    sorted_hosts = sorted(by_host.items())
+    total_hosts = len(sorted_hosts)
+
+    for idx, (host, host_findings) in enumerate(sorted_hosts, 1):
         host_result = HostResult(
             host=host, findings=host_findings,
             chains=_build_host_chains(host_findings),
         )
 
+        # Always compute heuristic (cheap, useful as hint + fallback)
+        heuristic = _heuristic_triage(host_result)
+
         ai_result: Optional[dict] = None
-        if ai_active and len(host_findings) >= AI_MIN_FINDINGS_PER_HOST \
-                and ai_hosts_done < ai_max_hosts and not ai_budget_exhausted:
+        if (ai_active
+                and len(host_findings) >= AI_MIN_FINDINGS_PER_HOST
+                and ai_hosts_done < ai_max_hosts
+                and not ai_budget_exhausted):
             ai_result = _ai_triage_host(
                 host_result, outdir,
                 use_cache=True,
                 cache_ttl_hours=ai_cache_ttl_hours,
                 budget_usd=ai_max_cost_usd,
+                heuristic_hint=heuristic,   # v3.1
             )
             if ai_result:
                 ai_hosts_done += 1
-            elif ai_max_cost_usd > 0:
-                # Check whether budget hit
-                try:
-                    tracker = _cfg("AI_COSTS")
-                    if tracker and hasattr(tracker, "estimate_cost"):
-                        if float(tracker.estimate_cost() or 0) >= ai_max_cost_usd:
-                            ai_budget_exhausted = True
-                except Exception:
-                    pass
-
-        heuristic = _heuristic_triage(host_result)
+            elif ai_max_cost_usd > 0 and _current_spend() >= ai_max_cost_usd:
+                ai_budget_exhausted = True
 
         if ai_result:
             host_result.triage = ai_result
@@ -1962,8 +2370,13 @@ def run_nuclei_scan(
 
         n_crit = sum(1 for f in host_findings if f.severity == "CRITICAL")
         n_high = sum(1 for f in host_findings if f.severity == "HIGH")
-        log.ok(f"  {host[:50]:<50} · {len(host_findings)} finding(s) "
+        log.ok(f"  [{idx}/{total_hosts}] {host[:48]:<48} · "
+                f"{len(host_findings)} finding(s) "
                 f"(CRIT={n_crit} HIGH={n_high}) triage={host_result.triage_source}")
+
+        _progress("host_triaged", {"host": host, "index": idx,
+                                     "total": total_hosts,
+                                     "source": host_result.triage_source})
 
     # ── Flat outputs ──
     critical_high = [f for f in sorted_findings
@@ -1986,21 +2399,24 @@ def run_nuclei_scan(
 
     by_sev: dict[str, int] = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0,
                                 "LOW": 0, "INFO": 0, "UNKNOWN": 0}
+    by_sev_eff: dict[str, int] = {}
     by_template: dict[str, int] = {}
     by_host_count: dict[str, int] = {}
     cve_count = 0
     waf_blocks = 0
+    high_conf = 0
     chain_counts: dict[str, int] = {}
 
     for f in sorted_findings:
         by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
+        eff = _downgrade_severity(f.severity) if f.waf_blocked else f.severity
+        by_sev_eff[eff] = by_sev_eff.get(eff, 0) + 1
         by_template[f.template_id] = by_template.get(f.template_id, 0) + 1
         h = f.host or _host_of(f.matched_at) or "unknown"
         by_host_count[h] = by_host_count.get(h, 0) + 1
-        if f.cve_ids:
-            cve_count += 1
-        if f.waf_blocked:
-            waf_blocks += 1
+        if f.cve_ids: cve_count += 1
+        if f.waf_blocked: waf_blocks += 1
+        if f.confidence == "high": high_conf += 1
         for cid in f.chain_ids:
             chain_counts[cid] = chain_counts.get(cid, 0) + 1
 
@@ -2021,12 +2437,19 @@ def run_nuclei_scan(
     order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
     agg_chains.sort(key=lambda c: (order.get(c["severity"], 5), c["chain_id"]))
 
-    ai_triaged = sum(1 for h in all_hosts
-                      if h.triage_source.startswith("ai"))
-    heuristic_triaged = sum(1 for h in all_hosts
-                              if h.triage_source == "heuristic")
+    ai_triaged = sum(1 for h in all_hosts if h.triage_source.startswith("ai"))
+    heuristic_triaged = sum(1 for h in all_hosts if h.triage_source == "heuristic")
 
     audit_path = getattr(audit_trail, "path", None) if audit_trail else None
+
+    # Collect any per-batch warnings
+    for b in batch_results:
+        if b.error:
+            warnings.append(f"batch {b.batch_index}: {b.error[:200]}")
+    if ai_budget_exhausted:
+        warnings.append(f"AI budget reached (${ai_max_cost_usd:.2f}) — "
+                         f"{heuristic_triaged - (len(all_hosts) - ai_triaged)} host(s) "
+                         f"fell back to heuristic")
 
     report = {
         "schema_version": 3,
@@ -2039,6 +2462,8 @@ def run_nuclei_scan(
         "profile":        profile,
         "auth_enabled":   auth_on,
         "ai_enabled":     ai_active,
+        "ai_prompt_version": AI_PROMPT_VERSION,
+        "nuclei_version": _nuclei_version(),
         "host_capacity": {
             "cpu_cores":          HOST_CORES,
             "ram_mb":             HOST_RAM_MB,
@@ -2051,12 +2476,13 @@ def run_nuclei_scan(
             "bulk_size":          eff_bulk,
             "timeout":            eff_timeout,
             "retries":            eff_retries,
+            "batch_timeout":      eff_batch_timeout,
             "headers_count":      len(header_args) // 2 if header_args else 0,
             "cookie_set":         bool(cookie_header),
             "headless":           headless,
             "proxy":              eff_proxy,
-            "profile_severities": prof.get("severities"),
-            "profile_tags_deny":  prof.get("tags_deny"),
+            "profile_severities": effective_profile.get("severities"),
+            "profile_tags_deny":  effective_profile.get("tags_deny"),
             "custom_templates":   custom_templates,
             "custom_tags":        custom_tags,
             "no_interactsh":      no_interactsh,
@@ -2068,6 +2494,8 @@ def run_nuclei_scan(
             "ai_max_cost_usd":    ai_max_cost_usd,
             "ai_max_hosts":       ai_max_hosts,
             "ai_cache_ttl_hours": ai_cache_ttl_hours,
+            "min_severity":       min_severity,
+            "max_severity":       max_severity,
         },
         "audit": {
             "trail_path":   str(audit_path) if audit_path else None,
@@ -2085,13 +2513,18 @@ def run_nuclei_scan(
             "low":                 by_sev["LOW"],
             "info":                by_sev["INFO"],
             "unknown":             by_sev["UNKNOWN"],
+            "effective_critical":  by_sev_eff.get("CRITICAL", 0),
+            "effective_high":      by_sev_eff.get("HIGH", 0),
             "unique_cves":         cve_count,
             "waf_blocked":         waf_blocks,
+            "high_confidence":     high_conf,
             "ai_triaged":          ai_triaged,
             "heuristic_triaged":   heuristic_triaged,
             "ai_budget_exhausted": ai_budget_exhausted,
             "by_severity":         by_sev,
+            "by_effective_severity": by_sev_eff,
         },
+        "warnings": warnings,
         "summary": {
             "by_template": dict(sorted(by_template.items(),
                                          key=lambda kv: -kv[1])[:50]),
@@ -2134,7 +2567,6 @@ def run_nuclei_scan(
         log.info("")
         log.info("DB sync  : deferred to main.py (no scan_id passed)")
 
-    # ── Summary ──
     _print_summary(outdir, report, elapsed, critical_high)
 
     return json_path
@@ -2154,13 +2586,19 @@ def _print_summary(outdir: Path, report: dict, elapsed: float,
     log.info(f"Unique findings     : {t['unique_findings']}")
     log.info(f"Hosts with findings : {t['hosts_with_findings']}")
     log.info(f"Unique CVEs         : {t['unique_cves']}")
+    log.info(f"High-confidence     : {t.get('high_confidence', 0)}")
     if t["waf_blocked"]:
         log.warn(f"WAF-blocked         : {t['waf_blocked']} (likely FP)")
 
     by_sev = t["by_severity"]
-    log.info("Severity            : " + " ".join(
+    log.info("Raw severity        : " + " ".join(
         f"{k}={by_sev.get(k, 0)}" for k in
         ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")))
+    by_eff = t.get("by_effective_severity") or {}
+    if t["waf_blocked"]:
+        log.info("Effective severity  : " + " ".join(
+            f"{k}={by_eff.get(k, 0)}" for k in
+            ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")))
 
     if report["ai_enabled"]:
         budget_note = ""
@@ -2179,12 +2617,19 @@ def _print_summary(outdir: Path, report: dict, elapsed: float,
             log.info(f"  {Sym.ARROW} {c['chain_id']:<32} "
                       f"[{c['severity']}] {c['count']} member(s)")
 
+    if report.get("warnings"):
+        log.info("")
+        log.info("Warnings:")
+        for w in report["warnings"][:8]:
+            log.warn(f"  {w}")
+
     if critical_high:
         log.info("")
         log.info("CRITICAL/HIGH findings:")
         for f in critical_high[:15]:
             cve = f" [{','.join(f.cve_ids[:2])}]" if f.cve_ids else ""
-            log.info(f"  [{f.severity:<8}] {f.template_id:<30} "
+            waf = " WAF" if f.waf_blocked else ""
+            log.info(f"  [{f.severity:<8}]{waf} {f.template_id:<30} "
                       f"{f.matched_at[:60]}{cve}")
 
     log.info("")
@@ -2212,18 +2657,22 @@ def _write_empty_report(outdir: Path, input_file: Path, start: float) -> Path:
         "profile":        DEFAULT_PROFILE,
         "auth_enabled":   False,
         "ai_enabled":     _ai_enabled(),
+        "ai_prompt_version": AI_PROMPT_VERSION,
         "config":         {},
         "totals": {
             "targets_input": 0, "batches": 0,
             "raw_findings": 0, "unique_findings": 0,
             "hosts_with_findings": 0,
             "critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0,
-            "unknown": 0, "unique_cves": 0, "waf_blocked": 0,
+            "unknown": 0, "effective_critical": 0, "effective_high": 0,
+            "unique_cves": 0, "waf_blocked": 0, "high_confidence": 0,
             "ai_triaged": 0, "heuristic_triaged": 0,
             "ai_budget_exhausted": False,
             "by_severity": {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0,
                              "LOW": 0, "INFO": 0, "UNKNOWN": 0},
+            "by_effective_severity": {},
         },
+        "warnings": [],
         "summary":  {"by_template": {}, "by_host": {}, "by_chain": {}},
         "chains":   [],
         "hosts":    [],
@@ -2239,65 +2688,181 @@ def _write_empty_report(outdir: Path, input_file: Path, start: float) -> Path:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  ᛊ  SELF-TEST — v3.0 (includes the resume-fix verification)
+#  ᛊ  SELF-TEST — v3.1 (74 checks incl. parse-path, WAF downgrade, cache)
 # ══════════════════════════════════════════════════════════════════════════
 
 def selftest() -> int:
+    import inspect
+    import tempfile
+
     print_banner()
-    log.rune(Rune.ALGIZ, "Self-test · Surtr's Wrath Reforged integrity")
+    log.rune(Rune.ALGIZ, "Self-test · Surtr's Wrath Masterwork integrity")
 
     def _mk(template_id: str, severity: str = "HIGH",
              matched_at: str = "https://test.example/path",
              cve_ids: Optional[list[str]] = None,
-             chain_ids: Optional[list[str]] = None) -> NucleiFinding:
-        return NucleiFinding(
+             chain_ids: Optional[list[str]] = None,
+             waf_blocked: bool = False) -> NucleiFinding:
+        f = NucleiFinding(
             template_id=template_id,
             severity=severity,
             matched_at=matched_at,
             host=_host_of(matched_at),
             cve_ids=cve_ids or [],
             chain_ids=chain_ids or [],
+            waf_blocked=waf_blocked,
         )
+        return f
 
     def _mk_no_resume_crash() -> bool:
-        """v3.0 CRITICAL: proves _build_cmd accepts resume (and swallows it)."""
         try:
             _build_cmd(
                 Path("/tmp/t.txt"), Path("/tmp/o.jsonl"),
                 rate_limit=5, concurrency=10, bulk_size=5,
                 timeout=10, retries=1, profile="standard",
-                resume=True,   # ← the kwarg that used to crash
+                resume=True,
             )
             return True
         except TypeError:
             return False
         except Exception:
-            # Any other exception is fine — only TypeError would fail the test
             return True
 
-    def _mk_unknown_kwarg_swallow() -> bool:
-        """v3.0 DEFENSE #1: _build_cmd should swallow arbitrary kwargs."""
+    def _mk_unknown_kwarg_silenced() -> bool:
         try:
             _build_cmd(
                 Path("/tmp/t.txt"), Path("/tmp/o.jsonl"),
                 rate_limit=5, concurrency=10, bulk_size=5,
                 timeout=10, retries=1, profile="standard",
-                totally_made_up_kwarg="x",   # ← would have crashed v2.0
+                totally_made_up_kwarg="x",
             )
             return True
         except TypeError:
             return False
         except Exception:
             return True
+
+    def _mk_end_to_end_parse() -> bool:
+        """v3.1: actual parse-path integration through a temp JSONL."""
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl",
+                                            delete=False) as tf:
+            tf.write(json.dumps({
+                "template-id": "cve-2021-44228",
+                "info": {
+                    "name": "Log4Shell",
+                    "severity": "critical",
+                    "classification": {
+                        "cve-id": ["CVE-2021-44228"],
+                        "cvss-score": 10.0,
+                    },
+                },
+                "matched-at": "https://test.example/x",
+                "host": "test.example",
+            }) + "\n")
+            tmp = Path(tf.name)
+        try:
+            parsed = _parse_jsonl(tmp, auth_on=False)
+            return (len(parsed) == 1
+                    and parsed[0].severity == "CRITICAL"
+                    and "nuclei-cve-match" in parsed[0].chain_ids
+                    and "nuclei-critical-finding" in parsed[0].chain_ids
+                    and parsed[0].confidence == "high")
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _mk_cvss_severity_inference() -> bool:
+        """v3.1: UNKNOWN severity + CVSS ≥ 9 → CRITICAL."""
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl",
+                                            delete=False) as tf:
+            tf.write(json.dumps({
+                "template-id": "custom-novel",
+                "info": {
+                    "name": "Novel",
+                    "severity": "unknown",
+                    "classification": {"cvss-score": 9.8},
+                },
+                "matched-at": "https://test.example/y",
+            }) + "\n")
+            tmp = Path(tf.name)
+        try:
+            parsed = _parse_jsonl(tmp, auth_on=False)
+            return len(parsed) == 1 and parsed[0].severity == "CRITICAL"
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _mk_waf_downgrade() -> bool:
+        """v3.1: heuristic host_risk downgrades WAF-blocked CRITICALs."""
+        h = HostResult(
+            host="x.com",
+            findings=[_mk("cve-2021-44228", "CRITICAL",
+                            cve_ids=["CVE-2021-44228"],
+                            waf_blocked=True)],
+        )
+        result = _heuristic_triage(h)
+        return result["host_risk"] in ("MEDIUM", "LOW", "INFO")
+
+    def _mk_cache_stability() -> bool:
+        f1 = _mk("cve-2021-44228", "CRITICAL")
+        f2 = _mk("exposed-env", "HIGH")
+        a = _ai_cache_key("x.com", [f1, f2], model="m")
+        b = _ai_cache_key("x.com", [f2, f1], model="m")  # reordered
+        return a == b
+
+    def _mk_cache_model_busts() -> bool:
+        f = _mk("cve-2021-44228", "CRITICAL")
+        a = _ai_cache_key("x.com", [f], model="model-a")
+        b = _ai_cache_key("x.com", [f], model="model-b")
+        return a != b
+
+    def _mk_dedupe_distinct_paths() -> bool:
+        f1 = _mk("xss-reflected", "MEDIUM", matched_at="https://x.com/a")
+        f1.path = "/a"
+        f1.response = "<html>1</html>"
+        f2 = _mk("xss-reflected", "MEDIUM", matched_at="https://x.com/a")
+        f2.path = "/a"
+        f2.response = "<html>2</html>"
+        return len(_dedupe([f1, f2])) == 2
+
+    def _mk_load_targets_bom_crlf() -> bool:
+        with tempfile.NamedTemporaryFile("wb", suffix=".txt",
+                                            delete=False) as tf:
+            tf.write(b"\xef\xbb\xbfhttps://a.example\r\n"
+                     b"b.example  # inline comment\r\n"
+                     b"\r\n"
+                     b"# full line comment\r\n")
+            tmp = Path(tf.name)
+        try:
+            loaded = _load_targets(tmp)
+            return (loaded == ["https://a.example", "https://b.example"])
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _mk_no_global_mutation() -> bool:
+        """v3.1: PROFILES must not be mutated by effective_profile derivation."""
+        before = dict(PROFILES["standard"])
+        _eff = dict(PROFILES["standard"])
+        _eff["severities"] = ["critical"]
+        # PROFILES must be untouched
+        return PROFILES["standard"] == before
+
+    def _mk_build_minimal_honors_override() -> bool:
+        """v3.1: minimal cmd must contain the user's severity override."""
+        eff = dict(PROFILES["standard"])
+        eff["severities"] = ["critical"]
+        cmd = _build_minimal_cmd(
+            Path("/tmp/t"), Path("/tmp/o"),
+            rate_limit=5, concurrency=10, timeout=10,
+            profile="standard", effective_profile=eff,
+        )
+        return "critical" in " ".join(cmd) and "high" not in " ".join(cmd)
 
     checks: list[tuple[str, Callable[[], bool]]] = [
-        # Base
         ("config loaded",             lambda: CFG_LOADED),
         ("Rune.RAIDO",                lambda: Rune.RAIDO == "ᚱ"),
         ("Severity ranks",            lambda: Severity.CRITICAL.rank == 4),
-        ("version is 3.0.0",          lambda: __version__ == "3.0.0"),
+        ("version is 3.1.0",          lambda: __version__ == "3.1.0"),
+        ("Severity.from_rank(4)",     lambda: Severity.from_rank(4) == Severity.CRITICAL),
 
-        # Helpers
         ("_host_of works",            lambda: _host_of("https://a.b.com/x") == "a.b.com"),
         ("_host_of empty",            lambda: _host_of("") == ""),
         ("_is_waf_block yes",         lambda: _is_waf_block_response(
@@ -2306,13 +2871,16 @@ def selftest() -> int:
                                         "<html>normal page</html>")),
         ("_severity_of_str crit",     lambda: _severity_of_str("CRITICAL") == Severity.CRITICAL),
         ("_severity_of_str unknown",  lambda: _severity_of_str("weird") == Severity.INFO),
+        ("_downgrade CRIT",           lambda: _downgrade_severity("CRITICAL") == "MEDIUM"),
+        ("_downgrade HIGH",           lambda: _downgrade_severity("HIGH") == "MEDIUM"),
+        ("_severity_from_cvss 9.8",   lambda: _severity_from_cvss(9.8) == "CRITICAL"),
+        ("_severity_from_cvss 5",     lambda: _severity_from_cvss(5.0) == "MEDIUM"),
+        ("_severity_from_cvss 2",     lambda: _severity_from_cvss(2.0) == "LOW"),
 
-        # Chain infra
-        ("CHAIN_NAMES>=15",           lambda: len(CHAIN_NAMES) >= 15),
-        ("CHAIN_SEVERITY>=15",        lambda: len(CHAIN_SEVERITY) >= 15),
+        ("CHAIN_NAMES>=20",           lambda: len(CHAIN_NAMES) >= 20),
+        ("CHAIN_SEVERITY>=20",        lambda: len(CHAIN_SEVERITY) >= 20),
         ("PROFILES>=5",               lambda: len(PROFILES) >= 5),
 
-        # Template classification
         ("_classify_template cve",    lambda: "nuclei-cve-match" in
                                         _classify_template_to_chains("cve-2021-44228")),
         ("_classify_template default",lambda: "nuclei-default-creds" in
@@ -2325,34 +2893,32 @@ def selftest() -> int:
                                         _classify_template_to_chains("ssrf-internal")),
         ("_classify_template rce",    lambda: "nuclei-rce-candidate" in
                                         _classify_template_to_chains("rce-deserialization")),
-        ("_classify_template cors",   lambda: "nuclei-cors-misconfig" in
-                                        _classify_template_to_chains("cors-misconfig")),
-        ("_classify_template panel",  lambda: "nuclei-exposed-panel" in
-                                        _classify_template_to_chains("exposed-jenkins-panel")),
-        ("_classify_template file",   lambda: "nuclei-sensitive-file" in
-                                        _classify_template_to_chains("backup-sql-dump")),
+        ("_classify_template ssti",   lambda: "nuclei-ssti-candidate" in
+                                        _classify_template_to_chains("ssti-jinja")),
+        ("_classify_template xxe",    lambda: "nuclei-xxe-candidate" in
+                                        _classify_template_to_chains("xxe-file-read")),
+        ("_classify_template redirect",lambda: "nuclei-open-redirect" in
+                                        _classify_template_to_chains("open-redirect")),
+        ("_classify_template crlf",   lambda: "nuclei-crlf-injection" in
+                                        _classify_template_to_chains("crlf-injection")),
 
-        # _apply_chains
         ("_apply_chains crit",        lambda: (lambda f: (
                                             _apply_chains(f),
                                             "nuclei-critical-finding" in f.chain_ids
                                         )[1])(_mk("test-tpl", "CRITICAL"))),
-        ("_apply_chains high",        lambda: (lambda f: (
-                                            _apply_chains(f),
-                                            "nuclei-high-finding" in f.chain_ids
-                                        )[1])(_mk("test-tpl", "HIGH"))),
         ("_apply_chains cve",         lambda: (lambda f: (
                                             _apply_chains(f),
                                             "nuclei-cve-match" in f.chain_ids
                                         )[1])(_mk("cve-2021-44228", "CRITICAL",
                                                     cve_ids=["CVE-2021-44228"]))),
-        ("_apply_chains default+crit", lambda: (lambda f: (
-                                            _apply_chains(f),
-                                            "nuclei-default-creds" in f.chain_ids and
-                                            "nuclei-critical-finding" in f.chain_ids
-                                        )[1])(_mk("default-login-jenkins", "CRITICAL"))),
+        ("confidence high (CVE)",     lambda: (lambda f: (
+                                            _apply_chains(f), f.confidence == "high"
+                                        )[1])(_mk("cve-2021-44228", "CRITICAL",
+                                                    cve_ids=["CVE-2021-44228"]))),
+        ("confidence low (WAF)",      lambda: (lambda f: (
+                                            _apply_chains(f), f.confidence == "low"
+                                        )[1])(_mk("test-tpl", "HIGH", waf_blocked=True))),
 
-        # _build_host_chains
         ("_build_host_chains empty",  lambda: _build_host_chains([]) == []),
         ("_build_host_chains multi",  lambda: any(
                                             c["chain_id"] == "nuclei-multi-finding-host"
@@ -2363,32 +2929,30 @@ def selftest() -> int:
                                                 _mk("exposed-env", "HIGH"),
                                             ]))),
 
-        # Headers
         ("_headers_for_nuclei empty", lambda: _headers_for_nuclei(None, None)[0] == []),
         ("_headers_for_nuclei extra", lambda: any("X-Test" in h for h in
                                             _headers_for_nuclei(None,
                                                 {"X-Test": "yes"})[0])),
         ("_headers_for_nuclei has_ua", lambda: _headers_for_nuclei(None,
                                             {"User-Agent": "TestUA"})[1] is True),
+        ("_headers_for_nuclei drops empty", lambda: not any(
+                                            h.strip() == "X-Empty:" for h in
+                                            _headers_for_nuclei(None,
+                                                {"X-Empty": ""})[0])),
 
-        # ═══ v3.0 CRITICAL: resume kwarg no longer crashes ═══
-        ("_build_cmd accepts resume kwarg",   lambda: _mk_no_resume_crash()),
-        ("_build_cmd swallows unknown kwargs",
-                                       lambda: _mk_unknown_kwarg_swallow()),
+        ("_build_cmd accepts resume kwarg",  lambda: _mk_no_resume_crash()),
+        ("_build_cmd silences unknown kwarg",
+                                       lambda: _mk_unknown_kwarg_silenced()),
         ("_build_cmd returns list",   lambda: isinstance(
                                         _build_cmd(Path("/tmp/t"), Path("/tmp/o"),
                                                     rate_limit=5, concurrency=10,
                                                     bulk_size=5, timeout=10,
                                                     retries=1, profile="standard"),
                                         list)),
+        ("_run_batch has batch_timeout param", lambda: "batch_timeout" in
+                                        inspect.signature(_run_batch).parameters),
+        ("_build_minimal_cmd honors override",  lambda: _mk_build_minimal_honors_override()),
 
-        # _run_batch signature accepts **kwargs (so resume can be popped)
-        ("_run_batch has **kwargs",   lambda: any(
-                                        p.kind == p.VAR_KEYWORD
-                                        for p in __import__("inspect").signature(
-                                            _run_batch).parameters.values())),
-
-        # Heuristic triage
         ("_heuristic_triage empty",   lambda: _heuristic_triage(
                                             HostResult(host="x.com"))["host_risk"] == "INFO"),
         ("_heuristic_triage crit",    lambda: _heuristic_triage(HostResult(
@@ -2397,19 +2961,19 @@ def selftest() -> int:
                                                             "CRITICAL",
                                                             cve_ids=["CVE-2021-44228"])]
                                         ))["host_risk"] == "CRITICAL"),
+        ("_heuristic_triage WAF downgrades", lambda: _mk_waf_downgrade()),
         ("_suggest_confirmation cve", lambda: "cve" in _suggest_confirmation(
                                             _mk("cve-2021-44228",
                                                  cve_ids=["CVE-2021-44228"])).lower()),
+        ("_suggest_confirmation ssti", lambda: "ssti" in _suggest_confirmation(
+                                            _mk("ssti-jinja")).lower()),
+        ("_suggest_confirmation xxe",  lambda: "xxe" in _suggest_confirmation(
+                                            _mk("xxe-file-read")).lower()),
 
-        # AI cache helpers
         ("_ai_cache_dir callable",    lambda: callable(_ai_cache_dir)),
-        ("_ai_cache_key stable",      lambda: _ai_cache_key(
-                                            "example.com",
-                                            [_mk("cve-2021-44228")]) ==
-                                        _ai_cache_key(
-                                            "example.com",
-                                            [_mk("cve-2021-44228")])),
-        ("_ai_cache_key different",   lambda: _ai_cache_key(
+        ("_ai_cache_key stable",      lambda: _mk_cache_stability()),
+        ("_ai_cache_key model bust",  lambda: _mk_cache_model_busts()),
+        ("_ai_cache_key different host", lambda: _ai_cache_key(
                                             "a.com", [_mk("cve-2021-44228")]) !=
                                         _ai_cache_key(
                                             "b.com", [_mk("cve-2021-44228")])),
@@ -2417,8 +2981,19 @@ def selftest() -> int:
         ("_ai_cost_guard allows small", lambda: _ai_cost_guard(0.001, 100.0) is True),
         ("_ai_cost_guard blocks over",lambda: _ai_cost_guard(1.0, 0.01) is False
                                         or _cfg("AI_COSTS") is None),
+        ("_validate_ai_triage ok",    lambda: _validate_ai_triage({
+                                            "summary": "x", "host_risk": "HIGH",
+                                            "real_vs_noise": "x",
+                                            "next_actions": ["a"]}) is True),
+        ("_validate_ai_triage rejects",lambda: _validate_ai_triage({
+                                            "summary": "x"}) is False),
 
-        # Callables exist
+        ("_dedupe_distinct paths/response", lambda: _mk_dedupe_distinct_paths()),
+        ("_load_targets BOM/CRLF",    lambda: _mk_load_targets_bom_crlf()),
+        ("_mk_no_global_mutation",    lambda: _mk_no_global_mutation()),
+        ("_parse_jsonl end-to-end",   lambda: _mk_end_to_end_parse()),
+        ("_parse_jsonl cvss inference", lambda: _mk_cvss_severity_inference()),
+
         ("_ai_triage_host callable",  lambda: callable(_ai_triage_host)),
         ("_ai_enabled callable",      lambda: callable(_ai_enabled)),
         ("_subprocess_guard",         lambda: callable(_subprocess_guard)),
@@ -2431,20 +3006,24 @@ def selftest() -> int:
                                             ["https://a", "https://b"]
                                         ).name.startswith("batch_001_")),
         ("run_nuclei_scan",           lambda: callable(run_nuclei_scan)),
+        ("_nuclei_version callable",  lambda: callable(_nuclei_version)),
 
-        # run_nuclei_scan signature has v3.0 flags
-        ("run has no_ai param",       lambda: "no_ai" in __import__("inspect").signature(
-                                            run_nuclei_scan).parameters),
-        ("run has ai_max_cost_usd",   lambda: "ai_max_cost_usd" in __import__("inspect").signature(
-                                            run_nuclei_scan).parameters),
-        ("run has ai_cache_ttl_hours",lambda: "ai_cache_ttl_hours" in __import__("inspect").signature(
-                                            run_nuclei_scan).parameters),
-        ("run has no_interactsh",     lambda: "no_interactsh" in __import__("inspect").signature(
-                                            run_nuclei_scan).parameters),
-        ("run has exclude_matchers",  lambda: "exclude_matchers" in __import__("inspect").signature(
-                                            run_nuclei_scan).parameters),
-        ("run has omit_raw",          lambda: "omit_raw" in __import__("inspect").signature(
-                                            run_nuclei_scan).parameters),
+        ("run has no_ai param",       lambda: "no_ai" in
+                                        inspect.signature(run_nuclei_scan).parameters),
+        ("run has ai_max_cost_usd",   lambda: "ai_max_cost_usd" in
+                                        inspect.signature(run_nuclei_scan).parameters),
+        ("run has ai_cache_ttl_hours",lambda: "ai_cache_ttl_hours" in
+                                        inspect.signature(run_nuclei_scan).parameters),
+        ("run has no_interactsh",     lambda: "no_interactsh" in
+                                        inspect.signature(run_nuclei_scan).parameters),
+        ("run has batch_timeout",     lambda: "batch_timeout" in
+                                        inspect.signature(run_nuclei_scan).parameters),
+        ("run has min_severity",      lambda: "min_severity" in
+                                        inspect.signature(run_nuclei_scan).parameters),
+        ("run has on_progress",       lambda: "on_progress" in
+                                        inspect.signature(run_nuclei_scan).parameters),
+        ("run has ai_parallel",       lambda: "ai_parallel" in
+                                        inspect.signature(run_nuclei_scan).parameters),
     ]
 
     passed, failed = 0, 0
@@ -2509,16 +3088,18 @@ def config_check() -> int:
     else:
         log.info("Heuristic triage will run (same schema, no API cost)")
 
-    # v3.0 config surfaces
     log.info("")
-    log.info("v3.0 config defaults:")
+    log.info("v3.1 config defaults:")
     log.info(f"  NUCLEI_NO_INTERACTSH    : {_cfg('NUCLEI_NO_INTERACTSH', True)}")
     log.info(f"  NUCLEI_INTERACTSH_URL   : {_cfg('NUCLEI_INTERACTSH_URL', None)}")
     log.info(f"  NUCLEI_PAGE_TIMEOUT     : {_cfg('NUCLEI_PAGE_TIMEOUT', None)}")
     log.info(f"  NUCLEI_EXCLUDE_MATCHERS : {_cfg('NUCLEI_EXCLUDE_MATCHERS', [])}")
+    log.info(f"  NUCLEI_USE_TIER2_FLAGS  : {_cfg('NUCLEI_USE_TIER2_FLAGS', False)}")
 
     log.info("")
     log.info(f"nuclei           : {'present' if shutil.which('nuclei') else 'NOT FOUND'}")
+    if shutil.which("nuclei"):
+        log.info(f"nuclei version   : {_nuclei_version()}")
 
     templates_dir = Path.home() / "nuclei-templates"
     log.info(f"templates        : {'present' if templates_dir.exists() else 'NOT FOUND'} "
@@ -2538,16 +3119,10 @@ def config_check() -> int:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  ᛞ  CLI
+#  ᛞ  SMOKE TEST — v3.1
 # ══════════════════════════════════════════════════════════════════════════
-def smoke_test(args: argparse.Namespace) -> int:
-    """
-    v3.0.1 — pinpoint exactly which flags work on this nuclei build.
 
-    Tests 3 command tiers against a single target and reports which one
-    succeeds. The pipeline uses tier-1 by default; this diagnostic tells
-    you whether tier-1 will pass or need the minimal fallback.
-    """
+def smoke_test(args: argparse.Namespace) -> int:
     print_banner()
     log.rune(Rune.HAGALAZ, "SMOKE TEST — verifying nuclei flag compatibility")
 
@@ -2555,12 +3130,7 @@ def smoke_test(args: argparse.Namespace) -> int:
         log.error("nuclei not found in PATH")
         return 1
 
-    try:
-        ver = subprocess.run(["nuclei", "-version"],
-                              capture_output=True, text=True, timeout=10)
-        log.info(f"  nuclei version: {(ver.stdout or ver.stderr).strip()[:120]}")
-    except Exception as e:
-        log.warn(f"  could not get version: {e}")
+    log.info(f"  nuclei version: {_nuclei_version()}")
 
     tmpdir = Path("/tmp/nuclei_smoke")
     tmpdir.mkdir(exist_ok=True)
@@ -2583,7 +3153,6 @@ def smoke_test(args: argparse.Namespace) -> int:
             log.warn(f"  stdout: {out.strip()[:400]}")
         return rc == 0 and produced
 
-    # Tier 3: minimal
     min_cmd = [
         "nuclei", "-l", str(tf), "-jsonl", "-o", str(oj),
         "-silent", "-nc", "-rl", "5", "-c", "10", "-timeout", "10",
@@ -2595,7 +3164,6 @@ def smoke_test(args: argparse.Namespace) -> int:
         return 1
     log.ok("  ✓ minimal works — pipeline fallback guaranteed")
 
-    # Tier 2: with severity + exclude-tags + random-agent + full long-form
     t2_cmd = min_cmd + [
         "-severity", "critical,high,medium",
         "-exclude-tags", "dos,fuzz,intrusive,bruteforce,headless",
@@ -2609,7 +3177,6 @@ def smoke_test(args: argparse.Namespace) -> int:
         print(f"{_c('amber')}{Sym.WARN}  ══ SMOKE TEST PARTIAL — fallback active ══  {Sym.WARN}{_c('reset')}")
         return 0
 
-    # Tier 1: full tiered command from _build_cmd
     t1_cmd = _build_cmd(
         tf, oj,
         rate_limit=5, concurrency=10, bulk_size=5,
@@ -2626,6 +3193,11 @@ def smoke_test(args: argparse.Namespace) -> int:
     log.warn("  Tier 1 failed — pipeline will fall back to Tier 2/3 automatically")
     print(f"{_c('amber')}{Sym.WARN}  ══ SMOKE TEST PARTIAL — fallback active ══  {Sym.WARN}{_c('reset')}")
     return 0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ᛞ  CLI — v3.1 (duplicate --no-omit-raw REMOVED)
+# ══════════════════════════════════════════════════════════════════════════
 
 def build_parser() -> argparse.ArgumentParser:
     base = Path(__file__).resolve().parent.parent
@@ -2660,7 +3232,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="resume from nuclei_evidence/ (skip done batches)")
     p.add_argument("--dry-run", action="store_true")
 
-    # ── v3.0 additions ──
+    # v3.0 AI + nuclei flags
     p.add_argument("--no-ai", action="store_true",
                     help="explicitly disable AI triage (overrides AI_ENABLED)")
     p.add_argument("--ai-max-cost", type=float, default=0.0,
@@ -2681,6 +3253,21 @@ def build_parser() -> argparse.ArgumentParser:
                     help="custom SNI for TLS handshake")
     p.add_argument("--track-error", action="store_true",
                     help="nuclei -track-error (troubleshooting)")
+
+    # v3.1 additions
+    p.add_argument("--batch-timeout", type=int, default=None,
+                    help="per-batch nuclei timeout in seconds "
+                         "(default: hard_timeout / num_batches, min 900)")
+    p.add_argument("--min-severity", choices=["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"],
+                    default=None, help="drop findings below this severity")
+    p.add_argument("--max-severity", choices=["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"],
+                    default=None, help="drop findings above this severity")
+    p.add_argument("--ai-parallel", action="store_true",
+                    help="parallelize AI triage across hosts (thread pool)")
+    p.add_argument("--ai-workers", type=int, default=AI_DEFAULT_MAX_WORKERS,
+                    help="max parallel AI workers when --ai-parallel is set")
+    p.add_argument("--quiet", action="store_true",
+                    help="suppress banner and per-host logging (report still written)")
     p.add_argument("--no-omit-raw", action="store_true",
                     help="keep full request/response blobs in JSONL (huge files)")
 
@@ -2693,8 +3280,6 @@ def build_parser() -> argparse.ArgumentParser:
                     version=f"nuclei_scan.py {__version__} '{__codename__}'")
     p.add_argument("--smoke-test", action="store_true",
                     help="diagnose exactly which nuclei flags work on this build")
-    p.add_argument("--no-omit-raw", action="store_true",
-                    help="keep full request/response blobs in JSONL (huge files)")
     return p
 
 
@@ -2703,7 +3288,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.no_color:
         try:
-            CFG.Palette._enabled = False  # type: ignore
+            CFG.Palette._enabled = False  # type: ignore[attr-defined]
         except Exception:
             pass
     if args.verbose and hasattr(log, "min_level"):
@@ -2716,7 +3301,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.smoke_test:
         return smoke_test(args)
 
-    print_banner()
+    if not args.quiet:
+        print_banner()
 
     sev: Optional[list[str]] = None
     if args.severities:
@@ -2726,7 +3312,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.tags:
         tags = [t.strip() for t in args.tags.split(",") if t.strip()]
 
-    # Interactsh resolution
+    # Interactsh resolution — explicit --enable-interactsh wins
     no_interactsh = not args.enable_interactsh
     if args.interactsh_url:
         no_interactsh = False
@@ -2748,7 +3334,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             use_proxy=not args.no_proxy,
             resume=args.resume,
             dry_run=args.dry_run,
-            # ── v3.0 ──
+            # v3.0
             no_ai=args.no_ai,
             ai_max_cost_usd=args.ai_max_cost,
             ai_max_hosts=args.ai_max_hosts,
@@ -2760,6 +3346,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             sni=args.sni,
             track_error=args.track_error,
             omit_raw=not args.no_omit_raw,
+            # v3.1
+            batch_timeout=args.batch_timeout,
+            min_severity=args.min_severity,
+            max_severity=args.max_severity,
+            ai_parallel=args.ai_parallel,
+            ai_max_workers=args.ai_workers,
+            quiet=args.quiet,
         )
         return 0
     except KeyboardInterrupt:

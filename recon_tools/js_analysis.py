@@ -462,13 +462,26 @@ XSS_SINKS: list[tuple[str, re.Pattern]] = [
     ("jquery_html",       re.compile(r"""\.html\s*\(\s*[^'"]""")),
 ]
 
-# ── PROTO POLLUTION (4 patterns) ──────────────────────────────────────────
+# ── PROTO POLLUTION (4 patterns) — v2.1: require exploit-shaped OR user-input context
 PROTO_POLLUTION: list[tuple[str, re.Pattern]] = [
-    ("proto_assign",       re.compile(r"""\b__proto__\b""")),
-    ("constructor_proto",  re.compile(r"""\bconstructor\s*\.\s*prototype\b""")),
-    ("object_assign_merge",re.compile(r"""(?:Object\.assign|\.merge|\.extend)\s*\([^)]*\+""")),
-    ("lodash_merge",       re.compile(r"""\b(?:merge|mergeWith|defaultsDeep|set)\s*\(\s*[^,]+,\s*[^)]*(?:req|params|query|body)""")),
+    # These two are inherently exploit-shaped — no context needed
+    ("proto_bracket",       re.compile(r"""\[\s*["']__proto__["']\s*\]""")),
+    ("proto_direct_assign", re.compile(r"""\.__proto__\s*=(?!=)""")),
+    # These two require nearby user-input source to be actionable
+    ("constructor_proto",   re.compile(r"""\.constructor\s*\.\s*prototype""")),
+    ("lodash_merge",        re.compile(
+        r"""\b(?:merge|mergeWith|defaultsDeep|set)\s*\(\s*[^,)]+,\s*"""
+        r"""(?:req|request|params|query|body|input|user)""", re.I)),
 ]
+
+# v2.1: user-input proximity requirement for common-sink FP reduction
+USER_INPUT_PROXIMITY = re.compile(
+    r"""(?:req\.(?:query|body|params|cookies)|"""
+    r"""location\.(?:search|hash|href|pathname)|"""
+    r"""document\.(?:URL|referrer|cookie)|"""
+    r"""window\.name|"""
+    r"""\b(?:req|request|params|query|body|input|user(?:data|input)?)\b)""",
+    re.I)
 
 # ── OTHER (3 patterns) ────────────────────────────────────────────────────
 POSTMESSAGE_WILDCARD = re.compile(r"""\.postMessage\s*\([^,]+,\s*["']\*["']""")
@@ -486,7 +499,7 @@ INTERNAL_URL_HINTS = re.compile(
     r"""["'`](https?://[^"'`\s]*(?:\.local|\.internal|\.corp|\.dev|\.staging|\.test|localhost|127\.0\.0\.1|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)[^"'`\s]*)["'`]""",
     re.I)
 STORAGE_KEY = re.compile(
-    r"""\.(?:localStorage|sessionStorage)\.(?:getItem|setItem|removeItem)\s*\(\s*["'`]([^"'`]+)["'`]""")
+    r"""(?<![A-Za-z_])(?:localStorage|sessionStorage)\.(?:getItem|setItem|removeItem)\s*\(\s*["'`]([^"'`]+)["'`]""")
 
 # ── ANALYSIS (3 patterns) ─────────────────────────────────────────────────
 SOURCEMAP_RE  = re.compile(r"""[#@]\s*sourceMappingURL=([^\s]+)""")
@@ -1080,7 +1093,7 @@ def _analyze_jwt_weak(js: JSFile) -> list[Finding]:
     offsets = _line_offsets(content)
     now = datetime.now(timezone.utc).isoformat()
 
-    jwt_re = re.compile(r"""\b(eyJ[A-Za-z0-9_-]+)\.(eyJ[A-Za-z0-9_-]+)\.([A-Za-z0-9_-]*)\b""")
+    jwt_re = re.compile(r"""\b(eyJ[A-Za-z0-9_-]+)\.(eyJ[A-Za-z0-9_-]+)\.([A-Za-z0-9_-]*)""")
     for match in jwt_re.finditer(content):
         try:
             header_b64 = match.group(1) + "=" * (-len(match.group(1)) % 4)
@@ -1126,10 +1139,23 @@ def _analyze_xss_sinks(js: JSFile) -> list[Finding]:
     offsets = _line_offsets(content)
     now = datetime.now(timezone.utc).isoformat()
 
+    # v2.1: which sinks demand user-input proximity to be worth reporting
+    # react_dangerously / vue_v_html / angular_innerHTML are developer
+    # decisions — no proximity required. eval/document.write/innerHTML
+    # are ubiquitous — require user input nearby.
+    NEEDS_PROXIMITY = {"eval", "document_write", "innerHTML", "outerHTML",
+                        "jquery_html", "Function_ctor"}
+
     for subtype, pattern in XSS_SINKS:
         for match in pattern.finditer(content):
-            ctx_lower = _snippet(content, match.start(), match.end()).lower()
-            confidence = 40
+            start, end = match.start(), match.end()
+            if subtype in NEEDS_PROXIMITY:
+                window = content[max(0, start - 250):min(len(content), end + 250)]
+                if not USER_INPUT_PROXIMITY.search(window):
+                    continue
+
+            ctx_lower = _snippet(content, start, end).lower()
+            confidence = 45
             reasons = [f"sink:{subtype}"]
             if any(kw in ctx_lower for kw in
                     ("location", "params", "query", "input", "user", "value")):
@@ -1137,12 +1163,13 @@ def _analyze_xss_sinks(js: JSFile) -> list[Finding]:
                 reasons.append("user_input_nearby")
             if confidence < MIN_REPORT_CONFIDENCE:
                 continue
+
             findings.append(Finding(
                 kind="xss_sink", subtype=subtype,
                 value=subtype, redacted=subtype,
                 file_url=js.url, host=js.host or _host_of(js.url),
-                line_number=_line_for_pos(offsets, match.start()),
-                context=_snippet(content, match.start(), match.end()),
+                line_number=_line_for_pos(offsets, start),
+                context=_snippet(content, start, end),
                 confidence=min(confidence, 100),
                 severity=_severity_for_confidence(confidence, "sink"),
                 reasons=reasons,
@@ -1160,14 +1187,32 @@ def _analyze_prototype_pollution(js: JSFile) -> list[Finding]:
 
     for subtype, pattern in PROTO_POLLUTION:
         for match in pattern.finditer(content):
+            start, end = match.start(), match.end()
+            # v2.1: constructor_proto and lodash_merge only fire when user
+            # input is nearby — otherwise they're framework boilerplate
+            needs_proximity = subtype in ("constructor_proto", "lodash_merge")
+            if needs_proximity:
+                window = content[max(0, start - 300):min(len(content), end + 300)]
+                if not USER_INPUT_PROXIMITY.search(window):
+                    continue
+
+            ctx_lower = _snippet(content, start, end).lower()
+            confidence = 75 if not needs_proximity else 55
+            if any(kw in ctx_lower for kw in ("req.", "params", "input", "user")):
+                confidence += 15
+            if confidence < MIN_REPORT_CONFIDENCE:
+                continue
+
             findings.append(Finding(
                 kind="proto_pollution", subtype=subtype,
                 value=subtype, redacted=subtype,
                 file_url=js.url, host=js.host or _host_of(js.url),
-                line_number=_line_for_pos(offsets, match.start()),
-                context=_snippet(content, match.start(), match.end()),
-                confidence=50, severity=Severity.MEDIUM,
-                reasons=[f"proto_sink:{subtype}"],
+                line_number=_line_for_pos(offsets, start),
+                context=_snippet(content, start, end),
+                confidence=min(confidence, 100),
+                severity=(Severity.MEDIUM if confidence >= 60 else Severity.LOW),
+                reasons=[f"proto_sink:{subtype}",
+                         "exploit_shaped" if not needs_proximity else "user_input_nearby"],
                 chain_ids=["js-prototype-pollution"],
                 first_seen=now,
             ))
@@ -1544,10 +1589,18 @@ Return STRICT JSON:
   "summary": "one paragraph overall assessment",
   "host_risk": "CRITICAL|HIGH|MEDIUM|LOW|INFO",
   "top_priorities": [
-    {{"rank": 1, "finding": "which finding", "reason": "why it matters", "test_idea": "what to test manually"}}
+    {{"rank": 1,
+      "finding": "which finding",
+      "reason": "why it matters",
+      "test_idea": "the exact command or HTTP request to extract/confirm"
+    }}
   ],
   "real_vs_noise": "which findings look real vs likely false positives",
-  "next_actions": ["specific manual test 1", "specific test 2", "specific test 3"]
+  "extraction_commands": [
+    "curl -i https://target/api/v1/users",
+    "curl -sS https://target/main.js.map | jq .sources"
+  ],
+  "next_actions": ["specific manual test 1", "specific test 2"]
 }}"""
 
     try:
@@ -1612,6 +1665,7 @@ Return STRICT JSON:
         "summary": data.get("summary", ""),
         "host_risk": data.get("host_risk", ""),
         "top_priorities": data.get("top_priorities", [])[:10],
+        "extraction_commands": data.get("extraction_commands", [])[:20],  # ← ADD
         "real_vs_noise": data.get("real_vs_noise", ""),
         "next_actions": data.get("next_actions", [])[:10],
         "cost_estimate": cost,
@@ -1719,6 +1773,58 @@ def _heuristic_triage(host_result: HostResult) -> dict:
         "source": "heuristic",
     }
 
+def _extraction_hint(f: Finding) -> str:
+    """v2.1: specific, actionable extraction/test command per finding type."""
+    k, s = f.kind, f.subtype
+    if k == "endpoint":
+        v = f.value or ""
+        if "graphql" in s:
+            payload = '{"query":"{__schema{types{name}}}}"}'
+            return (f"curl -sS -X POST '{v}' -H 'Content-Type: application/json' "
+                    f"-d '{payload}'")
+        if "websocket" in s or s == "socketio":
+            return f"wscat -c '{v}'  (check auth, test unauthenticated message bus)"
+        if "admin" in v.lower() or "internal" in v.lower():
+            return (f"curl -i '{v}'  (test auth bypass: X-Forwarded-For, "
+                    f"X-Original-URL, path traversal)")
+        return f"curl -i '{v}'  (check status, headers, auth requirements)"
+    if k == "secret":
+        if "aws" in s:
+            return "Verify in AWS IAM console — DO NOT use without authorization"
+        if "gcp" in s or "google" in s:
+            return "Verify in GCP console — DO NOT use without authorization"
+        if "private_key" in s or "pem" in s.lower():
+            return "Identify matching public key; check for auth flow using it"
+        if "jwt" in s:
+            return "Decode header/payload; test for alg confusion or weak secret"
+        if "db_connection" in s or "database" in s:
+            return "Check if DB reachable — DO NOT connect without authorization"
+        return "Verify via provider console — DO NOT test without authorization"
+    if k == "sourcemap":
+        return f"curl -sS '{f.value}' | jq '.sources'  — inspect full source tree"
+    if k == "internal_url":
+        return f"curl -i '{f.value}'  — test if internal host resolves from public network"
+    if k == "jwt_weakness":
+        return ("Modify JWT header alg→none and strip signature; "
+                "check if server still accepts")
+    if k == "xss_sink":
+        return ("Trace from URL/DOM source → sink; test with "
+                "<img src=x onerror=alert(1)>")
+    if k == "proto_pollution":
+        return ("Test with ?__proto__[admin]=1 or {\"__proto__\":{\"admin\":1}} "
+                "— check Object prototype")
+    if k == "debug_flag":
+        return ("Check if setting the flag (e.g. ?debug=1, cookie DEBUG=1) "
+                "enables verbose output")
+    if k == "storage_key":
+        return (f"Check if localStorage key '{f.value}' stores sensitive data; "
+                f"test XSS injection into it")
+    if k == "comment":
+        return ("Review comment for hints about missing sanitization, "
+                "TODO auth, or debug paths")
+    if k == "postmessage":
+        return "Check if postMessage listener validates origin; test with evil.test iframe"
+    return "Manual inspection of context"
 
 def _suggest_test_for_finding(f: Finding) -> str:
     """Suggest a manual test based on the finding."""
@@ -1973,6 +2079,7 @@ def run_js_analysis(
     dry_run: bool = False,
     proxy_pool: Any = None,
     audit_trail: Any = None,
+    verbose_findings: bool = False,
 ) -> Path:
     """Main entry point — discovers, downloads, analyzes, triages JS files."""
     start = time.monotonic()
@@ -2186,7 +2293,7 @@ def run_js_analysis(
             except Exception:
                 pass
 
-            # Log
+            # Log — v2.1: rich per-host finding detail
             ok_count = sum(1 for j in downloaded if j.ok)
             n_sec = sum(1 for f in deduped if f.kind == "secret")
             n_crit = sum(1 for f in deduped if f.severity == Severity.CRITICAL)
@@ -2194,6 +2301,28 @@ def run_js_analysis(
             triage_tag = f" triage={host_result.triage_source}"
             log.ok(f"  {len(deduped)} finding(s) from {ok_count}/{len(downloaded)} "
                     f"JS · secrets={n_sec} · CRIT={n_crit} HIGH={n_high}{triage_tag}")
+
+            # v2.1: show the top 5 findings with file:line + extraction hint
+            if deduped:
+                kind_counts: dict[str, int] = {}
+                for f in deduped:
+                    kind_counts[f.kind] = kind_counts.get(f.kind, 0) + 1
+                kind_str = " · ".join(f"{k}({v})" for k, v in
+                                       sorted(kind_counts.items(), key=lambda kv: -kv[1])[:5])
+                log.info(f"      kinds: {kind_str}")
+
+                top5 = sorted(deduped, key=lambda f: (-f.severity.rank, -f.confidence))[:5]
+                show_list = deduped if verbose_findings else top5
+                for f in show_list:
+                    fname = f.file_url.split("/")[-1][:28]
+                    log.info(f"      │ [{f.severity.value:<8}] {f.kind:<14} "
+                             f"{f.subtype:<18} {fname}:{f.line_number} "
+                             f"(conf={f.confidence})")
+                    hint = _extraction_hint(f)
+                    log.info(f"      │   → {hint[:120]}")
+                if not verbose_findings and len(deduped) > 5:
+                    log.info(f"      └─ … and {len(deduped) - 5} more "
+                             f"(see js_findings.json / js_findings_digest.md)")
 
         except Exception as e:
             log.error(f"  host failed: {type(e).__name__}: {e}")
@@ -2302,6 +2431,7 @@ def run_js_analysis(
     json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n",
                           encoding="utf-8")
 
+    _write_digest(outdir, all_hosts)        # ← ADD THIS
     _print_summary(outdir, report, elapsed)
 
     if scan_id is not None:
@@ -2338,6 +2468,39 @@ def _load_resume_hosts(path: Path) -> set[str]:
         pass
     return done
 
+def _write_digest(outdir: Path, all_hosts: list[HostResult]) -> None:
+    """v2.1: markdown table of the top findings across all hosts."""
+    all_f: list[tuple[str, Finding]] = []
+    for h in all_hosts:
+        for f in h.findings:
+            all_f.append((h.host, f))
+
+    if not all_f:
+        (outdir / "js_findings_digest.md").write_text(
+            "# JS Analysis Digest\n\nNo findings.\n", encoding="utf-8")
+        return
+
+    all_f.sort(key=lambda hf: (-hf[1].severity.rank, -hf[1].confidence))
+
+    lines = [
+        "# JS Analysis Digest\n\n",
+        f"**Generated:** {datetime.now(timezone.utc).isoformat()}  \n",
+        f"**Total findings:** {len(all_f)}  \n\n",
+        "## Top 50 findings\n\n",
+        "| Sev | Kind | Subtype | Host | File:Line | Redacted | Extraction |\n",
+        "|-----|------|---------|------|-----------|----------|------------|\n",
+    ]
+    for host, f in all_f[:50]:
+        fname = f.file_url.split("/")[-1][:40]
+        red = (f.redacted or "")[:40].replace("|", "\\|")
+        hint = _extraction_hint(f).replace("|", "\\|").replace("\n", " ")[:100]
+        lines.append(
+            f"| {f.severity.value:<8} | {f.kind:<12} | {f.subtype:<18} | "
+            f"{host:<32} | {fname}:{f.line_number} | {red} | {hint} |\n"
+        )
+
+    (outdir / "js_findings_digest.md").write_text("".join(lines), encoding="utf-8")
+    log.ok(f"  Digest: js_findings_digest.md ({min(50, len(all_f))} findings)")
 
 def _print_summary(outdir: Path, report: dict, elapsed: float) -> None:
     log.rune(Rune.SOWILO, "Summary")
@@ -2480,7 +2643,7 @@ def selftest() -> int:
             for f in _analyze_endpoints(_mk('const q = "query GetUser{user{id}}";')))),
         ("_analyze_endpoints ws_ctor", lambda: any(
             f.subtype == "websocket_ctor"
-            for f in _analyze_endpoints(_mk('new WebSocket("wss://x.com/ws");')))),
+            for f in _analyze_endpoints(_mk('new WebSocket("/stream");')))),
         ("_analyze_secrets AWS",       lambda: any(
             f.subtype == "aws_access_key"
             for f in _analyze_secrets(_mk(f"k='{TEST_AWS}';")))),
@@ -2511,10 +2674,14 @@ def selftest() -> int:
         ("_analyze_xss_sinks eval",    lambda: any(
             f.subtype == "eval"
             for f in _analyze_xss_sinks(_mk("eval(userInput);")))),
-        ("_analyze_prototype_pollution", lambda: any(
-            f.subtype == "proto_assign"
+        ("_analyze_prototype_pollution direct", lambda: any(
+            f.subtype == "proto_direct_assign"
             for f in _analyze_prototype_pollution(
-                _mk("obj.__proto__.admin = true;")))),
+                _mk("obj.__proto__ = {};")))),
+        ("_analyze_prototype_pollution bracket", lambda: any(
+            f.subtype == "proto_bracket"
+            for f in _analyze_prototype_pollution(
+                _mk('obj["__proto__"]["admin"] = true;')))),
         ("_analyze_postmessage wildcard", lambda: any(
             "wildcard" in f.subtype
             for f in _analyze_postmessage(_mk("t.postMessage(d, '*');")))),
@@ -2524,10 +2691,10 @@ def selftest() -> int:
                 _mk("localStorage.setItem('admin_token', x);")))),
         ("_analyze_debug_flags",       lambda: any(
             f.kind == "debug_flag"
-            for f in _analyze_debug_flags(_mk('if (DEBUG) {}')))),
+            for f in _analyze_debug_flags(_mk('var mode = "DEBUG";')))),
         ("_analyze_comments TODO",     lambda: any(
             f.subtype == "tag_todo"
-            for f in _analyze_comments(_mk("// TODO: fix auth")))),
+            for f in _analyze_comments(_mk("// TODO: fix auth bypass in login flow")))),
         ("_analyze_internal_urls",     lambda: any(
             f.kind == "internal_url"
             for f in _analyze_internal_urls(_mk(TEST_INTERNAL)))),
@@ -2683,6 +2850,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--verbose", "-v", action="store_true")
     p.add_argument("--version", action="version",
                     version=f"js_analysis.py {__version__} '{__codename__}'")
+    p.add_argument("--verbose-findings", action="store_true",
+                    help="show ALL findings per host, not just the top 5")
     return p
 
 
@@ -2713,6 +2882,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             aggressive=args.aggressive,
             resume=args.resume,
             dry_run=args.dry_run,
+            verbose_findings=args.verbose_findings,
         )
         return 0
     except KeyboardInterrupt:
